@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -19,7 +20,7 @@ with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
         "TickFlow API Key",
-        value="tk_c06ce640ade841029726ee6b650fbb3a",
+        value=os.getenv("TICKFLOW_API_KEY", ""),
         type="password",
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
