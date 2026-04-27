@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.streamlit/
+cache.db
+data/
+output/
