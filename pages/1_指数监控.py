@@ -1,11 +1,10 @@
-import os
-from pathlib import Path
+from datetime import datetime
+import html
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-from core.cache import list_datasets, load_dataset, save_dataset
+from core.cache import load_dataset
 from core.db import init_db
 from services.index_ma20 import build_summary
 from services.update_tasks import run_index_ma20_update
@@ -15,37 +14,73 @@ st.set_page_config(page_title="指数监控", layout="wide")
 init_db()
 
 st.title("指数监控")
-st.caption("指数数据会缓存到本地 CSV，页面优先读取缓存。")
+
+if "index_auto_update_done" not in st.session_state:
+    st.session_state.index_auto_update_done = False
+
+
+def format_update_time(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return value.replace("T", " ")
+
+
+def format_number(value) -> str:
+    if pd.isna(value):
+        return "-"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.2f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def centered_table(df: pd.DataFrame) -> None:
+    headers = "".join(f"<th>{html.escape(str(col))}</th>" for col in df.columns)
+    rows = []
+    for _, row in df.iterrows():
+        cells = "".join(f"<td>{html.escape(format_number(row[col]))}</td>" for col in df.columns)
+        rows.append(f"<tr>{cells}</tr>")
+    st.markdown(
+        f"""
+        <style>
+        .centered-summary-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }}
+        .centered-summary-table th,
+        .centered-summary-table td {{
+            text-align: center;
+            padding: 0.45rem 0.6rem;
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            white-space: nowrap;
+        }}
+        .centered-summary-table th {{
+            font-weight: 600;
+            background: rgba(49, 51, 63, 0.04);
+        }}
+        </style>
+        <table class="centered-summary-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
-        "TickFlow API Key",
-        value=os.getenv("TICKFLOW_API_KEY", ""),
+        "API Key",
+        value="",
         type="password",
+        placeholder="可选；留空使用免费历史数据或环境变量",
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
     force_refresh = st.checkbox("强制重新获取", value=False)
     update_clicked = st.button("更新指数 MA20 数据", type="primary")
-    import_latest_clicked = st.button("导入桌面最新指数CSV")
-
-if import_latest_clicked:
-    desktop = Path.home() / "Desktop"
-    candidates = sorted(desktop.glob("指数MA20分析_分列版_*.csv"), key=lambda p: p.stat().st_mtime)
-    if not candidates:
-        st.warning(f"桌面没有找到 指数MA20分析_分列版_*.csv：{desktop}")
-    else:
-        latest_file = candidates[-1]
-        df = pd.read_csv(latest_file)
-        save_dataset(
-            symbol="index_ma20_latest",
-            name="指数MA20分列结果",
-            source="auto",
-            data_type="index_ma20_report",
-            df=df,
-        )
-        st.success(f"已导入：{latest_file}")
-        st.rerun()
 
 if update_clicked:
     progress = st.progress(0)
@@ -81,21 +116,19 @@ if update_clicked:
     else:
         st.error(result.message)
 
-uploaded = st.file_uploader("导入指数 MA20 分列 CSV", type=["csv"])
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-    save_dataset(
-        symbol="index_ma20_latest",
-        name="指数MA20分列结果",
-        source="manual",
-        data_type="index_ma20_report",
-        df=df,
-    )
-    st.success("已保存到本地 CSV 缓存，并写入 SQLite 索引。")
-
-datasets = list_datasets()
-st.subheader("缓存状态")
-st.dataframe(datasets, use_container_width=True, hide_index=True)
+if not update_clicked and not st.session_state.index_auto_update_done:
+    st.session_state.index_auto_update_done = True
+    with st.spinner("正在检查今日指数数据..."):
+        auto_result = run_index_ma20_update(
+            api_key="",
+            days=int(days),
+            cache_source="auto",
+            use_fresh_cache=True,
+        )
+    if auto_result.status == "success":
+        st.rerun()
+    else:
+        st.warning(auto_result.message)
 
 report_df = None
 for source in ("auto", "manual"):
@@ -105,41 +138,26 @@ for source in ("auto", "manual"):
         "index_ma20_report",
     )
     if report_df is not None:
-        st.caption(f"当前展示数据源：{source}，更新时间：{meta['last_update_time']}")
+        st.caption(f"更新时间：{format_update_time(meta['last_update_time'])}")
         break
 
 if report_df is not None:
     summary_df = build_summary(report_df)
     if not summary_df.empty:
-        st.subheader("最新摘要")
+        summary_date = summary_df["日期"].max()
+        st.subheader(f"最新摘要 · {summary_date}")
         metric_cols = st.columns(min(4, len(summary_df)))
         for idx, row in summary_df.iterrows():
             with metric_cols[idx % len(metric_cols)]:
                 st.metric(
-                    label=f"{row['指数']} · {row['日期']}",
+                    label=f"{row['指数']}  {row['代码']}",
                     value=f"{row['收盘价']:.2f}",
-                    delta=f"{row['偏离率(%)']:+.2f}% vs MA20",
+                    delta=f"{row['当日涨跌幅(%)']:+.2f}%",
+                    delta_color="inverse",
                 )
 
-        fig_bar = px.bar(
-            summary_df,
-            x="指数",
-            y="偏离率(%)",
-            color="偏离率(%)",
-            color_continuous_scale=["#2563eb", "#e5e7eb", "#dc2626"],
-            title="各指数 MA20 偏离率",
-        )
-        fig_bar.update_layout(coloraxis_showscale=False)
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-    close_cols = [col for col in report_df.columns if col.endswith("_收盘价")]
-    if close_cols and "日期" in report_df.columns:
-        selected = st.selectbox("选择指数收盘价图表", close_cols)
-        chart_df = report_df[["日期", selected]].dropna()
-        fig = px.line(chart_df, x="日期", y=selected, title=selected)
-        st.plotly_chart(fig, use_container_width=True)
+        display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
+        centered_table(display_summary_df)
 
     with st.expander("查看完整分列数据", expanded=False):
         st.dataframe(report_df, use_container_width=True, hide_index=True)

@@ -45,6 +45,7 @@ INDEX_CONFIG = {
         "source": "akshare_us",
         "code": ".INX",
         "tickflow_symbol": ".INX.US",
+        "display_symbol": "SPX",
     },
     "纳斯达克综合": {
         "source": "akshare_us",
@@ -266,6 +267,58 @@ def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str,
     return build_export_df(df, index_name, days=days)
 
 
+def normalize_tickflow_index_df(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    normalized.columns = [str(col).strip() for col in normalized.columns]
+    if "trade_date" not in normalized.columns or "close" not in normalized.columns:
+        raise ValueError(f"TickFlow返回列无法识别：{list(df.columns)}")
+    result = normalized[["trade_date", "close"]].copy()
+    result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce")
+    result["close"] = pd.to_numeric(result["close"], errors="coerce")
+    result = result.dropna(subset=["trade_date", "close"])
+    return result.sort_values("trade_date").drop_duplicates("trade_date").reset_index(drop=True)
+
+
+def get_index_raw_from_tickflow(api_key: str, index_code: str, count: int = 80) -> pd.DataFrame | None:
+    from tickflow import TickFlow
+
+    client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    df = client.klines.get(index_code, period="1d", count=count, as_dataframe=True)
+    if df is None or df.empty:
+        return None
+    return normalize_tickflow_index_df(df)
+
+
+def merge_raw_index_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
+    if old_df is None or old_df.empty:
+        merged = new_df.copy()
+    else:
+        merged = pd.concat([old_df, new_df], ignore_index=True)
+    merged["trade_date"] = pd.to_datetime(merged["trade_date"], errors="coerce")
+    merged["close"] = pd.to_numeric(merged["close"], errors="coerce")
+    merged = merged.dropna(subset=["trade_date", "close"])
+    return merged.sort_values("trade_date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
+
+
+def raw_cache_symbol(index_name: str, index_config) -> str:
+    if isinstance(index_config, dict) and index_config.get("tickflow_symbol"):
+        return f"index_raw_{index_config['tickflow_symbol']}"
+    return f"index_raw_{index_name}"
+
+
+def display_index_symbol(index_config) -> str:
+    if not isinstance(index_config, dict):
+        return str(index_config).split(".", 1)[0]
+    symbol = index_config.get(
+        "display_symbol",
+        index_config.get("tickflow_symbol", index_config.get("code", "")),
+    )
+    symbol_text = str(symbol).strip()
+    if symbol_text.startswith("."):
+        return symbol_text.rsplit(".", 1)[0].lstrip(".")
+    return symbol_text.split(".", 1)[0]
+
+
 def merge_by_date(all_data: list[pd.DataFrame]) -> pd.DataFrame:
     merged_df = all_data[0]
     for df in all_data[1:]:
@@ -336,7 +389,7 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
 
 def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for index_name in INDEX_CONFIG:
+    for index_name, index_config in INDEX_CONFIG.items():
         close_col = f"{index_name}_收盘价"
         ma20_col = f"{index_name}_MA20"
         deviation_col = f"{index_name}_偏离率(%)"
@@ -346,13 +399,24 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
         if valid_rows.empty:
             continue
         latest = valid_rows.iloc[-1]
+        previous_close = pd.NA
+        daily_change_pct = pd.NA
+        if len(valid_rows) >= 2:
+            previous_close = valid_rows.iloc[-2][close_col]
+            if previous_close:
+                daily_change_pct = (latest[close_col] / previous_close - 1) * 100
         rows.append(
             {
                 "指数": index_name,
+                "代码": display_index_symbol(index_config),
                 "日期": latest["日期"],
                 "收盘价": latest[close_col],
+                "前收盘价": previous_close,
+                "当日涨跌幅(%)": daily_change_pct,
                 "MA20": latest[ma20_col],
                 "偏离率(%)": latest[deviation_col],
             }
         )
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).reset_index(drop=True)

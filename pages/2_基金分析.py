@@ -1,9 +1,11 @@
+import html
+
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from core.cache import save_dataset
+from core.cache import load_dataset, save_dataset
 from core.db import init_db
 from services.fund_analysis import (
     analyze_fund_nav,
@@ -23,6 +25,73 @@ def _format_metric(value, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _compact_date_range(start: str | None, end: str | None) -> str:
+    if not start or not end:
+        return "-"
+    try:
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+        if start_ts.year == end_ts.year:
+            return f"{start_ts:%Y-%m-%d} → {end_ts:%m-%d}"
+    except Exception:
+        pass
+    return f"{start} → {end}"
+
+
+def _text_metric(label: str, display_value: str, tooltip: str) -> None:
+    safe_label = html.escape(label)
+    safe_value = html.escape(display_value)
+    safe_tooltip = html.escape(tooltip)
+    st.markdown(
+        f"""
+        <div title="{safe_tooltip}" style="
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 6px;
+            padding: 0.65rem 0.75rem;
+            min-height: 84px;
+            background: rgba(255, 255, 255, 0.02);
+        ">
+            <div style="
+                font-size: 0.875rem;
+                color: rgba(49, 51, 63, 0.72);
+                margin-bottom: 0.35rem;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            ">{safe_label}</div>
+            <div style="
+                font-size: 1.25rem;
+                line-height: 1.25;
+                font-weight: 600;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            ">{safe_value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _load_cache(symbol: str, source: str, data_type: str, period: str = "1d"):
+    cached_df, meta = load_dataset(symbol, source, data_type, period=period)
+    if cached_df is None or not meta or not meta.get("last_update_time"):
+        return None, None
+    return cached_df, meta
+
+
+def _merge_raw_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
+    if old_df is None or old_df.empty:
+        merged = new_df.copy()
+    else:
+        merged = pd.concat([old_df, new_df], ignore_index=True)
+    if "日期" not in merged.columns:
+        return merged
+    merged["日期"] = pd.to_datetime(merged["日期"], errors="coerce")
+    merged = merged.dropna(subset=["日期"])
+    return merged.sort_values("日期").drop_duplicates("日期", keep="last").reset_index(drop=True)
+
+
 st.set_page_config(page_title="基金分析", layout="wide")
 init_db()
 
@@ -39,7 +108,8 @@ with st.sidebar:
     )
     rsi_period = st.number_input("RSI周期", min_value=5, max_value=60, value=14, step=1)
     base_date = st.date_input("区间基准日", value=pd.Timestamp("2024-09-30"))
-    save_to_cache = st.checkbox("分析后保存到本地缓存", value=True)
+    force_refresh = st.checkbox("联网更新数据（有缓存时增量）", value=False)
+    save_to_cache = st.checkbox("分析后保存分析结果", value=True)
 
 source_df = None
 result = None
@@ -61,13 +131,46 @@ if input_mode == "场外基金":
         st.stop()
 
     try:
-        with st.spinner(f"正在拉取 {fund_code} 的净值数据..."):
-            source_df = fetch_eastmoney_fund_nav(
-                fund_code=fund_code,
-                full_history=full_history,
-                max_workers=int(max_workers),
+        fund_code = fund_code.strip()
+        raw_symbol = f"fund_nav_{fund_code}_{'full' if full_history else 'latest'}"
+        cached_df, cache_meta = _load_cache(
+            raw_symbol,
+            "eastmoney",
+            "fund_nav_raw",
+            period="1d",
+        )
+        if cached_df is not None and not force_refresh:
+            source_df = cached_df
+            st.info(f"已使用本地缓存，缓存时间：{cache_meta['last_update_time']}")
+        else:
+            if cached_df is not None:
+                with st.spinner(f"正在增量更新 {fund_code} 的最新净值..."):
+                    latest_df = fetch_eastmoney_fund_nav(
+                        fund_code=fund_code,
+                        full_history=False,
+                        max_workers=int(max_workers),
+                    )
+                source_df = _merge_raw_data(cached_df, latest_df)
+                st.info(
+                    f"已基于本地缓存增量更新：{len(cached_df)} 条 → {len(source_df)} 条"
+                )
+            else:
+                with st.spinner(f"正在全量拉取 {fund_code} 的净值数据..."):
+                    source_df = fetch_eastmoney_fund_nav(
+                        fund_code=fund_code,
+                        full_history=full_history,
+                        max_workers=int(max_workers),
+                    )
+            save_dataset(
+                symbol=raw_symbol,
+                name=f"{fund_code} 场外基金原始净值",
+                source="eastmoney",
+                data_type="fund_nav_raw",
+                df=source_df,
             )
         fund_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=f"{fund_code} 场外基金")
+        if fund_name == fund_code:
+            fund_name = f"{fund_name} 场外基金"
         result = analyze_fund_nav(
             nav_df,
             fund_name=fund_name,
@@ -86,26 +189,62 @@ elif input_mode == "场内基金/ETF":
         with col2:
             count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         with col3:
-            adjust_option = st.selectbox("复权", options=["不复权", "前复权", "后复权"], index=0)
+            adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
         with col4:
-            api_key = st.text_input("TickFlow Key", value="", type="password")
+            api_key = st.text_input("API Key", value="", type="password")
         submitted = st.form_submit_button("拉取并分析", type="primary")
 
     if not submitted:
         st.info("输入场内基金/ETF 代码后点击「拉取并分析」。场内基金使用 TickFlow 日收盘价。")
         st.stop()
 
-    adjust_map = {"不复权": None, "前复权": "forward", "后复权": "backward"}
+    adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
     try:
         symbol = infer_tickflow_symbol(fund_code)
-        with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的日线收盘价..."):
-            source_df = fetch_tickflow_fund_close(
-                symbol=symbol,
-                api_key=api_key,
-                count=int(count),
-                adjust=adjust_map[adjust_option],
+        adjust_value = adjust_map[adjust_option]
+        raw_symbol = f"fund_close_{symbol}_{adjust_value or 'none'}"
+        cached_df, cache_meta = _load_cache(
+            raw_symbol,
+            "tickflow",
+            "fund_close_raw",
+            period=f"{int(count)}_1d",
+        )
+        if cached_df is not None and not force_refresh:
+            source_df = cached_df
+            st.info(f"已使用本地缓存，缓存时间：{cache_meta['last_update_time']}")
+        else:
+            if cached_df is not None:
+                incremental_count = min(max(120, int(count) // 20), int(count))
+                with st.spinner(f"正在增量更新 {symbol} 最近 {incremental_count} 条日线..."):
+                    latest_df = fetch_tickflow_fund_close(
+                        symbol=symbol,
+                        api_key=api_key,
+                        count=incremental_count,
+                        adjust=adjust_value,
+                    )
+                source_df = _merge_raw_data(cached_df, latest_df)
+                st.info(
+                    f"已基于本地缓存增量更新：{len(cached_df)} 条 → {len(source_df)} 条"
+                )
+            else:
+                with st.spinner(f"正在通过 TickFlow 全量拉取 {symbol} 的日线收盘价..."):
+                    source_df = fetch_tickflow_fund_close(
+                        symbol=symbol,
+                        api_key=api_key,
+                        count=int(count),
+                        adjust=adjust_value,
+                    )
+            save_dataset(
+                symbol=raw_symbol,
+                name=f"{symbol} 场内基金原始收盘价",
+                source="tickflow",
+                data_type="fund_close_raw",
+                period=f"{int(count)}_1d",
+                df=source_df,
             )
         fund_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=f"{symbol} 场内基金")
+        if fund_name == symbol:
+            fund_name = f"{fund_name} 场内基金/ETF"
         result = analyze_fund_nav(
             nav_df,
             fund_name=fund_name,
@@ -152,6 +291,7 @@ if save_to_cache:
 
 summary = result.summary
 st.subheader(result.fund_name)
+st.caption(f"数据范围：{summary.get('起始日期')} 至 {summary.get('最新日期')}，共 {summary.get('数据行数')} 条")
 
 metric_cols = st.columns(5)
 metric_items = [
@@ -247,16 +387,19 @@ with tabs[1]:
     with info_cols[0]:
         st.metric("最大回撤", _format_metric(summary.get("最大回撤(%)"), "%"))
     with info_cols[1]:
-        st.metric("峰值日 → 谷底日", f"{drawdown_info['峰值日']} → {drawdown_info['谷底日']}")
+        peak_to_trough_full = f"{drawdown_info['峰值日']} → {drawdown_info['谷底日']}"
+        peak_to_trough_display = _compact_date_range(drawdown_info["峰值日"], drawdown_info["谷底日"])
+        _text_metric("峰值日 → 谷底日", peak_to_trough_display, peak_to_trough_full)
     with info_cols[2]:
         st.metric("下跌天数", _format_metric(drawdown_info["下跌天数"], "天"))
     with info_cols[3]:
-        recovery_text = (
-            _format_metric(drawdown_info["修复天数"], "天")
-            if drawdown_info["是否已修复"]
-            else f"未修复，截至 {drawdown_info['修复日']}"
-        )
-        st.metric("修复状态", recovery_text)
+        if drawdown_info["是否已修复"]:
+            recovery_text = f"已修复：{_format_metric(drawdown_info['修复天数'], '天')}"
+            recovery_display = recovery_text
+        else:
+            recovery_text = f"未修复，截至 {drawdown_info['修复日']}"
+            recovery_display = "未修复"
+        _text_metric("修复状态", recovery_display, recovery_text)
 
     dd_fig = make_subplots(
         rows=2,

@@ -51,6 +51,51 @@ CONTRACT_PREFIXES = {
     "LC": "碳酸锂",
 }
 
+FUTURES_EXCHANGES = {
+    "CU": "SHF",
+    "AL": "SHF",
+    "ZN": "SHF",
+    "PB": "SHF",
+    "NI": "SHF",
+    "SN": "SHF",
+    "AU": "SHF",
+    "AG": "SHF",
+    "RB": "SHF",
+    "HC": "SHF",
+    "SS": "SHF",
+    "BU": "SHF",
+    "RU": "SHF",
+    "FU": "SHF",
+    "M": "DCE",
+    "Y": "DCE",
+    "P": "DCE",
+    "C": "DCE",
+    "L": "DCE",
+    "V": "DCE",
+    "PP": "DCE",
+    "J": "DCE",
+    "JM": "DCE",
+    "I": "DCE",
+    "CF": "ZCE",
+    "SR": "ZCE",
+    "TA": "ZCE",
+    "MA": "ZCE",
+    "FG": "ZCE",
+    "RM": "ZCE",
+    "OI": "ZCE",
+    "SA": "ZCE",
+    "SI": "GFE",
+    "LC": "GFE",
+    "IC": "CFX",
+    "IF": "CFX",
+    "IH": "CFX",
+    "IM": "CFX",
+    "TL": "CFX",
+    "T": "CFX",
+    "TF": "CFX",
+    "TS": "CFX",
+}
+
 
 def parse_contracts(text: str) -> list[str]:
     contracts = [item.strip().upper() for item in re.split(r"[\s,，]+", text) if item.strip()]
@@ -65,16 +110,36 @@ def contract_name(code: str) -> str:
     return f"{code.upper()} ({name})" if name else code.upper()
 
 
-def fetch_futures_daily(contract: str) -> pd.DataFrame:
-    import akshare as ak
+def infer_tickflow_futures_symbol(contract: str) -> str:
+    contract = contract.strip()
+    if "." in contract:
+        code, exchange = contract.rsplit(".", 1)
+        return f"{code}.{exchange.upper()}"
+    match = re.match(r"^([A-Za-z]+)(\d+)$", contract)
+    if not match:
+        raise ValueError(f"无法识别期货合约代码：{contract}")
+    prefix, month = match.groups()
+    exchange = FUTURES_EXCHANGES.get(prefix.upper())
+    if not exchange:
+        raise ValueError(f"无法推断交易所后缀：{contract}")
+    code_prefix = prefix.lower() if exchange in {"DCE", "ZCE", "GFE"} else prefix.upper()
+    return f"{code_prefix}{month}.{exchange}"
 
-    df = ak.futures_zh_daily_sina(symbol=contract)
+
+def normalize_futures_daily(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError("返回空数据")
-    if "date" not in df.columns or "close" not in df.columns:
+    if "trade_date" in df.columns:
+        date_col = "trade_date"
+    elif "date" in df.columns:
+        date_col = "date"
+    else:
+        raise ValueError(f"返回列无法识别：{list(df.columns)}")
+    if "close" not in df.columns:
         raise ValueError(f"返回列无法识别：{list(df.columns)}")
 
-    result = df[["date", "close"]].copy()
+    result = df[[date_col, "close"]].copy()
+    result.columns = ["date", "close"]
     result["date"] = pd.to_datetime(result["date"], errors="coerce")
     result["close"] = pd.to_numeric(result["close"], errors="coerce")
     result = result.dropna(subset=["date", "close"]).sort_values("date")
@@ -83,13 +148,41 @@ def fetch_futures_daily(contract: str) -> pd.DataFrame:
     return result
 
 
-def fetch_contracts(contracts: list[str], max_workers: int = 5) -> tuple[dict[str, pd.DataFrame], list[str]]:
+def fetch_futures_daily_from_tickflow(contract: str, api_key: str = "") -> pd.DataFrame:
+    from tickflow import TickFlow
+
+    symbol = infer_tickflow_futures_symbol(contract)
+    client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    df = client.klines.get(symbol, period="1d", count=5000, as_dataframe=True)
+    return normalize_futures_daily(df)
+
+
+def fetch_futures_daily(contract: str, api_key: str = "") -> pd.DataFrame:
+    import akshare as ak
+
+    try:
+        return fetch_futures_daily_from_tickflow(contract, api_key=api_key)
+    except Exception:
+        pass
+
+    df = ak.futures_zh_daily_sina(symbol=contract)
+    return normalize_futures_daily(df)
+
+
+def fetch_contracts(
+    contracts: list[str],
+    max_workers: int = 5,
+    api_key: str = "",
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
     data: dict[str, pd.DataFrame] = {}
     errors: list[str] = []
     workers = max(1, min(max_workers, len(contracts)))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(fetch_futures_daily, contract): contract for contract in contracts}
+        futures = {
+            executor.submit(fetch_futures_daily, contract, api_key=api_key): contract
+            for contract in contracts
+        }
         for future in as_completed(futures):
             contract = futures[future]
             try:

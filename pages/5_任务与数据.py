@@ -19,9 +19,10 @@ st.title("任务与数据")
 with st.sidebar:
     st.subheader("后台更新")
     api_key = st.text_input(
-        "TickFlow API Key",
-        value=os.getenv("TICKFLOW_API_KEY", ""),
+        "API Key",
+        value="",
         type="password",
+        placeholder="可选；仅本次启动后台时传入",
     )
     days = st.number_input("报表天数", min_value=10, max_value=365, value=30, step=5)
     interval_minutes = st.number_input("后台间隔（分钟）", min_value=1, max_value=1440, value=60)

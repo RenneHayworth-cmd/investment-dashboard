@@ -69,13 +69,14 @@ def fetch_eastmoney_fund_nav(
     if not fund_code.isdigit():
         raise ValueError("东方财富基金净值接口需要 6 位数字基金代码，例如 512890。")
 
+    fund_name = fetch_eastmoney_fund_name(fund_code)
     total_count = _fetch_eastmoney_total_count(fund_code)
     if total_count <= 0:
         raise ValueError(f"没有获取到基金 {fund_code} 的净值记录。")
 
     if not full_history:
         page_df = _fetch_eastmoney_fund_nav_page(fund_code, 1, page_size)
-        return _finalize_eastmoney_nav(page_df, fund_code)
+        return _finalize_eastmoney_nav(page_df, fund_code, fund_name=fund_name)
 
     total_pages = (total_count + page_size - 1) // page_size
     all_pages: list[tuple[int, pd.DataFrame]] = []
@@ -97,7 +98,29 @@ def fetch_eastmoney_fund_nav(
 
     all_pages.sort(key=lambda item: item[0])
     merged = pd.concat([page_df for _, page_df in all_pages], ignore_index=True)
-    return _finalize_eastmoney_nav(merged, fund_code)
+    return _finalize_eastmoney_nav(merged, fund_code, fund_name=fund_name)
+
+
+def fetch_eastmoney_fund_name(fund_code: str) -> str:
+    url = "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx"
+    try:
+        response = requests.get(
+            url,
+            params={"m": "1", "key": fund_code},
+            headers=EASTMONEY_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get("Datas") or []
+        for item in items:
+            if str(item.get("CODE", "")).strip() == fund_code:
+                name = str(item.get("NAME", "")).strip()
+                if name:
+                    return name
+    except Exception:
+        pass
+    return fund_code
 
 
 def _fetch_eastmoney_total_count(fund_code: str) -> int:
@@ -151,7 +174,7 @@ def _request_eastmoney_page(fund_code: str, page_index: int, page_size: int) -> 
     return payload
 
 
-def _finalize_eastmoney_nav(df: pd.DataFrame, fund_code: str) -> pd.DataFrame:
+def _finalize_eastmoney_nav(df: pd.DataFrame, fund_code: str, fund_name: str | None = None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     result = df.copy()
@@ -162,6 +185,7 @@ def _finalize_eastmoney_nav(df: pd.DataFrame, fund_code: str) -> pd.DataFrame:
     result = result.dropna(subset=["日期", "累计净值"])
     result = result.sort_values("日期").drop_duplicates("日期").reset_index(drop=True)
     result["symbol"] = fund_code
+    result["基金名称"] = fund_name or fund_code
     return result
 
 
@@ -189,6 +213,7 @@ def fetch_tickflow_fund_close(
     from tickflow import TickFlow
 
     client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    fund_name = fetch_tickflow_instrument_name(symbol, api_key=api_key)
     kwargs = {
         "period": "1d",
         "count": count,
@@ -212,7 +237,23 @@ def fetch_tickflow_fund_close(
     result = result.dropna(subset=["日期", "收盘价"])
     result = result.sort_values("日期").drop_duplicates("日期").reset_index(drop=True)
     result["symbol"] = symbol
+    result["name"] = fund_name or symbol
     return result
+
+
+def fetch_tickflow_instrument_name(symbol: str, api_key: str = "") -> str:
+    try:
+        from tickflow import TickFlow
+
+        client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+        instruments = client.instruments.batch(symbols=[symbol])
+        if instruments:
+            name = str(instruments[0].get("name", "")).strip()
+            if name:
+                return name
+    except Exception:
+        pass
+    return symbol
 
 
 def _find_column(columns: list[str], keywords: tuple[str, ...]) -> str | None:

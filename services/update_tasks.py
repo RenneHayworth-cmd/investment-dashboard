@@ -8,7 +8,15 @@ import pandas as pd
 
 from core.cache import load_dataset, save_dataset
 from core.db import finish_job, start_job
-from services.index_ma20 import INDEX_CONFIG, fetch_one_index, merge_by_date
+from services.index_ma20 import (
+    INDEX_CONFIG,
+    build_export_df,
+    fetch_one_index,
+    get_index_raw_from_tickflow,
+    merge_by_date,
+    merge_raw_index_data,
+    raw_cache_symbol,
+)
 
 
 ProgressCallback = Callable[[str, int, int, str], None]
@@ -54,7 +62,38 @@ def run_index_ma20_update(
                 progress_callback(index_name, idx, total, "running")
 
             try:
-                df = fetch_one_index(index_name, index_config, api_key=api_key, days=days)
+                df = None
+                tickflow_symbol = index_config.get("tickflow_symbol") if isinstance(index_config, dict) else None
+                if tickflow_symbol:
+                    try:
+                        cache_symbol = raw_cache_symbol(index_name, index_config)
+                        cached_raw, _ = load_dataset(
+                            cache_symbol,
+                            "tickflow",
+                            "index_daily_raw",
+                        )
+                        fetch_count = 30 if cached_raw is not None and not cached_raw.empty else max(days * 2, 80)
+                        latest_raw = get_index_raw_from_tickflow(
+                            api_key,
+                            tickflow_symbol,
+                            count=fetch_count,
+                        )
+                        if latest_raw is not None and not latest_raw.empty:
+                            raw_df = merge_raw_index_data(cached_raw, latest_raw)
+                            save_dataset(
+                                symbol=cache_symbol,
+                                name=f"{index_name} 指数原始日线",
+                                source="tickflow",
+                                data_type="index_daily_raw",
+                                df=raw_df,
+                            )
+                            df = build_export_df(raw_df, index_name, days=days)
+                    except Exception:
+                        df = None
+
+                if df is None:
+                    df = fetch_one_index(index_name, index_config, api_key=api_key, days=days)
+
                 if df is not None and not df.empty:
                     all_data.append(df)
                     if progress_callback:

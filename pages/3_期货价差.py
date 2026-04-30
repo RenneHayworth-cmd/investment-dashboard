@@ -1,3 +1,5 @@
+import html
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -17,11 +19,62 @@ st.set_page_config(page_title="期货价差", layout="wide")
 init_db()
 
 st.title("期货价差")
-st.caption("输入多个期货合约，选择基准合约，计算“基准 - 其他”的绝对价差和百分比价差。")
+st.caption("输入多个期货合约，选择基准合约，计算“基准 - 其他”的绝对价差。")
+
+
+def format_cell(value) -> str:
+    if pd.isna(value):
+        return "-"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.4f}".rstrip("0").rstrip(".")
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
+def centered_table(df: pd.DataFrame) -> None:
+    headers = "".join(f"<th>{html.escape(str(col))}</th>" for col in df.columns)
+    rows = []
+    for _, row in df.iterrows():
+        cells = "".join(f"<td>{html.escape(format_cell(row[col]))}</td>" for col in df.columns)
+        rows.append(f"<tr>{cells}</tr>")
+    st.markdown(
+        f"""
+        <style>
+        .centered-futures-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }}
+        .centered-futures-table th,
+        .centered-futures-table td {{
+            text-align: center;
+            padding: 0.45rem 0.6rem;
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            white-space: nowrap;
+        }}
+        .centered-futures-table th {{
+            font-weight: 600;
+            background: rgba(49, 51, 63, 0.04);
+        }}
+        </style>
+        <table class="centered-futures-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with st.sidebar:
     st.subheader("参数")
     contracts_text = st.text_area("合约代码", value="IM2605 IM2606", height=90)
+    api_key = st.text_input(
+        "TickFlow API Key",
+        value="",
+        type="password",
+        placeholder="可选；填入后使用实时更新的日线",
+    )
     contracts = parse_contracts(contracts_text)
     if contracts:
         base_contract = st.selectbox(
@@ -48,7 +101,11 @@ if not analyze_clicked:
     st.stop()
 
 with st.spinner("正在获取期货数据并计算价差..."):
-    data, errors = fetch_contracts(contracts, max_workers=int(max_workers))
+    data, errors = fetch_contracts(
+        contracts,
+        max_workers=int(max_workers),
+        api_key=api_key,
+    )
     try:
         spread_df = calculate_spreads(data, base_contract)
     except Exception as exc:
@@ -82,11 +139,10 @@ else:
             st.metric(
                 label=row["价差对"],
                 value=f"{row['最新价差']:.2f}",
-                delta=f"{row['最新占比(%)']:+.2f}%",
             )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    centered_table(summary_df.drop(columns=["最新占比(%)"], errors="ignore"))
 
-tabs = st.tabs(["价差图", "百分比价差", "明细数据"])
+tabs = st.tabs(["价差图", "明细数据"])
 other_contracts = [contract for contract in available_contracts if contract != base_contract]
 
 with tabs[0]:
@@ -95,7 +151,7 @@ with tabs[0]:
         id_vars="date",
         var_name="价差对",
         value_name="价差",
-    )
+    ).dropna(subset=["价差"])
     label_map = {
         f"spread_{base_contract}_vs_{contract}": f"{base_contract} - {contract}"
         for contract in other_contracts
@@ -106,23 +162,11 @@ with tabs[0]:
     st.plotly_chart(fig, use_container_width=True)
 
 with tabs[1]:
-    pct_cols = [f"spread_{base_contract}_vs_{contract}_pct" for contract in other_contracts]
-    chart_df = spread_df[["date", *pct_cols]].melt(
-        id_vars="date",
-        var_name="价差对",
-        value_name="价差占比(%)",
-    )
-    label_map = {
-        f"spread_{base_contract}_vs_{contract}_pct": f"{base_contract} - {contract}"
-        for contract in other_contracts
-    }
-    chart_df["价差对"] = chart_df["价差对"].map(label_map)
-    fig = px.line(chart_df, x="date", y="价差占比(%)", color="价差对", title="百分比价差")
-    fig.update_layout(hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
-
-with tabs[2]:
-    st.dataframe(spread_df.sort_values("date", ascending=False), use_container_width=True, hide_index=True)
+    detail_df = spread_df.drop(
+        columns=[col for col in spread_df.columns if col.endswith("_pct")],
+        errors="ignore",
+    ).sort_values("date", ascending=False)
+    centered_table(detail_df)
     csv_bytes = spread_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "下载价差数据 CSV",
