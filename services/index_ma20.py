@@ -1,25 +1,56 @@
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 
-TICKFLOW_SITE_PACKAGES = "/home/renne/.hermes/python/.venv/lib/python3.11/site-packages"
-if TICKFLOW_SITE_PACKAGES not in sys.path:
-    sys.path.insert(0, TICKFLOW_SITE_PACKAGES)
-
-
 INDEX_CONFIG = {
-    "沪深300": {"source": "akshare_cn", "code": "000300", "market": "sh"},
-    "创业板指": {"source": "akshare_cn", "code": "399006", "market": "sz"},
-    "中证500": {"source": "akshare_cn", "code": "000905", "market": "sh"},
-    "中证1000": {"source": "akshare_cn", "code": "000852", "market": "sh"},
-    "中证红利低波": {"source": "akshare_csindex", "code": "H30269"},
-    "国证自由现金流": {"source": "akshare_cn", "code": "980092", "market": "sz"},
-    "标普500": {"source": "akshare_us", "code": ".INX"},
-    "纳斯达克综合": {"source": "akshare_us", "code": ".IXIC"},
+    "沪深300": {
+        "source": "akshare_cn",
+        "code": "000300",
+        "market": "sh",
+        "tickflow_symbol": "000300.SH",
+    },
+    "创业板指": {
+        "source": "akshare_cn",
+        "code": "399006",
+        "market": "sz",
+        "tickflow_symbol": "399006.SZ",
+    },
+    "中证500": {
+        "source": "akshare_cn",
+        "code": "000905",
+        "market": "sh",
+        "tickflow_symbol": "000905.SH",
+    },
+    "中证1000": {
+        "source": "akshare_cn",
+        "code": "000852",
+        "market": "sh",
+        "tickflow_symbol": "000852.SH",
+    },
+    "中证红利低波": {
+        "source": "akshare_csindex",
+        "code": "H30269",
+        "tickflow_symbol": "H30269.SH",
+    },
+    "国证自由现金流": {
+        "source": "akshare_cn",
+        "code": "980092",
+        "market": "sz",
+        "tickflow_symbol": "980092.SZ",
+    },
+    "标普500": {
+        "source": "akshare_us",
+        "code": ".INX",
+        "tickflow_symbol": ".INX.US",
+    },
+    "纳斯达克综合": {
+        "source": "akshare_us",
+        "code": ".IXIC",
+        "tickflow_symbol": ".IXIC.US",
+    },
 }
 
 
@@ -227,8 +258,11 @@ def get_index_data_from_akshare_us(index_code: str, index_name: str, days: int =
 def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str, days: int = 30):
     from tickflow import TickFlow
 
-    client = TickFlow(api_key=api_key)
-    df = client.klines.get(index_code, as_dataframe=True)
+    client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    count = max(days * 2, 80)
+    df = client.klines.get(index_code, period="1d", count=count, as_dataframe=True)
+    if df is None or df.empty:
+        return None
     return build_export_df(df, index_name, days=days)
 
 
@@ -262,20 +296,40 @@ def generate_index_ma20_report(api_key: str, days: int = 30) -> pd.DataFrame:
 
 def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30) -> pd.DataFrame | None:
     if isinstance(index_config, dict):
+        tickflow_symbol = index_config.get("tickflow_symbol")
+        tickflow_error = None
+        if tickflow_symbol:
+            try:
+                df = get_index_data_from_tickflow(
+                    api_key,
+                    tickflow_symbol,
+                    index_name,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    return df
+            except Exception as exc:
+                tickflow_error = exc
+
         source = index_config.get("source")
         code = index_config.get("code")
-        if source == "akshare_cn":
-            return get_index_data_from_akshare_cn(
-                code,
-                index_config.get("market", "sh"),
-                index_name,
-                days=days,
-            )
-        if source == "akshare_csindex":
-            return get_index_data_from_akshare_csindex(code, index_name, days=days)
-        if source == "akshare_us":
-            return get_index_data_from_akshare_us(code, index_name, days=days)
-        raise ValueError(f"未知数据源：{source}")
+        try:
+            if source == "akshare_cn":
+                return get_index_data_from_akshare_cn(
+                    code,
+                    index_config.get("market", "sh"),
+                    index_name,
+                    days=days,
+                )
+            if source == "akshare_csindex":
+                return get_index_data_from_akshare_csindex(code, index_name, days=days)
+            if source == "akshare_us":
+                return get_index_data_from_akshare_us(code, index_name, days=days)
+            raise ValueError(f"未知数据源：{source}")
+        except Exception as exc:
+            if tickflow_error:
+                raise RuntimeError(f"TickFlow失败：{tickflow_error}；AkShare失败：{exc}") from exc
+            raise
 
     return get_index_data_from_tickflow(api_key, index_config, index_name, days=days)
 

@@ -23,8 +23,10 @@ def save_dataset(
     df.to_csv(file_path, index=False, encoding="utf-8-sig")
 
     last_trade_date = ""
-    if "trade_date" in df.columns and not df.empty:
-        last_trade_date = str(pd.to_datetime(df["trade_date"]).max().date())
+    for date_column in ("trade_date", "日期"):
+        if date_column in df.columns and not df.empty:
+            last_trade_date = str(pd.to_datetime(df[date_column]).max().date())
+            break
 
     conn = get_conn()
     conn.execute(
@@ -99,4 +101,3 @@ def list_datasets() -> pd.DataFrame:
     )
     conn.close()
     return df
-

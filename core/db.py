@@ -1,6 +1,8 @@
 import sqlite3
 from datetime import datetime
 
+import pandas as pd
+
 from core.paths import DB_PATH, ensure_dirs
 
 
@@ -74,3 +76,18 @@ def finish_job(job_id: int, status: str, message: str = "") -> None:
     conn.commit()
     conn.close()
 
+
+def list_jobs(limit: int = 100) -> pd.DataFrame:
+    conn = get_conn()
+    df = pd.read_sql_query(
+        """
+        SELECT id, job_name, status, started_at, finished_at, message
+        FROM jobs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,),
+    )
+    conn.close()
+    return df

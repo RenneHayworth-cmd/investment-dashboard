@@ -3,3 +3,4 @@ pandas
 plotly
 akshare
 requests
+tickflow[all]>=0.1.17

@@ -6,8 +6,9 @@ import plotly.express as px
 import streamlit as st
 
 from core.cache import list_datasets, load_dataset, save_dataset
-from core.db import finish_job, init_db, start_job
-from services.index_ma20 import INDEX_CONFIG, build_summary, fetch_one_index, merge_by_date
+from core.db import init_db
+from services.index_ma20 import build_summary
+from services.update_tasks import run_index_ma20_update
 
 
 st.set_page_config(page_title="指数监控", layout="wide")
@@ -24,6 +25,7 @@ with st.sidebar:
         type="password",
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
+    force_refresh = st.checkbox("强制重新获取", value=False)
     update_clicked = st.button("更新指数 MA20 数据", type="primary")
     import_latest_clicked = st.button("导入桌面最新指数CSV")
 
@@ -46,54 +48,38 @@ if import_latest_clicked:
         st.rerun()
 
 if update_clicked:
-    job_id = start_job("更新指数MA20")
-    try:
-        st.warning("在线更新还在调试中。如果页面卡住，请先用原脚本生成CSV，再点「导入桌面最新指数CSV」。")
-        progress = st.progress(0)
-        status_box = st.empty()
-        all_data = []
-        errors = []
-        total = len(INDEX_CONFIG)
+    progress = st.progress(0)
+    status_box = st.empty()
 
-        for idx, (index_name, index_config) in enumerate(INDEX_CONFIG.items(), start=1):
+    def show_progress(index_name: str, idx: int, total: int, status: str) -> None:
+        if status == "running":
+            progress.progress((idx - 1) / total)
             status_box.info(f"正在获取 {index_name} ({idx}/{total})...")
-            try:
-                df = fetch_one_index(index_name, index_config, api_key=api_key, days=int(days))
-                if df is not None and not df.empty:
-                    all_data.append(df)
-                    status_box.success(f"{index_name} 获取完成")
-                else:
-                    errors.append(f"{index_name}: 无数据")
-                    status_box.warning(f"{index_name} 无数据")
-            except Exception as exc:
-                errors.append(f"{index_name}: {exc}")
-                status_box.warning(f"{index_name} 获取失败：{exc}")
+        elif status == "success":
             progress.progress(idx / total)
-
-        if not all_data:
-            raise RuntimeError("未获取到任何指数数据。" + " | ".join(errors))
-
-        report = merge_by_date(all_data)
-        report.attrs["errors"] = errors
-        save_dataset(
-            symbol="index_ma20_latest",
-            name="指数MA20分列结果",
-            source="auto",
-            data_type="index_ma20_report",
-            df=report,
-        )
-
-        message = "更新成功"
-        if errors:
-            message += "；部分指数失败：" + " | ".join(errors)
-            st.warning(message)
+            status_box.success(f"{index_name} 获取完成")
+        elif status == "empty":
+            progress.progress(idx / total)
+            status_box.warning(f"{index_name} 无数据")
         else:
-            st.success(message)
-        finish_job(job_id, "success", message)
+            progress.progress(idx / total)
+            status_box.warning(f"{index_name} 获取失败")
+
+    result = run_index_ma20_update(
+        api_key=api_key,
+        days=int(days),
+        cache_source="auto",
+        use_fresh_cache=not force_refresh,
+        progress_callback=show_progress,
+    )
+    if result.status == "success":
+        if result.errors:
+            st.warning(result.message)
+        else:
+            st.success(result.message)
         st.rerun()
-    except Exception as exc:
-        finish_job(job_id, "failed", str(exc))
-        st.error(f"更新失败：{exc}")
+    else:
+        st.error(result.message)
 
 uploaded = st.file_uploader("导入指数 MA20 分列 CSV", type=["csv"])
 if uploaded is not None:
