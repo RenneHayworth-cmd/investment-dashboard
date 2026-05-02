@@ -297,6 +297,66 @@ def normalize_nav_dataframe(df: pd.DataFrame, fallback_name: str = "基金") -> 
     return name, result
 
 
+def should_use_log_price_axis(
+    df: pd.DataFrame,
+    price_columns: list[str] | tuple[str, ...] = ("price",),
+    date_column: str = "date",
+    min_calendar_days: int = 365 * 3,
+    min_rows: int = 252 * 3,
+) -> bool:
+    if df is None or df.empty or date_column not in df.columns:
+        return False
+
+    dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
+    if dates.empty:
+        return False
+
+    is_long_history = (dates.max() - dates.min()).days >= min_calendar_days or len(df) >= min_rows
+    if not is_long_history:
+        return False
+
+    for column in price_columns:
+        if column not in df.columns:
+            continue
+        values = pd.to_numeric(df[column], errors="coerce").dropna()
+        if not values.empty and (values <= 0).any():
+            return False
+
+    return True
+
+
+def resolve_price_axis_type(
+    df: pd.DataFrame,
+    axis_mode: str,
+    price_columns: list[str] | tuple[str, ...] = ("price",),
+    date_column: str = "date",
+) -> str:
+    if axis_mode == "普通坐标":
+        return "linear"
+
+    has_non_positive = False
+    for column in price_columns:
+        if column not in df.columns:
+            continue
+        values = pd.to_numeric(df[column], errors="coerce").dropna()
+        if not values.empty and (values <= 0).any():
+            has_non_positive = True
+            break
+
+    if axis_mode == "对数坐标":
+        return "linear" if has_non_positive else "log"
+
+    return (
+        "log"
+        if should_use_log_price_axis(
+            df,
+            price_columns=price_columns,
+            date_column=date_column,
+        )
+        else "linear"
+    )
+
+
 def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
     delta = prices.diff()
     gain = delta.where(delta > 0, 0).rolling(window=period).mean()
@@ -393,7 +453,7 @@ def analyze_fund_nav(
         f"{base_date}以来涨幅(%)": _round_or_nan(latest["base_date_return_pct"]),
         f"RSI({rsi_period})": _round_or_nan(latest[f"rsi_{rsi_period}"]),
         "价格百分位": _round_or_nan(latest["price_percentile"]),
-        "最大回撤(%)": _round_or_nan(result["drawdown_pct"].min()),
+        "最大回撤(%)": _round_or_nan(result["drawdown_pct"].min(), digits=2),
         "最大回撤峰值日": max_drawdown_info.get("峰值日期", ""),
         "最大回撤谷底日": max_drawdown_info.get("谷底日期", ""),
         "最大回撤修复日": max_drawdown_info.get("修复完成日期", ""),
@@ -413,6 +473,9 @@ def analyze_fund_nav(
     rounded = result.copy()
     for column in rounded.select_dtypes(include=[np.number]).columns:
         rounded[column] = rounded[column].round(4)
+    for column in ("drawdown_pct",):
+        if column in rounded.columns:
+            rounded[column] = rounded[column].round(2)
 
     return FundAnalysisResult(
         fund_name=fund_name,
@@ -457,10 +520,58 @@ def calculate_max_drawdown_info(df: pd.DataFrame) -> dict[str, object]:
         "峰值日期": peak_date.strftime("%Y-%m-%d"),
         "谷底日期": trough_date.strftime("%Y-%m-%d"),
         "修复完成日期": recovery_date.strftime("%Y-%m-%d"),
-        "回撤深度(%)": round(float(drawdown[trough_idx]), 4),
+        "回撤深度(%)": round(float(drawdown[trough_idx]), 2),
         "回撤天数": int((trough_date - peak_date).days),
         "修复天数": recovery_days,
         "是否已修复": is_recovered,
+    }
+
+
+def calculate_current_drawdown_info(df: pd.DataFrame) -> dict[str, object]:
+    if df is None or len(df) < 1:
+        return {}
+
+    data = df.sort_values("date").reset_index(drop=True).copy()
+    prices = pd.to_numeric(data["price"], errors="coerce")
+    dates = pd.to_datetime(data["date"], errors="coerce")
+    valid = pd.DataFrame({"date": dates, "price": prices}).dropna(subset=["date", "price"])
+    if valid.empty:
+        return {}
+
+    valid = valid.reset_index(drop=True)
+    running_peak = valid["price"].cummax()
+    drawdown_pct = (valid["price"] / running_peak - 1) * 100
+    latest_idx = len(valid) - 1
+    latest_date = valid.loc[latest_idx, "date"]
+    latest_drawdown = float(drawdown_pct.iloc[latest_idx])
+
+    peak_value = float(running_peak.iloc[latest_idx])
+    peak_matches = valid.index[valid["price"].round(10) >= round(peak_value, 10)].tolist()
+    peak_idx = peak_matches[-1] if peak_matches else int(running_peak.iloc[: latest_idx + 1].idxmax())
+    peak_date = valid.loc[peak_idx, "date"]
+
+    if latest_drawdown >= -1e-10:
+        return {
+            "当前回撤(%)": 0.0,
+            "当前回撤峰值日": latest_date.strftime("%Y-%m-%d"),
+            "当前谷底日": latest_date.strftime("%Y-%m-%d"),
+            "当前回撤时间": 0,
+            "当前回撤是否已修复": True,
+            "当前修复状态": "无当前回撤",
+        }
+
+    current_period = drawdown_pct.iloc[peak_idx : latest_idx + 1]
+    trough_idx = int(current_period.idxmin())
+    trough_date = valid.loc[trough_idx, "date"]
+    drawdown_days = int((latest_date - peak_date).days)
+
+    return {
+        "当前回撤(%)": round(latest_drawdown, 2),
+        "当前回撤峰值日": peak_date.strftime("%Y-%m-%d"),
+        "当前谷底日": trough_date.strftime("%Y-%m-%d"),
+        "当前回撤时间": drawdown_days,
+        "当前回撤是否已修复": False,
+        "当前修复状态": f"未修复，截至 {latest_date.strftime('%Y-%m-%d')}",
     }
 
 
@@ -501,7 +612,7 @@ def extract_drawdown_periods(df: pd.DataFrame) -> pd.DataFrame:
                     "回撤开始日期": start_date.strftime("%Y-%m-%d"),
                     "谷底日期": trough_date.strftime("%Y-%m-%d"),
                     "修复完成日期": recovery_date.strftime("%Y-%m-%d"),
-                    "回撤深度(%)": round(float(drawdown[trough_idx]), 4),
+                    "回撤深度(%)": round(float(drawdown[trough_idx]), 2),
                     "回撤天数": int((trough_date - start_date).days),
                     "修复天数": int((recovery_date - trough_date).days),
                     "是否已修复": recovery_idx is not None,
@@ -512,7 +623,13 @@ def extract_drawdown_periods(df: pd.DataFrame) -> pd.DataFrame:
 
     if not periods:
         return pd.DataFrame()
-    return pd.DataFrame(periods).sort_values("回撤深度(%)").reset_index(drop=True)
+
+    periods_df = pd.DataFrame(periods)
+    max_drawdown_abs = abs(float(periods_df["回撤深度(%)"].min()))
+    if max_drawdown_abs > 0:
+        min_depth_abs = max_drawdown_abs / 4
+        periods_df = periods_df[periods_df["回撤深度(%)"].abs() >= min_depth_abs]
+    return periods_df.sort_values("回撤开始日期").reset_index(drop=True)
 
 
 def calculate_yearly_drawdowns(df: pd.DataFrame) -> pd.DataFrame:
@@ -553,7 +670,7 @@ def calculate_yearly_drawdowns(df: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "年份": int(year),
-                "年度最大回撤(%)": round(float(drawdown[trough_idx]), 4),
+                "年度最大回撤(%)": round(float(drawdown[trough_idx]), 2),
                 "最大回撤发生日期": trough_date.strftime("%Y-%m-%d"),
                 "修复完成日期": recovery_date.strftime("%Y-%m-%d"),
                 "修复时间(天)": recovery_days,

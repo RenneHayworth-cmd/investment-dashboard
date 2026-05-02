@@ -7,7 +7,13 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
-from services.fund_analysis import analyze_fund_nav, normalize_nav_dataframe
+from core.plotly_keyboard import enable_plotly_daily_keyboard_navigation
+from services.fund_analysis import (
+    analyze_fund_nav,
+    calculate_current_drawdown_info,
+    normalize_nav_dataframe,
+    resolve_price_axis_type,
+)
 from services.us_stock_analysis import fetch_tickflow_us_daily, infer_us_symbol, parse_us_symbols
 
 
@@ -17,6 +23,15 @@ def _format_metric(value, suffix: str = "") -> str:
     if isinstance(value, float):
         return f"{value:.2f}{suffix}"
     return f"{value}{suffix}"
+
+
+def _format_datetime_text(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value).replace("T", " ")
 
 
 def _load_cache(symbol: str, source: str, data_type: str, period: str = "1d"):
@@ -55,6 +70,65 @@ def _text_metric(label: str, display_value: str, tooltip: str) -> None:
     )
 
 
+def _drawdown_metric_grid(items: list[tuple[str, str, str]]) -> None:
+    cards = []
+    for label, value, tooltip in items:
+        cards.append(
+            (
+                f'<div class="drawdown-metric-card" title="{html.escape(tooltip)}">'
+                f'<div class="drawdown-metric-label">{html.escape(label)}</div>'
+                f'<div class="drawdown-metric-value">{html.escape(value)}</div>'
+                "</div>"
+            )
+        )
+    st.markdown(
+        f"""
+        <style>
+        .drawdown-metric-grid {{
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 1.35rem;
+            margin: 0.75rem 0 1.25rem;
+        }}
+        .drawdown-metric-card {{
+            min-width: 0;
+            min-height: 72px;
+            padding: 0;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+        }}
+        .drawdown-metric-label {{
+            color: rgba(49, 51, 63, 0.72);
+            font-size: clamp(0.9rem, 1.05vw, 1rem);
+            line-height: 1.25;
+            margin-bottom: 0.35rem;
+            overflow-wrap: anywhere;
+        }}
+        .drawdown-metric-value {{
+            color: rgb(49, 51, 63);
+            font-size: clamp(1.15rem, 1.55vw, 1.55rem);
+            line-height: 1.2;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }}
+        @media (max-width: 760px) {{
+            .drawdown-metric-grid {{
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
+        }}
+        @media (max-width: 480px) {{
+            .drawdown-metric-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+        </style>
+        <div class="drawdown-metric-grid">{''.join(cards)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _compact_date_range(start: str | None, end: str | None) -> str:
     if not start or not end:
         return "-"
@@ -76,6 +150,7 @@ with st.sidebar:
     ma_periods = st.multiselect("均线周期", options=[20, 60, 120, 250], default=[20, 60, 120, 250])
     rsi_period = st.number_input("RSI周期", min_value=5, max_value=60, value=14, step=1)
     base_date = st.date_input("区间基准日", value=pd.Timestamp("2025-04-07"))
+    price_axis_mode = st.selectbox("价格轴", options=["自动", "普通坐标", "对数坐标"], index=0)
     force_refresh = st.checkbox("联网更新数据（有缓存时增量）", value=False)
     save_to_cache = st.checkbox("分析后保存分析结果", value=True)
 
@@ -112,7 +187,7 @@ try:
 
     if cached_df is not None and not force_refresh:
         source_df = cached_df
-        st.info(f"已使用本地缓存，缓存时间：{cache_meta['last_update_time']}")
+        st.info(f"已使用本地缓存，缓存时间：{_format_datetime_text(cache_meta['last_update_time'])}")
     else:
         if cached_df is not None:
             incremental_count = min(max(120, int(count) // 20), int(count))
@@ -188,13 +263,15 @@ tabs = st.tabs(["走势", "回撤分析", "摘要", "指标数据", "原始数�
 
 with tabs[0]:
     df = result.dataframe.copy()
+    price_columns = ["price", *[f"ma_{period_item}" for period_item in ma_periods]]
+    price_axis_type = resolve_price_axis_type(df, price_axis_mode, price_columns=price_columns)
     fig = make_subplots(
         rows=4,
         cols=1,
         shared_xaxes=True,
         row_heights=[0.50, 0.18, 0.16, 0.16],
         vertical_spacing=0.04,
-        subplot_titles=("价格与均线", "RSI", "20日涨幅", summary.get("滚动年化类型", "滚动年化收益率")),
+        subplot_titles=("日K线", "RSI", "20日涨幅", summary.get("滚动年化类型", "滚动年化收益率")),
     )
     fig.add_trace(go.Scatter(x=df["date"], y=df["price"], mode="lines", name="价格", line=dict(width=2)), row=1, col=1)
     ma_colors = {20: "#eab308", 60: "#2563eb", 120: "#dc2626", 250: "#059669"}
@@ -219,38 +296,45 @@ with tabs[0]:
     )
     fig.add_hline(y=0, line_color="#6b7280", row=4, col=1)
     fig.update_layout(height=900, hovermode="x unified", legend=dict(orientation="h"))
-    fig.update_yaxes(title_text="价格", row=1, col=1)
+    fig.update_xaxes(hoverformat="%Y-%m-%d")
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), row=4, col=1)
+    price_yaxis_options = {
+        "title_text": "价格（对数）" if price_axis_type == "log" else "价格",
+        "type": price_axis_type,
+        "row": 1,
+        "col": 1,
+    }
+    if price_axis_type == "linear":
+        price_yaxis_options["rangemode"] = "tozero"
+    fig.update_yaxes(**price_yaxis_options)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     fig.update_yaxes(title_text="涨幅%", row=3, col=1)
     fig.update_yaxes(title_text="年化%", row=4, col=1)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    enable_plotly_daily_keyboard_navigation()
 
 with tabs[1]:
     df = result.dataframe.copy()
+    price_axis_type = resolve_price_axis_type(df, price_axis_mode, price_columns=("price", "running_peak"))
     drawdown_info = {
         "峰值日": summary.get("最大回撤峰值日"),
         "谷底日": summary.get("最大回撤谷底日"),
-        "修复日": summary.get("最大回撤修复日"),
-        "下跌天数": summary.get("最大回撤下跌天数"),
-        "修复天数": summary.get("最大回撤修复天数"),
-        "是否已修复": summary.get("最大回撤是否已修复"),
     }
-    info_cols = st.columns(4)
-    with info_cols[0]:
-        st.metric("最大回撤", _format_metric(summary.get("最大回撤(%)"), "%"))
-    with info_cols[1]:
-        full = f"{drawdown_info['峰值日']} → {drawdown_info['谷底日']}"
-        _text_metric("峰值日 → 谷底日", _compact_date_range(drawdown_info["峰值日"], drawdown_info["谷底日"]), full)
-    with info_cols[2]:
-        st.metric("下跌天数", _format_metric(drawdown_info["下跌天数"], "天"))
-    with info_cols[3]:
-        if drawdown_info["是否已修复"]:
-            recovery_text = f"已修复：{_format_metric(drawdown_info['修复天数'], '天')}"
-            recovery_display = recovery_text
-        else:
-            recovery_text = f"未修复，截至 {drawdown_info['修复日']}"
-            recovery_display = "未修复"
-        _text_metric("修复状态", recovery_display, recovery_text)
+    current_drawdown_info = calculate_current_drawdown_info(df)
+    current_status = str(current_drawdown_info.get("当前修复状态") or "-")
+    current_tooltip = (
+        f"当前回撤峰值日：{current_drawdown_info.get('当前回撤峰值日', '-')}"
+        f"；当前谷底日：{current_drawdown_info.get('当前谷底日', '-')}"
+    )
+    _drawdown_metric_grid(
+        [
+            ("最大回撤", _format_metric(summary.get("最大回撤(%)"), "%"), "历史最大回撤"),
+            ("谷底日期", str(drawdown_info["谷底日"] or "-"), f"最大回撤峰值日：{drawdown_info['峰值日'] or '-'}"),
+            ("当前回撤", _format_metric(current_drawdown_info.get("当前回撤(%)"), "%"), "最新交易日相对历史高点的回撤"),
+            ("当前回撤时间", _format_metric(current_drawdown_info.get("当前回撤时间"), "天"), "从当前回撤峰值日至最新交易日"),
+            ("修复状态", current_status, current_tooltip),
+        ]
+    )
 
     dd_fig = make_subplots(
         rows=2,
@@ -278,16 +362,26 @@ with tabs[1]:
     dd_fig.add_trace(go.Scatter(x=df["date"], y=df["drawdown_pct"], mode="lines", fill="tozeroy", name="回撤(%)", line=dict(color="#dc2626")), row=2, col=1)
     dd_fig.add_hline(y=0, line_color="#6b7280", row=2, col=1)
     dd_fig.update_layout(height=720, hovermode="x unified", legend=dict(orientation="h"))
-    dd_fig.update_yaxes(title_text="价格", row=1, col=1)
+    dd_fig.update_xaxes(hoverformat="%Y-%m-%d")
+    dd_fig.update_yaxes(
+        title_text="价格（对数）" if price_axis_type == "log" else "价格",
+        type=price_axis_type,
+        row=1,
+        col=1,
+    )
     dd_fig.update_yaxes(title_text="回撤%", row=2, col=1)
     st.plotly_chart(dd_fig, use_container_width=True)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("回撤波段")
+    st.subheader("回撤波段")
+    if result.drawdown_periods.empty:
+        st.info("没有发现独立回撤波段。")
+    else:
         st.dataframe(result.drawdown_periods, use_container_width=True, hide_index=True)
-    with col_b:
-        st.subheader("年度最大回撤")
+
+    st.subheader("年度最大回撤")
+    if result.yearly_drawdowns.empty:
+        st.info("没有年度回撤数据。")
+    else:
         st.dataframe(result.yearly_drawdowns, use_container_width=True, hide_index=True)
 
 with tabs[2]:
