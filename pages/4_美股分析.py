@@ -7,7 +7,6 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
-from core.plotly_keyboard import enable_plotly_daily_keyboard_navigation
 from services.fund_analysis import (
     analyze_fund_nav,
     calculate_current_drawdown_info,
@@ -311,7 +310,6 @@ with tabs[0]:
     fig.update_yaxes(title_text="涨幅%", row=3, col=1)
     fig.update_yaxes(title_text="年化%", row=4, col=1)
     st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
-    enable_plotly_daily_keyboard_navigation()
 
 with tabs[1]:
     df = result.dataframe.copy()
