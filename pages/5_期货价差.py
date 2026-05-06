@@ -89,7 +89,7 @@ def centered_table(df: pd.DataFrame) -> None:
 
 with st.sidebar:
     st.subheader("参数")
-    contracts_text = st.text_area("合约代码", value="IM2605 IM2606", height=90)
+    contracts_text = st.text_area("合约代码", value="IM2606 IM2612", height=90)
     api_key = st.text_input(
         "TickFlow API Key",
         value="",
@@ -111,7 +111,7 @@ with st.sidebar:
     analyze_clicked = st.button("获取数据并分析", type="primary")
 
 if not contracts:
-    st.info("请输入至少两个合约代码，例如：IM2605 IM2606。")
+    st.info("请输入至少两个合约代码，例如：IM2606 IM2612。")
     st.stop()
 
 if len(contracts) < 2:

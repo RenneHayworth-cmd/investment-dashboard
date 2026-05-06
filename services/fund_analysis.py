@@ -230,9 +230,14 @@ def fetch_tickflow_fund_close(
     if "trade_date" not in normalized.columns or "close" not in normalized.columns:
         raise ValueError(f"TickFlow 返回列无法识别：{list(normalized.columns)}")
 
-    result = normalized[["trade_date", "close"]].copy()
-    result.columns = ["日期", "收盘价"]
+    columns = ["trade_date", "close"]
+    if "open" in normalized.columns:
+        columns.insert(1, "open")
+    result = normalized[columns].copy()
+    result.columns = ["日期", "开盘价", "收盘价"] if "open" in normalized.columns else ["日期", "收盘价"]
     result["日期"] = pd.to_datetime(result["日期"], errors="coerce")
+    if "开盘价" in result.columns:
+        result["开盘价"] = pd.to_numeric(result["开盘价"], errors="coerce")
     result["收盘价"] = pd.to_numeric(result["收盘价"], errors="coerce")
     result = result.dropna(subset=["日期", "收盘价"])
     result = result.sort_values("日期").drop_duplicates("日期").reset_index(drop=True)
