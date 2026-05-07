@@ -1,4 +1,5 @@
 import html
+import os
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -162,15 +163,15 @@ def _merge_raw_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.Dat
     return merged.sort_values("日期").drop_duplicates("日期", keep="last").reset_index(drop=True)
 
 
-st.set_page_config(page_title="基金分析", layout="wide")
+st.set_page_config(page_title="A股分析", layout="wide")
 init_db()
 
-st.title("基金分析")
-st.caption("输入基金代码或上传净值文件，计算均线、RSI、涨跌幅、波动率、百分位和回撤。")
+st.title("A股分析")
+st.caption("输入场外基金、场内基金或 A 股股票代码，或上传净值/价格文件，计算均线、RSI、涨跌幅、波动率、百分位和回撤。")
 
 with st.sidebar:
     st.subheader("分析设置")
-    input_mode = st.radio("数据来源", options=["场外基金", "场内基金/ETF", "上传文件"], horizontal=False)
+    input_mode = st.radio("数据来源", options=["场外基金", "场内基金/股票", "上传文件"], horizontal=False)
     ma_periods = st.multiselect(
         "均线周期",
         options=[20, 60, 120, 250],
@@ -252,21 +253,21 @@ if input_mode == "场外基金":
     except Exception as exc:
         st.error(f"分析失败：{exc}")
         st.stop()
-elif input_mode == "场内基金/ETF":
+elif input_mode == "场内基金/股票":
     with st.form("exchange_fund_form"):
         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
         with col1:
-            fund_code = st.text_input("场内代码", value="512890", placeholder="例如 512890 或 512890.SH")
+            fund_code = st.text_input("场内代码", value="512890", placeholder="例如 512890、600519 或 512890.SH")
         with col2:
             count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         with col3:
             adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
         with col4:
-            api_key = st.text_input("API Key", value="", type="password")
+            api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         submitted = st.form_submit_button("拉取并分析", type="primary")
 
     if not submitted:
-        st.info("输入场内基金/ETF 代码后点击「拉取并分析」。场内基金使用 TickFlow 日收盘价。")
+        st.info("输入场内基金或股票代码后点击「拉取并分析」。场内数据使用 TickFlow 日收盘价。")
         st.stop()
 
     adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
@@ -307,15 +308,15 @@ elif input_mode == "场内基金/ETF":
                     )
             save_dataset(
                 symbol=raw_symbol,
-                name=f"{symbol} 场内基金原始收盘价",
+                name=f"{symbol} 场内基金/股票原始收盘价",
                 source="tickflow",
                 data_type="fund_close_raw",
                 period=f"{int(count)}_1d",
                 df=source_df,
             )
-        fund_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=f"{symbol} 场内基金")
+        fund_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=f"{symbol} 场内基金/股票")
         if fund_name == symbol:
-            fund_name = f"{fund_name} 场内基金/ETF"
+            fund_name = f"{fund_name} 场内基金/股票"
         result = analyze_fund_nav(
             nav_df,
             fund_name=fund_name,
@@ -354,7 +355,7 @@ else:
 if save_to_cache:
     save_dataset(
         symbol=f"fund_analysis_{fund_name}",
-        name=f"{fund_name} 基金分析",
+        name=f"{fund_name} A股分析",
         source=cache_source,
         data_type="fund_analysis",
         df=result.dataframe,

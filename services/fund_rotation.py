@@ -31,6 +31,7 @@ class RotationResult:
     trades: pd.DataFrame
     summary: dict[str, object]
     individual_results: pd.DataFrame = field(default_factory=pd.DataFrame)
+    individual_nav_data: pd.DataFrame = field(default_factory=pd.DataFrame)
     drawdown: pd.DataFrame = field(default_factory=pd.DataFrame)
     yearly_stats: pd.DataFrame = field(default_factory=pd.DataFrame)
 
@@ -129,7 +130,6 @@ def run_fund_rotation_backtest(
         execution_prices: dict[str, float] = {}
 
         if holdings_changed and current_shares:
-            cash_value = 0.0
             for symbol, shares in current_shares.items():
                 price = _trade_price(row, symbol, side="sell")
                 gross_value = shares * price
@@ -222,6 +222,7 @@ def run_fund_rotation_backtest(
 
     drawdown_df = _calculate_drawdown(nav_df)
     individual_df = _calculate_individual_results(source_data, symbol_names, start_date, initial_capital)
+    individual_nav_df = _calculate_individual_nav_data(source_data, symbol_names, start_date, initial_capital)
     yearly_stats = _calculate_yearly_stats(nav_df)
     summary = _build_summary(
         nav_df=nav_df,
@@ -241,6 +242,7 @@ def run_fund_rotation_backtest(
         trades=trades_df,
         summary=summary,
         individual_results=individual_df,
+        individual_nav_data=individual_nav_df,
         drawdown=drawdown_df,
         yearly_stats=yearly_stats,
     )
@@ -404,7 +406,7 @@ def _trade_lot_size(funds: list[RotationInput], symbol: str) -> int:
 def _round_lot_shares(shares: float, lot_size: int = LOT_SIZE) -> float:
     if shares <= 0:
         return 0.0
-    if lot_size <= 1:
+    if lot_size <= 0:
         return float(shares)
     return float(int(shares // lot_size) * lot_size)
 
@@ -456,6 +458,36 @@ def _calculate_individual_results(
                 "期末资金": round(initial_capital * (1 + total_return), 2),
             }
         )
+    return pd.DataFrame(rows)
+
+
+def _calculate_individual_nav_data(
+    source_data: dict[str, pd.DataFrame],
+    names: dict[str, str],
+    start_date: pd.Timestamp,
+    initial_capital: float,
+) -> pd.DataFrame:
+    rows = []
+    for symbol, df in source_data.items():
+        data = df[df["trade_date"] >= start_date].copy()
+        if data.empty:
+            continue
+        first = pd.to_numeric(data["close"].iloc[0], errors="coerce")
+        if pd.isna(first) or float(first) <= 0:
+            continue
+        data["close"] = pd.to_numeric(data["close"], errors="coerce")
+        data = data.dropna(subset=["trade_date", "close"])
+        for _, row in data.iterrows():
+            value = float(row["close"]) / float(first) * initial_capital
+            rows.append(
+                {
+                    "日期": row["trade_date"],
+                    "标的": names.get(symbol, symbol),
+                    "代码": symbol,
+                    "单独持有净值": round(value, 2),
+                    "累计收益率(%)": round((value / initial_capital - 1) * 100, 2),
+                }
+            )
     return pd.DataFrame(rows)
 
 

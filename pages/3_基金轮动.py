@@ -1,7 +1,10 @@
+import os
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from core.cache import load_dataset, save_dataset
 from core.db import init_db
 from services.fund_analysis import (
     fetch_eastmoney_fund_nav,
@@ -24,6 +27,15 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
+def format_cache_time(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value).replace("T", " ")
+
+
 def render_nav_chart(nav_df: pd.DataFrame, individual_df: pd.DataFrame | None = None) -> None:
     fig = go.Figure()
     fig.add_trace(
@@ -36,6 +48,19 @@ def render_nav_chart(nav_df: pd.DataFrame, individual_df: pd.DataFrame | None = 
             line=dict(width=2.4, color="#d62728"),
         )
     )
+    if individual_df is not None and not individual_df.empty:
+        for _, group in individual_df.groupby("标的", sort=False):
+            label = str(group["标的"].iloc[0])
+            fig.add_trace(
+                go.Scatter(
+                    x=group["日期"],
+                    y=group["单独持有净值"],
+                    mode="lines",
+                    name=f"单独持有：{label}",
+                    hovertemplate="%{x|%Y-%m-%d}<br>净值=%{y:.2f}<extra></extra>",
+                    line=dict(width=1.6, dash="dot"),
+                )
+            )
     fig.update_layout(
         height=520,
         margin=dict(l=10, r=10, t=30, b=10),
@@ -104,6 +129,7 @@ with st.sidebar:
     adjust_option = "前复权"
     api_key = ""
     max_workers = 8
+    force_refresh = False
     if data_source == "上传文件":
         uploaded_files = st.file_uploader(
             "基金数据文件",
@@ -119,8 +145,9 @@ with st.sidebar:
         )
         count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0)
-        api_key = st.text_input("TickFlow API Key", value="", type="password")
-    else:
+        api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
+        force_refresh = st.checkbox("联网更新数据", value=False)
+    elif data_source == "场外基金":
         eastmoney_codes = st.text_area(
             "场外基金代码",
             value="",
@@ -132,7 +159,13 @@ with st.sidebar:
     lookback_period = st.number_input("动量周期", min_value=1, max_value=500, value=22, step=1)
     num_positions = st.number_input("持仓数量", min_value=1, max_value=20, value=1, step=1)
     initial_capital = st.number_input("初始资金", min_value=1000.0, value=100000.0, step=10000.0)
-    transaction_cost_bp = st.number_input("单边交易成本（万分之）", min_value=0.0, value=0.6, step=0.1)
+    transaction_cost_bp = st.number_input(
+        "单边交易成本（万分之）",
+        min_value=0.0,
+        value=0.6,
+        step=0.1,
+        key=f"rotation_transaction_cost_bp_{data_source}",
+    )
     run_clicked = st.button("运行轮动回测", type="primary")
 
 if data_source == "上传文件" and not uploaded_files:
@@ -182,7 +215,7 @@ try:
                             max_workers=int(max_workers),
                         )
                     fund = normalize_rotation_dataframe(raw_df, fallback_name=f"{code} 场外基金")
-                    fund.trade_lot_size = 1
+                    fund.trade_lot_size = 0
                     funds.append(fund)
                 except Exception as exc:
                     errors.append(f"{code}: {exc}")
@@ -200,13 +233,37 @@ try:
             for code in codes:
                 try:
                     symbol = infer_tickflow_symbol(code)
-                    with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."):
-                        raw_df = fetch_tickflow_fund_close(
-                            symbol=symbol,
-                            api_key=api_key,
-                            count=int(count),
-                            adjust=adjust_value,
+                    cache_symbol = f"fund_rotation_{symbol}_{adjust_value}"
+                    cache_period = f"{int(count)}_1d"
+                    cached_df, cache_meta = load_dataset(
+                        cache_symbol,
+                        "tickflow_fund_rotation",
+                        "fund_rotation_raw",
+                        period=cache_period,
+                    )
+                    if cached_df is not None and not force_refresh:
+                        raw_df = cached_df
+                        st.info(
+                            f"{symbol} 已使用本地缓存，缓存时间："
+                            f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
                         )
+                    else:
+                        with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."):
+                            raw_df = fetch_tickflow_fund_close(
+                                symbol=symbol,
+                                api_key=api_key,
+                                count=int(count),
+                                adjust=adjust_value,
+                            )
+                        save_dataset(
+                            cache_symbol,
+                            f"{symbol} {adjust_option}",
+                            "tickflow_fund_rotation",
+                            "fund_rotation_raw",
+                            raw_df,
+                            period=cache_period,
+                        )
+                        st.success(f"{symbol} 已更新并保存到本地缓存。")
                     funds.append(normalize_rotation_dataframe(raw_df, fallback_name=f"{symbol} {adjust_option}"))
                 except Exception as exc:
                     errors.append(f"{code}: {exc}")
@@ -258,7 +315,7 @@ tab_nav, tab_drawdown, tab_trades, tab_daily, tab_summary = st.tabs(
 )
 
 with tab_nav:
-    render_nav_chart(result.nav_data, result.individual_results)
+    render_nav_chart(result.nav_data, result.individual_nav_data)
     st.download_button(
         "下载每日净值 CSV",
         data=to_csv_bytes(result.nav_data),

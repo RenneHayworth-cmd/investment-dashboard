@@ -14,8 +14,14 @@ def infer_us_symbol(code: str) -> str:
     code = code.strip().upper()
     if not code:
         raise ValueError("美股代码不能为空。")
-    if "." in code:
+    if code.endswith(".US"):
         return code
+    if "." in code:
+        return f"{code}.US"
+    if "-" in code:
+        return f"{code.replace('-', '.', 1)}.US"
+    if "_" in code:
+        return f"{code.replace('_', '.', 1)}.US"
     return f"{code}.US"
 
 
@@ -79,4 +85,3 @@ def fetch_tickflow_us_name(symbol: str, api_key: str = "") -> str:
     except Exception:
         pass
     return symbol
-

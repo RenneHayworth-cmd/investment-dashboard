@@ -44,6 +44,22 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS correlation_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_a TEXT NOT NULL,
+            asset_b TEXT NOT NULL,
+            correlation REAL NOT NULL,
+            strength TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            common_days INTEGER,
+            source_summary TEXT,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 

@@ -20,7 +20,7 @@ with st.sidebar:
     st.subheader("后台更新")
     api_key = st.text_input(
         "API Key",
-        value="",
+        value=os.getenv("TICKFLOW_API_KEY", ""),
         type="password",
         placeholder="可选；仅本次启动后台时传入",
     )

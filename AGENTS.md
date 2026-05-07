@@ -22,6 +22,10 @@ Open the app from Windows or WSL at:
 http://localhost:8501
 ```
 
+For local runs, TickFlow API Key inputs default to the `TICKFLOW_API_KEY`
+environment variable when it is set. Users can still override the key in the
+Streamlit sidebar or form fields.
+
 Do not install dependencies into the system Python. Use:
 
 ```bash
@@ -78,6 +82,7 @@ not ISO strings containing `T`.
 The project currently uses:
 
 - TickFlow for futures, funds/ETFs, US stocks, and some index data.
+- EastMoney for off-exchange mutual fund cumulative NAV data.
 - AkShare as fallback or as the primary source for some China market and options
   data.
 - SQLite and CSV files for local cache.
@@ -93,6 +98,37 @@ For futures:
 - Futures drawdown analysis is useful, but futures options should usually focus
   on走势、波动、成交量、持仓量 rather than standard drawdown tables.
 
+For fund rotation:
+
+- The app now has a dedicated `基金轮动` page after `A股分析`.
+- Data sources include uploaded files, TickFlow exchange-traded funds/ETFs, and
+  EastMoney off-exchange mutual funds.
+- TickFlow fund rotation data is cached with `core.cache`; default behavior is
+  to reuse local cache and fetch fresh data only when the page's refresh option
+  is enabled.
+- Rotation signals use the previous trading day's close/NAV and require a full
+  lookback window before the first rebalance date.
+- Exchange-traded ETFs are modeled with rebalance execution at the trading day's
+  open, buy slippage `+0.05%`, sell slippage `-0.05%`, and 100-share lot-size
+  rounding with residual cash retained.
+- Off-exchange mutual funds are modeled with cumulative NAV as the execution
+  proxy and do not use 100-share lot rounding.
+
+For correlation analysis:
+
+- The `相关性分析` page sits after `基金轮动`.
+- It computes Pearson correlation coefficients `r` on close prices or daily
+  returns after inner joining all selected symbols by common dates.
+- It supports full-range, recent 1/3/5-year, and custom-date calculation
+  windows before the common-date join.
+- Supported sources are uploaded CSV/Excel files, TickFlow A-share ETFs,
+  TickFlow US stocks, and futures main-continuous data.
+- The sources can be mixed in one run; any non-empty A-share ETF, US stock,
+  futures, or uploaded-file inputs should be combined into one matrix.
+- The page persists pairwise analysis results in SQLite table
+  `correlation_results`; the right side shows saved results across app sessions
+  and supports deleting selected rows.
+
 ## Development Style
 
 - Follow existing Streamlit patterns in the app.
@@ -104,6 +140,9 @@ For futures:
   market data.
 - Use `plotly` for charts, matching existing chart style and tab layout.
 - Do not add large visual redesigns unless explicitly requested.
+- For functional changes that alter page structure, user-visible capabilities,
+  data sources, or trading/backtest rules, also check whether `app.py`,
+  `README.md`, and `AGENTS.md` need corresponding updates in the same change.
 
 ## Git
 
@@ -115,4 +154,3 @@ git diff --stat
 ```
 
 Commit only relevant source changes. Do not revert unrelated user changes.
-

@@ -1,4 +1,5 @@
 import html
+import os
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -162,7 +163,7 @@ with st.form("us_stock_form"):
     with col3:
         adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
     with col4:
-        api_key = st.text_input("TickFlow Key", value="", type="password")
+        api_key = st.text_input("TickFlow Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     submitted = st.form_submit_button("拉取并分析", type="primary")
 
 if not submitted:

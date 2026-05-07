@@ -1,5 +1,6 @@
 from datetime import datetime
 import html
+import os
 
 import pandas as pd
 import streamlit as st
@@ -74,7 +75,7 @@ with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
         "API Key",
-        value="",
+        value=os.getenv("TICKFLOW_API_KEY", ""),
         type="password",
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
@@ -120,7 +121,7 @@ if not update_clicked and not st.session_state.index_auto_update_done:
     st.session_state.index_auto_update_done = True
     with st.spinner("正在检查今日指数数据..."):
         auto_result = run_index_ma20_update(
-            api_key="",
+            api_key=os.getenv("TICKFLOW_API_KEY", ""),
             days=int(days),
             cache_source="auto",
             use_fresh_cache=True,
@@ -157,6 +158,11 @@ if report_df is not None:
                 )
 
         display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
+        if "偏离率(%)" in display_summary_df.columns:
+            display_summary_df = display_summary_df.assign(
+                _sort_deviation=pd.to_numeric(display_summary_df["偏离率(%)"], errors="coerce")
+            ).sort_values("_sort_deviation", ascending=False, na_position="last")
+            display_summary_df = display_summary_df.drop(columns=["_sort_deviation"])
         centered_table(display_summary_df)
 
     with st.expander("查看完整分列数据", expanded=False):

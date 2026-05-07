@@ -1,4 +1,5 @@
 import html
+import os
 
 import pandas as pd
 import plotly.express as px
@@ -92,7 +93,7 @@ with st.sidebar:
     contracts_text = st.text_area("合约代码", value="IM2606 IM2612", height=90)
     api_key = st.text_input(
         "TickFlow API Key",
-        value="",
+        value=os.getenv("TICKFLOW_API_KEY", ""),
         type="password",
         placeholder="可选；填入后使用实时更新的日线",
     )

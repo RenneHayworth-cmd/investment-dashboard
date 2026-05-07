@@ -1,4 +1,5 @@
 import html
+import os
 import re
 
 import pandas as pd
@@ -199,7 +200,7 @@ with st.sidebar:
     period = st.selectbox("K线周期", options=["1d", "1w", "1M", "1Q", "1Y"], index=0)
     count = st.number_input("获取条数", min_value=20, max_value=10000, value=500, step=100)
     ma_periods = st.multiselect("均线周期", options=[5, 10, 20, 60, 120], default=[5, 20, 60])
-    api_key = st.text_input("TickFlow API Key", value="", type="password")
+    api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     use_free = st.checkbox("使用免费历史数据服务", value=True)
     force_refresh = st.checkbox("联网更新数据", value=False)
     save_to_cache = st.checkbox("分析后保存到本地缓存", value=True)
