@@ -170,6 +170,7 @@ def list_correlation_results(limit: int = 200) -> pd.DataFrame:
             start_date AS 开始日期,
             end_date AS 结束日期,
             common_days AS 共同日期数,
+            source_summary AS 计算说明,
             created_at AS 计算时间
         FROM correlation_results
         ORDER BY id DESC

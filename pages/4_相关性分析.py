@@ -1,10 +1,9 @@
 import os
-import html
 
 import pandas as pd
 import streamlit as st
 
-from core.cache import load_dataset, save_dataset
+from core.cache import list_datasets, load_dataset, save_dataset
 from core.db import init_db
 from services.correlation_analysis import (
     calculate_price_correlation,
@@ -69,112 +68,342 @@ with st.sidebar:
     st.subheader("参数")
     count = st.number_input("日线条数", min_value=60, max_value=10000, value=2500, step=100)
     adjust_option = st.selectbox("股票/ETF复权", options=["前复权", "后复权", "不复权"], index=0)
-    correlation_method = st.selectbox("计算方式", options=["收盘价相关", "日收益率相关"], index=0)
-    range_option = st.selectbox("计算区间", options=["全区间", "最近1年", "最近3年", "最近5年", "自定义"], index=0)
-    custom_start = None
-    custom_end = None
-    if range_option == "自定义":
-        custom_start = st.date_input("开始日期", value=pd.Timestamp.today() - pd.DateOffset(years=3))
-        custom_end = st.date_input("结束日期", value=pd.Timestamp.today())
+    correlation_method = st.selectbox("计算方式", options=["收盘价相关", "日收益率相关"], index=1)
     api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     force_refresh = st.checkbox("联网更新数据", value=False)
     calculate_clicked = st.button("计算相关系数", type="primary")
 
-left_col, right_col = st.columns([3, 1.35])
-history_box = right_col.empty()
-
-
 def render_results_panel() -> None:
-    with history_box.container():
-        st.subheader("相关性分析结果")
-        saved_df = list_correlation_results()
-        if not saved_df.empty:
-            render_saved_results(saved_df)
-            delete_options = {
-                f"{row['标的A']} / {row['标的B']}  {row['相关系数r']:.4f}  {row['相关性']}": int(row["id"])
-                for _, row in saved_df.iterrows()
-            }
-            selected = st.multiselect(
-                "删除结果",
-                options=list(delete_options.keys()),
-                key="correlation_delete_selection",
-            )
-            if st.button("删除选中结果", key="correlation_delete_button") and selected:
-                delete_correlation_results([delete_options[item] for item in selected])
-                st.rerun()
-        else:
-            st.info("计算完成后会保存到这里，下次打开页面仍会展示。")
+    st.subheader("相关性分析结果")
+    saved_df = list_correlation_results(limit=2000)
+    if not saved_df.empty:
+        completed_count = auto_complete_missing_cached_results(saved_df, correlation_method)
+        if completed_count:
+            st.toast(f"已用本地缓存自动补全 {completed_count} 个相关系数。")
+            st.rerun()
+        render_saved_results(saved_df)
+    else:
+        st.info("计算完成后会保存到这里，下次打开页面仍会展示。")
 
 
 def render_saved_results(df: pd.DataFrame) -> None:
-    rows = []
-    for _, row in df.iterrows():
-        asset_a = format_asset_label_html(row["标的A"])
-        asset_b = format_asset_label_html(row["标的B"])
-        rows.append(
-            "<tr>"
-            f"<td>{asset_a}</td>"
-            f"<td>{asset_b}</td>"
-            f"<td class=\"corr-r\">{float(row['相关系数r']):.4f}</td>"
-            f"<td>{html.escape(str(row['相关性']))}</td>"
-            "</tr>"
+    groups = build_saved_groups(df)
+    if not groups:
+        st.info("还没有可展示的历史结果。")
+        return
+
+    for group in groups:
+        st.markdown(f"#### {group['label']}")
+        detail_cols = st.columns(4)
+        detail_cols[0].caption(f"区间：{group['date_range']}")
+        detail_cols[1].caption(f"共同日期数：{group['common_days']}")
+        detail_cols[2].caption(f"计算方式：{group['method_summary']}")
+        detail_cols[3].caption(f"已合并标的数：{len(group['assets'])}")
+
+        st.dataframe(build_saved_matrix(group["data"]), use_container_width=True)
+        if st.button("删除这个矩阵", key=f"delete_correlation_group_{group['key']}"):
+            delete_correlation_results(group["ids"])
+            st.rerun()
+
+
+def build_saved_groups(df: pd.DataFrame) -> list[dict[str, object]]:
+    groups: dict[tuple[str, str], dict[str, object]] = {}
+    seen_pairs_by_group: dict[tuple[str, str], set[tuple[str, str]]] = {}
+
+    for _, row in df.sort_values("id", ascending=False).iterrows():
+        source_summary = display_value(row.get("计算说明"))
+        asset_a = format_asset_label_text(row["标的A"])
+        asset_b = format_asset_label_text(row["标的B"])
+        category_a = classify_asset_category(asset_a, source_summary)
+        category_b = classify_asset_category(asset_b, source_summary)
+        category = category_a if category_a == category_b else "跨资产"
+        group_key = category
+        pair_key = tuple(sorted((asset_a, asset_b)))
+
+        group = groups.setdefault(
+            group_key,
+            {
+                "key": category,
+                "label": category,
+                "category": category,
+                "ids": [],
+                "assets": [],
+                "data_rows": [],
+                "created_at": None,
+            },
         )
-    st.markdown(
-        f"""
-        <style>
-        .correlation-results-table {{
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: fixed;
-            font-size: 0.84rem;
-        }}
-        .correlation-results-table th,
-        .correlation-results-table td {{
-            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
-            padding: 0.45rem 0.25rem;
-            text-align: left;
-            vertical-align: top;
-            white-space: normal;
-            overflow-wrap: anywhere;
-            word-break: break-word;
-        }}
-        .correlation-results-table th {{
-            color: rgba(49, 51, 63, 0.72);
-            font-weight: 600;
-        }}
-        .correlation-results-table .asset-code {{
-            display: block;
-            color: rgba(49, 51, 63, 0.68);
-            margin-top: 0.12rem;
-        }}
-        .correlation-results-table .corr-r {{
-            font-variant-numeric: tabular-nums;
-            white-space: nowrap;
-        }}
-        </style>
-        <table class="correlation-results-table">
-            <thead>
-                <tr>
-                    <th style="width:34%;">标的A</th>
-                    <th style="width:34%;">标的B</th>
-                    <th style="width:16%;">r</th>
-                    <th style="width:16%;">相关性</th>
-                </tr>
-            </thead>
-            <tbody>{''.join(rows)}</tbody>
-        </table>
-        """,
-        unsafe_allow_html=True,
-    )
+        group["ids"].append(int(row["id"]))
+        for asset in (asset_a, asset_b):
+            if asset not in group["assets"]:
+                group["assets"].append(asset)
+
+        row_time = pd.to_datetime(row.get("计算时间"), errors="coerce")
+        current_time = pd.to_datetime(group["created_at"], errors="coerce")
+        if group["created_at"] is None or (not pd.isna(row_time) and (pd.isna(current_time) or row_time > current_time)):
+            group["created_at"] = row.get("计算时间")
+
+        seen_pairs = seen_pairs_by_group.setdefault(group_key, set())
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        group["data_rows"].append(row)
+
+    result = []
+    for group in groups.values():
+        data = pd.DataFrame(group["data_rows"])
+        if data.empty:
+            continue
+        group["data"] = data
+        group["date_range"] = summarize_date_range(data)
+        group["common_days"] = summarize_common_days(data)
+        group["method_summary"] = summarize_methods(data)
+        group["key"] = f"{group['key']}_{max(group['ids'])}"
+        result.append(group)
+
+    return sorted(result, key=lambda item: category_sort_key(item["category"]))
 
 
-def format_asset_label_html(value: object) -> str:
-    text = str(value)
-    text = format_futures_asset_text(text)
-    parts = text.rsplit(" ", 1)
-    if len(parts) == 2 and "." in parts[1]:
-        return f"{html.escape(parts[0])}<span class=\"asset-code\">{html.escape(parts[1])}</span>"
-    return html.escape(text)
+def auto_complete_missing_cached_results(df: pd.DataFrame, method_label: str) -> int:
+    cached_items = load_cached_correlation_items()
+    if not cached_items:
+        return 0
+
+    completed = 0
+    for group in build_saved_groups(df):
+        assets = list(group["assets"])
+        existing_pairs = {
+            tuple(sorted((format_asset_label_text(row["标的A"]), format_asset_label_text(row["标的B"]))))
+            for _, row in group["data"].iterrows()
+        }
+        category = group["category"]
+        source_summary = f"{category_to_source_summary(category)}；{method_label}"
+        method_value = "return" if method_label == "日收益率相关" else "price"
+        for left_index, asset_a in enumerate(assets):
+            for asset_b in assets[left_index + 1 :]:
+                pair_key = tuple(sorted((asset_a, asset_b)))
+                if pair_key in existing_pairs:
+                    continue
+                item_a = cached_items.get(asset_a)
+                item_b = cached_items.get(asset_b)
+                if item_a is None or item_b is None:
+                    continue
+                try:
+                    result = calculate_price_correlation([item_a, item_b], method=method_value)
+                    save_correlation_results(result.pair_table, result.summary, source_summary=source_summary)
+                    existing_pairs.add(pair_key)
+                    completed += 1
+                except Exception:
+                    continue
+    return completed
+
+
+def load_cached_correlation_items() -> dict[str, object]:
+    try:
+        datasets = list_datasets()
+    except Exception:
+        return {}
+    if datasets.empty:
+        return {}
+
+    datasets = datasets[
+        datasets["source"].isin(["tickflow_correlation", "akshare_correlation"])
+        & datasets["data_type"].isin(["cn_etf_correlation_raw", "us_correlation_raw", "futures_main_correlation_raw"])
+    ].copy()
+    if datasets.empty:
+        return {}
+    datasets["last_update_time"] = pd.to_datetime(datasets["last_update_time"], errors="coerce")
+    datasets = datasets.sort_values("last_update_time", ascending=False)
+
+    items = {}
+    for _, row in datasets.iterrows():
+        try:
+            raw_df = pd.read_csv(row["file_path"])
+            category = source_to_category_from_dataset(row["source"], row["data_type"])
+            symbol = cached_symbol_from_dataset(str(row["symbol"]), category)
+            name = cached_name_from_dataset(str(row["name"]), symbol, category)
+            item = normalize_price_dataframe(raw_df, fallback_name=name, fallback_symbol=symbol)
+            label = format_asset_label_text(correlation_item_label(item))
+            items.setdefault(label, item)
+        except Exception:
+            continue
+    return items
+
+
+def source_to_category_from_dataset(source: str, data_type: str) -> str:
+    if source == "akshare_correlation" or data_type == "futures_main_correlation_raw":
+        return "期货主连"
+    if data_type == "us_correlation_raw":
+        return "美股"
+    if data_type == "cn_etf_correlation_raw":
+        return "A股ETF/股票"
+    return "其他"
+
+
+def cached_symbol_from_dataset(symbol: str, category: str) -> str:
+    if category == "A股ETF/股票" and symbol.startswith("correlation_cn_"):
+        clean = symbol.removeprefix("correlation_cn_")
+        for suffix in ("_forward", "_backward", "_none"):
+            if clean.endswith(suffix):
+                return clean[: -len(suffix)]
+        return clean
+    if category == "美股" and symbol.startswith("correlation_us_"):
+        clean = symbol.removeprefix("correlation_us_")
+        for suffix in ("_forward", "_backward", "_none"):
+            if clean.endswith(suffix):
+                return clean[: -len(suffix)]
+        return clean
+    if category == "期货主连" and symbol.startswith("correlation_futures_"):
+        return futures_product_name(symbol.removeprefix("correlation_futures_"))
+    return symbol
+
+
+def cached_name_from_dataset(name: str, symbol: str, category: str) -> str:
+    for suffix in (" 前复权", " 后复权", " 不复权"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    if category == "期货主连":
+        return futures_product_name(symbol)
+    return name or symbol
+
+
+def correlation_item_label(item: object) -> str:
+    name = str(getattr(item, "name", "")).strip()
+    symbol = str(getattr(item, "symbol", "")).strip()
+    if not name:
+        return symbol
+    if not symbol or name == symbol:
+        return name
+    return f"{name} {symbol}".strip()
+
+
+def category_to_source_summary(category: str) -> str:
+    mapping = {
+        "A股ETF/股票": "A股ETF",
+        "美股": "美股",
+        "期货主连": "期货主连",
+        "上传文件": "上传文件",
+        "跨资产": "跨资产",
+    }
+    return mapping.get(category, category)
+
+
+def classify_asset_category(asset: str, source_summary: str) -> str:
+    source = source_summary.split("；", 1)[0]
+    source_parts = [part.strip() for part in source.split("/") if part.strip()]
+    if len(source_parts) == 1:
+        mapped = source_to_category(source_parts[0])
+        if mapped:
+            return mapped
+
+    text = asset.strip()
+    upper = text.upper()
+    if is_futures_asset(text):
+        return "期货主连"
+    if ".US" in upper:
+        return "美股"
+    if ".SH" in upper or ".SZ" in upper or (upper[:6].isdigit() and len(upper) >= 6):
+        return "A股ETF/股票"
+    if "上传文件" in source:
+        return "上传文件"
+    return "其他"
+
+
+def source_to_category(source: str) -> str | None:
+    mapping = {
+        "A股ETF": "A股ETF/股票",
+        "美股": "美股",
+        "期货主连": "期货主连",
+        "上传文件": "上传文件",
+    }
+    return mapping.get(source)
+
+
+def is_futures_asset(asset: str) -> bool:
+    normalized = format_futures_asset_text(asset)
+    if normalized in CONTRACT_PREFIXES.values():
+        return True
+    for part in asset.upper().split():
+        if part.endswith("0") and part[:-1] in CONTRACT_PREFIXES:
+            return True
+    return False
+
+
+def category_sort_key(category: str) -> int:
+    order = ["A股ETF/股票", "美股", "期货主连", "上传文件", "跨资产", "其他"]
+    try:
+        return order.index(category)
+    except ValueError:
+        return len(order)
+
+
+def summarize_date_range(df: pd.DataFrame) -> str:
+    ranges = {
+        (display_value(row["开始日期"]), display_value(row["结束日期"]))
+        for _, row in df.iterrows()
+    }
+    if len(ranges) == 1:
+        start_date, end_date = next(iter(ranges))
+        return f"{start_date} → {end_date}"
+    return "各 pair 自动共同区间"
+
+
+def summarize_common_days(df: pd.DataFrame) -> str:
+    values = {display_value(value) for value in df["共同日期数"].tolist()}
+    if len(values) == 1:
+        return next(iter(values))
+    return "各 pair 不同"
+
+
+def summarize_methods(df: pd.DataFrame) -> str:
+    methods = {extract_correlation_method(row.get("计算说明")) for _, row in df.iterrows()}
+    methods.discard("相关系数")
+    if len(methods) == 1:
+        return next(iter(methods))
+    if methods:
+        return "各 pair 不同"
+    return "历史记录"
+
+
+def extract_correlation_method(source_summary: object) -> str:
+    text = display_value(source_summary)
+    if "日收益率相关" in text:
+        return "日收益率相关"
+    if "收盘价相关" in text:
+        return "收盘价相关"
+    return "相关系数"
+
+
+def display_value(value: object) -> str:
+    if value is None:
+        return "-"
+    if pd.isna(value):
+        return "-"
+    text = str(value).strip()
+    return text or "-"
+
+
+def build_saved_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    assets = []
+    for _, row in df.iterrows():
+        for column in ("标的A", "标的B"):
+            asset = format_asset_label_text(row[column])
+            if asset not in assets:
+                assets.append(asset)
+
+    matrix = pd.DataFrame(index=assets, columns=assets, dtype=float)
+    for asset in assets:
+        matrix.loc[asset, asset] = 1.0
+    for _, row in df.iterrows():
+        asset_a = format_asset_label_text(row["标的A"])
+        asset_b = format_asset_label_text(row["标的B"])
+        value = round(float(row["相关系数r"]), 4)
+        matrix.loc[asset_a, asset_b] = value
+        matrix.loc[asset_b, asset_a] = value
+    return matrix.astype(object).where(pd.notna(matrix), "-")
+
+
+def format_asset_label_text(value: object) -> str:
+    return format_futures_asset_text(str(value))
 
 
 def format_futures_asset_text(text: str) -> str:
@@ -193,39 +422,9 @@ def futures_product_name(code: str) -> str:
     return CONTRACT_PREFIXES.get(product, product)
 
 
-def apply_date_range(items: list, option: str, start_date, end_date) -> list:
-    if not items or option == "全区间":
-        return items
-
-    max_date = max(pd.to_datetime(item.dataframe["date"]).max() for item in items)
-    if option == "最近1年":
-        start = max_date - pd.DateOffset(years=1)
-        end = max_date
-    elif option == "最近3年":
-        start = max_date - pd.DateOffset(years=3)
-        end = max_date
-    elif option == "最近5年":
-        start = max_date - pd.DateOffset(years=5)
-        end = max_date
-    else:
-        start = pd.Timestamp(start_date)
-        end = pd.Timestamp(end_date)
-        if start > end:
-            raise ValueError("自定义区间的开始日期不能晚于结束日期。")
-
-    filtered = []
-    for item in items:
-        data = item.dataframe.copy()
-        dates = pd.to_datetime(data["date"], errors="coerce")
-        data = data[(dates >= start) & (dates <= end)].reset_index(drop=True)
-        filtered.append(type(item)(symbol=item.symbol, name=item.name, dataframe=data))
-    return filtered
-
-
 if not calculate_clicked:
     render_results_panel()
-    with left_col:
-        st.info("在左侧任意输入 A股ETF、美股、期货主连或上传文件，至少两个标的即可混合计算相关系数。上传文件需要包含日期列和收盘价/净值列。")
+    st.info("在左侧任意输入 A股ETF、美股、期货主连或上传文件，至少两个标的即可混合计算相关系数。上传文件需要包含日期列和收盘价/净值列。")
     st.stop()
 
 items = []
@@ -369,7 +568,6 @@ try:
         st.error("至少需要成功获取或上传 2 个标的。")
         st.stop()
 
-    items = apply_date_range(items, range_option, custom_start, custom_end)
     method_value = "return" if correlation_method == "日收益率相关" else "price"
     result = calculate_price_correlation(items, method=method_value)
 except Exception as exc:
@@ -380,39 +578,36 @@ summary = result.summary
 save_correlation_results(
     result.pair_table,
     summary,
-    source_summary=f"{' / '.join(dict.fromkeys(source_names))}；{range_option}；{correlation_method}",
+    source_summary=f"{' / '.join(dict.fromkeys(source_names))}；{correlation_method}",
 )
+
+metric_cols = st.columns(4)
+with metric_cols[0]:
+    st.metric("标的数量", summary.get("标的数量"))
+with metric_cols[1]:
+    st.metric("共同日期数", summary.get("共同日期数"))
+with metric_cols[2]:
+    st.metric("平均相关系数r", summary.get("平均相关系数r"))
+with metric_cols[3]:
+    st.metric("时间区间", f"{summary.get('开始日期')} → {summary.get('结束日期')}")
+
 render_results_panel()
 
-with left_col:
-    metric_cols = st.columns(4)
-    with metric_cols[0]:
-        st.metric("标的数量", summary.get("标的数量"))
-    with metric_cols[1]:
-        st.metric("共同日期数", summary.get("共同日期数"))
-    with metric_cols[2]:
-        st.metric("平均相关系数r", summary.get("平均相关系数r"))
-    with metric_cols[3]:
-        st.metric("时间区间", f"{summary.get('开始日期')} → {summary.get('结束日期')}")
-
-    st.subheader("相关系数矩阵")
-    st.dataframe(result.correlation_matrix, use_container_width=True)
-
-    st.subheader("两两相关性")
+with st.expander("本次计算明细", expanded=False):
     st.dataframe(result.pair_table, use_container_width=True, hide_index=True)
 
-    download_cols = st.columns(2)
-    with download_cols[0]:
-        st.download_button(
-            "下载相关矩阵 CSV",
-            data=to_csv_bytes(result.correlation_matrix),
-            file_name="correlation_matrix.csv",
-            mime="text/csv",
-        )
-    with download_cols[1]:
-        st.download_button(
-            "下载对齐价格 CSV",
-            data=result.aligned_prices.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-            file_name="correlation_aligned_prices.csv",
-            mime="text/csv",
-        )
+download_cols = st.columns(2)
+with download_cols[0]:
+    st.download_button(
+        "下载相关矩阵 CSV",
+        data=to_csv_bytes(result.correlation_matrix),
+        file_name="correlation_matrix.csv",
+        mime="text/csv",
+    )
+with download_cols[1]:
+    st.download_button(
+        "下载对齐价格 CSV",
+        data=result.aligned_prices.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+        file_name="correlation_aligned_prices.csv",
+        mime="text/csv",
+    )

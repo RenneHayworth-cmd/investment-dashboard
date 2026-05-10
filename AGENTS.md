@@ -119,15 +119,23 @@ For correlation analysis:
 - The `相关性分析` page sits after `基金轮动`.
 - It computes Pearson correlation coefficients `r` on close prices or daily
   returns after inner joining all selected symbols by common dates.
-- It supports full-range, recent 1/3/5-year, and custom-date calculation
-  windows before the common-date join.
+- It does not expose manual date-window choices; inputs are inner-joined by
+  common dates, so the effective start is the latest first available date among
+  the selected symbols.
 - Supported sources are uploaded CSV/Excel files, TickFlow A-share ETFs,
   TickFlow US stocks, and futures main-continuous data.
 - The sources can be mixed in one run; any non-empty A-share ETF, US stock,
   futures, or uploaded-file inputs should be combined into one matrix.
 - The page persists pairwise analysis results in SQLite table
-  `correlation_results`; the right side shows saved results across app sessions
-  and supports deleting selected rows.
+  `correlation_results`; saved results are rendered as bottom matrices across
+  app sessions, grouped by asset category. A-share
+  ETFs/stocks, US stocks, futures main-continuous contracts, uploads, and
+  cross-asset pairs should be separate matrices. Within each matrix, keep only
+  the newest value for each asset pair. After a new calculation, render the
+  merged saved matrix instead of a separate current-only matrix; deleting a
+  matrix removes all rows in that category group. If a category matrix has
+  missing pairs, auto-fill them from local cached correlation datasets only; do
+  not trigger network fetches from the history renderer.
 
 ## Development Style
 
