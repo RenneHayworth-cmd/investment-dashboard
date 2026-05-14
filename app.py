@@ -1,5 +1,7 @@
+import pandas as pd
 import streamlit as st
 
+from core.cache import list_datasets
 from core.db import init_db
 
 
@@ -12,26 +14,53 @@ st.set_page_config(
 init_db()
 
 st.title("投资分析工作台")
-st.caption("本地缓存行情数据，集中查看指数、A股、基金轮动、相关性、期货期权、期货价差和美股分析结果。")
+st.caption("本地缓存行情数据，左侧进入各分析页面。首页只保留状态概览和常用入口。")
 
-col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
-with col1:
-    st.metric("指数监控", "指数摘要 + 偏离率")
-with col2:
-    st.metric("A股分析", "均线 + 回撤")
-with col3:
-    st.metric("基金轮动", "22日动量回测")
-with col4:
-    st.metric("相关性分析", "价格/收益率 r")
-with col5:
-    st.metric("期货期权", "日线 + 指标")
-with col6:
-    st.metric("期货价差", "基准-其他价差")
-with col7:
-    st.metric("美股分析", "均线 + 回撤")
 
-st.subheader("功能入口")
-st.write("从左侧页面进入「指数监控」「A股分析」「基金轮动」「相关性分析」「期货期权」「期货价差」「美股分析」或「任务与数据」。")
-st.write("基金轮动支持上传文件、TickFlow 场内基金/ETF 和东方财富场外基金累计净值。")
-st.write("相关性分析支持上传文件、A 股 ETF、美股和期货主连，按共同日期对齐后计算收盘价或日收益率相关系数。")
-st.write("数据会写入本地 CSV，并在 SQLite 中记录数据集和任务状态。")
+def format_cache_time(value: object) -> str:
+    if value is None:
+        return "-"
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value).replace("T", " ")
+
+
+try:
+    datasets = list_datasets()
+except Exception:
+    datasets = None
+
+cache_count = 0
+latest_update = "-"
+latest_trade_date = "-"
+if datasets is not None and not datasets.empty:
+    cache_count = len(datasets)
+    latest_update = format_cache_time(datasets["last_update_time"].dropna().iloc[0])
+    trade_dates = datasets["last_trade_date"].dropna()
+    if not trade_dates.empty:
+        latest_trade_date = str(trade_dates.max())
+
+status_cols = st.columns(3)
+status_cols[0].metric("缓存数据集", cache_count)
+status_cols[1].metric("最近缓存更新时间", latest_update)
+status_cols[2].metric("最近交易日", latest_trade_date)
+
+st.subheader("今日重点")
+st.write("先看「指数监控」确认主要指数与 MA20 偏离情况；需要做标的比较时进入「相关性分析」查看按类别合并的相关矩阵。")
+st.write("如果要回测策略，进入「基金轮动」；如果要看单个标的走势和回撤，进入「A股分析」或「美股分析」。")
+
+st.subheader("常用入口")
+st.markdown(
+    """
+- 指数监控：指数摘要、MA20 偏离率和排序表。
+- A股分析：场内基金/股票走势、均线和回撤分析。
+- 基金轮动：22 日动量轮动回测、交易明细和持仓金额。
+- 相关性分析：A股ETF/股票、美股、期货主连按类别展示相关矩阵。
+- 期货期权：期货主连走势、摘要和回撤。
+- 期货价差：多个合约的基准价差对比。
+- 美股分析：TickFlow 美股日线、均线和回撤分析。
+"""
+)
+
+st.caption("数据会写入本地 CSV，并在 SQLite 中记录数据集和任务状态。")

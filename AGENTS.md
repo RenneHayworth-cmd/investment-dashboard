@@ -43,6 +43,15 @@ For code changes, at minimum run:
 For targeted edits, compile the touched modules only, then run the full command
 before a larger handoff or commit.
 
+## UI Notes
+
+- Keep `app.py` lightweight. It should act as a status and navigation overview:
+  cache count, latest cache update time, latest trade date, today-focus notes,
+  and common page entry text. Avoid rebuilding it as a heavy card dashboard.
+- The `指数监控` page should not block first render with a synchronous daily
+  update. Show cached data immediately; if today's cache is stale, start a
+  one-shot background update and ask the user to refresh later.
+
 ## Structure
 
 - `app.py`: Streamlit home page.

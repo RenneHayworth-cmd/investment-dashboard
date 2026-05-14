@@ -1,12 +1,15 @@
 from datetime import datetime
 import html
 import os
+import subprocess
+import sys
 
 import pandas as pd
 import streamlit as st
 
 from core.cache import load_dataset
 from core.db import init_db
+from core.paths import OUTPUT_DIR, ensure_dirs
 from services.index_ma20 import build_summary
 from services.update_tasks import run_index_ma20_update
 
@@ -27,6 +30,43 @@ def format_update_time(value: str | None) -> str:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return value.replace("T", " ")
+
+
+def is_today_cache(meta: dict | None) -> bool:
+    last_update_time = (meta or {}).get("last_update_time")
+    if not last_update_time:
+        return False
+    try:
+        return datetime.fromisoformat(last_update_time).date() == datetime.now().date()
+    except ValueError:
+        return False
+
+
+def start_background_update_once(api_key: str, days: int) -> bool:
+    ensure_dirs()
+    log_path = OUTPUT_DIR / "index_auto_update.log"
+    cmd = [
+        sys.executable,
+        "-m",
+        "services.background_updater",
+        "--once",
+        "--days",
+        str(days),
+    ]
+    if api_key:
+        cmd.extend(["--api-key", api_key])
+    try:
+        with log_path.open("ab") as log_file:
+            subprocess.Popen(
+                cmd,
+                cwd=str(OUTPUT_DIR.parent),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return True
+    except Exception:
+        return False
 
 
 def format_number(value) -> str:
@@ -81,7 +121,7 @@ with st.sidebar:
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
     force_refresh = st.checkbox("强制重新获取", value=False)
-    update_clicked = st.button("更新指数 MA20 数据", type="primary")
+    update_clicked = st.button("更新指数数据", type="primary")
 
 if update_clicked:
     progress = st.progress(0)
@@ -117,21 +157,8 @@ if update_clicked:
     else:
         st.error(result.message)
 
-if not update_clicked and not st.session_state.index_auto_update_done:
-    st.session_state.index_auto_update_done = True
-    with st.spinner("正在检查今日指数数据..."):
-        auto_result = run_index_ma20_update(
-            api_key=os.getenv("TICKFLOW_API_KEY", ""),
-            days=int(days),
-            cache_source="auto",
-            use_fresh_cache=True,
-        )
-    if auto_result.status == "success":
-        st.rerun()
-    else:
-        st.warning(auto_result.message)
-
 report_df = None
+report_meta = None
 for source in ("auto", "manual"):
     report_df, meta = load_dataset(
         "index_ma20_latest",
@@ -139,8 +166,18 @@ for source in ("auto", "manual"):
         "index_ma20_report",
     )
     if report_df is not None:
-        st.caption(f"更新时间：{format_update_time(meta['last_update_time'])}")
+        report_meta = meta
         break
+
+if not update_clicked and not st.session_state.index_auto_update_done and not is_today_cache(report_meta):
+    st.session_state.index_auto_update_done = True
+    if start_background_update_once(api_key=api_key or os.getenv("TICKFLOW_API_KEY", ""), days=int(days)):
+        st.info("今日指数数据正在后台更新。当前先显示本地缓存，稍后刷新页面即可查看最新数据。")
+    else:
+        st.warning("后台更新启动失败，可以点击左侧按钮手动更新。")
+
+if report_df is not None and report_meta is not None:
+    st.caption(f"更新时间：{format_update_time(report_meta['last_update_time'])}")
 
 if report_df is not None:
     summary_df = build_summary(report_df)
