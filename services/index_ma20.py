@@ -41,6 +41,16 @@ INDEX_CONFIG = {
         "market": "sz",
         "tickflow_symbol": "980092.SZ",
     },
+    "恒生科技": {
+        "source": "akshare_hk",
+        "code": "HSTECH",
+        "display_symbol": "HSTECH",
+    },
+    "铁矿石主连": {
+        "source": "akshare_futures_main",
+        "code": "I0",
+        "display_symbol": "I0",
+    },
     "标普500": {
         "source": "akshare_us",
         "code": ".INX",
@@ -51,6 +61,18 @@ INDEX_CONFIG = {
         "source": "akshare_us",
         "code": ".IXIC",
         "tickflow_symbol": ".IXIC.US",
+    },
+    "日经225": {
+        "source": "akshare_global",
+        "code": "日经225",
+        "yahoo_symbol": "^N225",
+        "display_symbol": "N225",
+    },
+    "韩国KOSPI": {
+        "source": "akshare_global",
+        "code": "韩国KOSPI",
+        "yahoo_symbol": "^KS11",
+        "display_symbol": "KOSPI",
     },
 }
 
@@ -96,7 +118,7 @@ def normalize_akshare_index_df(df: pd.DataFrame) -> pd.DataFrame:
         column_text = str(column).strip()
         if column_text in {"日期", "date", "trade_date", "交易日期"}:
             rename_map[column] = "trade_date"
-        elif column_text in {"收盘", "收盘价", "close", "Close"}:
+        elif column_text in {"收盘", "收盘价", "最新价", "close", "Close"}:
             rename_map[column] = "close"
 
     normalized = df.rename(columns=rename_map)
@@ -256,6 +278,69 @@ def get_index_data_from_akshare_us(index_code: str, index_name: str, days: int =
     return build_export_df(df, index_name, days=days)
 
 
+def get_index_data_from_akshare_hk(index_code: str, index_name: str, days: int = 30):
+    import akshare as ak
+
+    raw_df = ak.stock_hk_index_daily_sina(symbol=index_code)
+    df = normalize_akshare_index_df(raw_df)
+    return build_export_df(df, index_name, days=days)
+
+
+def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
+    import requests
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "1y", "interval": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    result = payload.get("chart", {}).get("result", [])
+    if not result:
+        return None
+
+    item = result[0]
+    timestamps = item.get("timestamp") or []
+    quote = item.get("indicators", {}).get("quote", [{}])[0]
+    closes = quote.get("close") or []
+    rows = []
+    for timestamp, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        rows.append(
+            {
+                "trade_date": pd.Timestamp(datetime.fromtimestamp(timestamp).date()),
+                "close": float(close),
+            }
+        )
+    if not rows:
+        return None
+    return build_export_df(pd.DataFrame(rows), index_name, days=days)
+
+
+def get_index_data_from_akshare_global(index_code: str, index_name: str, days: int = 30, yahoo_symbol: str | None = None):
+    import akshare as ak
+
+    try:
+        raw_df = ak.index_global_hist_em(symbol=index_code)
+        df = normalize_akshare_index_df(raw_df)
+        return build_export_df(df, index_name, days=days)
+    except Exception:
+        if yahoo_symbol:
+            yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
+            if yahoo_df is not None and not yahoo_df.empty:
+                return yahoo_df
+        raise
+
+
+def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, days: int = 30):
+    import akshare as ak
+
+    raw_df = ak.futures_zh_daily_sina(symbol=index_code)
+    df = normalize_akshare_index_df(raw_df)
+    return build_export_df(df, index_name, days=days)
+
+
 def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str, days: int = 30):
     from tickflow import TickFlow
 
@@ -378,6 +463,17 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
                 return get_index_data_from_akshare_csindex(code, index_name, days=days)
             if source == "akshare_us":
                 return get_index_data_from_akshare_us(code, index_name, days=days)
+            if source == "akshare_hk":
+                return get_index_data_from_akshare_hk(code, index_name, days=days)
+            if source == "akshare_global":
+                return get_index_data_from_akshare_global(
+                    code,
+                    index_name,
+                    days=days,
+                    yahoo_symbol=index_config.get("yahoo_symbol"),
+                )
+            if source == "akshare_futures_main":
+                return get_index_data_from_akshare_futures_main(code, index_name, days=days)
             raise ValueError(f"未知数据源：{source}")
         except Exception as exc:
             if tickflow_error:

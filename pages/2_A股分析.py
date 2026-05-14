@@ -178,7 +178,7 @@ with st.sidebar:
         default=[20, 60, 120, 250],
     )
     rsi_period = st.number_input("RSI周期", min_value=5, max_value=60, value=14, step=1)
-    base_date = st.date_input("区间基准日", value=pd.Timestamp("2024-09-30"))
+    base_date = st.date_input("区间基准日", value=pd.Timestamp("2024-09-24"))
     price_axis_mode = st.selectbox("价格轴", options=["自动", "普通坐标", "对数坐标"], index=0)
     force_refresh = st.checkbox("联网更新数据（有缓存时增量）", value=False)
     save_to_cache = st.checkbox("分析后保存分析结果", value=True)

@@ -159,11 +159,11 @@ with st.form("us_stock_form"):
     with col1:
         symbol_text = st.text_input("美股代码", value="AAPL", placeholder="例如 AAPL、MSFT、COWZ")
     with col2:
-        count = st.number_input("日线条数", min_value=300, max_value=10000, value=1500, step=100)
+        count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
     with col3:
         adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
     with col4:
-        api_key = st.text_input("TickFlow Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
+        api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     submitted = st.form_submit_button("拉取并分析", type="primary")
 
 if not submitted:
@@ -273,21 +273,39 @@ with tabs[0]:
         vertical_spacing=0.04,
         subplot_titles=("日K线", "RSI", "20日涨幅", summary.get("滚动年化类型", "滚动年化收益率")),
     )
-    fig.add_trace(go.Scatter(x=df["date"], y=df["price"], mode="lines", name="价格", line=dict(width=2)), row=1, col=1)
+    fig.add_trace(
+        go.Scatter(x=df["date"], y=df["price"], mode="lines", name="价格", line=dict(width=2)),
+        row=1,
+        col=1,
+    )
     ma_colors = {20: "#eab308", 60: "#2563eb", 120: "#dc2626", 250: "#059669"}
     for period_item in ma_periods:
         ma_col = f"ma_{period_item}"
         if ma_col in df.columns:
             fig.add_trace(
-                go.Scatter(x=df["date"], y=df[ma_col], mode="lines", name=f"MA{period_item}", line=dict(width=1.4, color=ma_colors.get(period_item))),
+                go.Scatter(
+                    x=df["date"],
+                    y=df[ma_col],
+                    mode="lines",
+                    name=f"MA{period_item}",
+                    line=dict(width=1.4, color=ma_colors.get(period_item)),
+                ),
                 row=1,
                 col=1,
             )
     rsi_col = f"rsi_{int(rsi_period)}"
-    fig.add_trace(go.Scatter(x=df["date"], y=df[rsi_col], mode="lines", name=f"RSI({int(rsi_period)})"), row=2, col=1)
+    fig.add_trace(
+        go.Scatter(x=df["date"], y=df[rsi_col], mode="lines", name=f"RSI({int(rsi_period)})"),
+        row=2,
+        col=1,
+    )
     fig.add_hline(y=70, line_dash="dash", line_color="#dc2626", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="#059669", row=2, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["return_20d_pct"], mode="lines", name="20日涨幅(%)"), row=3, col=1)
+    fig.add_trace(
+        go.Scatter(x=df["date"], y=df["return_20d_pct"], mode="lines", name="20日涨幅(%)"),
+        row=3,
+        col=1,
+    )
     fig.add_hline(y=0, line_color="#6b7280", row=3, col=1)
     fig.add_trace(
         go.Scatter(x=df["date"], y=df["rolling_annual_return_pct"], mode="lines", name=summary.get("滚动年化类型", "滚动年化收益率(%)"), line=dict(color="#7c3aed")),
@@ -343,8 +361,22 @@ with tabs[1]:
         vertical_spacing=0.06,
         subplot_titles=("价格、历史峰值与回撤区域", "回撤曲线"),
     )
-    dd_fig.add_trace(go.Scatter(x=df["date"], y=df["price"], mode="lines", name="价格", line=dict(color="#2563eb")), row=1, col=1)
-    dd_fig.add_trace(go.Scatter(x=df["date"], y=df["running_peak"], mode="lines", name="历史峰值", line=dict(color="#6b7280", dash="dash")), row=1, col=1)
+    dd_fig.add_trace(
+        go.Scatter(x=df["date"], y=df["price"], mode="lines", name="价格", line=dict(color="#2563eb")),
+        row=1,
+        col=1,
+    )
+    dd_fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["running_peak"],
+            mode="lines",
+            name="历史峰值",
+            line=dict(color="#6b7280", dash="dash"),
+        ),
+        row=1,
+        col=1,
+    )
     dd_fig.add_trace(
         go.Scatter(
             x=df["date"].tolist() + df["date"].tolist()[::-1],
@@ -358,8 +390,34 @@ with tabs[1]:
         row=1,
         col=1,
     )
-    dd_fig.add_trace(go.Scatter(x=df["date"], y=df["drawdown_pct"], mode="lines", fill="tozeroy", name="回撤(%)", line=dict(color="#dc2626")), row=2, col=1)
+    dd_fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["drawdown_pct"],
+            mode="lines",
+            fill="tozeroy",
+            name="回撤(%)",
+            line=dict(color="#dc2626"),
+        ),
+        row=2,
+        col=1,
+    )
     dd_fig.add_hline(y=0, line_color="#6b7280", row=2, col=1)
+    if drawdown_info["谷底日"]:
+        trough_date = pd.Timestamp(drawdown_info["谷底日"])
+        trough_row = df[df["date"] == trough_date]
+        if not trough_row.empty:
+            dd_fig.add_trace(
+                go.Scatter(
+                    x=[trough_row.iloc[0]["date"]],
+                    y=[trough_row.iloc[0]["drawdown_pct"]],
+                    mode="markers",
+                    name="最大回撤谷底",
+                    marker=dict(color="#16a34a", size=10),
+                ),
+                row=2,
+                col=1,
+            )
     dd_fig.update_layout(height=720, hovermode="x unified", legend=dict(orientation="h"))
     dd_fig.update_xaxes(hoverformat="%Y-%m-%d")
     dd_fig.update_yaxes(

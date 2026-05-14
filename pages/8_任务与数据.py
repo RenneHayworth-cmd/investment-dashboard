@@ -26,6 +26,7 @@ with st.sidebar:
     )
     days = st.number_input("报表天数", min_value=10, max_value=365, value=30, step=5)
     interval_minutes = st.number_input("后台间隔（分钟）", min_value=1, max_value=1440, value=60)
+    st.caption("后台循环仅在 09:30-15:00 刷新，其余时间跳过。")
     force_refresh = st.checkbox("强制重新获取", value=False)
     run_once_clicked = st.button("立即运行一次", type="primary")
     start_loop_clicked = st.button("启动后台循环")

@@ -51,6 +51,16 @@ before a larger handoff or commit.
 - The `指数监控` page should not block first render with a synchronous daily
   update. Show cached data immediately; if today's cache is stale, start a
   one-shot background update and ask the user to refresh later.
+- The `指数监控` latest summary uses dashboard-style index cards: four columns
+  on desktop, fixed-height cards, index name and code on separate lines,
+  A-share color convention for deltas (red up, green down), and a summary table
+  sorted by MA20 deviation.
+- The monitored set includes mainland China indices, US indices, Hang Seng Tech,
+  Nikkei 225, Korea KOSPI, and iron ore main-continuous futures. Global indices
+  may use Yahoo chart fallback when the AkShare Eastmoney global endpoint fails.
+- Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
+  settings, top summary metrics, chart tab order, and drawdown metric/chart
+  style should stay consistent so users do not have to relearn the page.
 
 ## Structure
 

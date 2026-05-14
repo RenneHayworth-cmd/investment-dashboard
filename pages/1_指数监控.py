@@ -111,6 +111,43 @@ def centered_table(df: pd.DataFrame) -> None:
         unsafe_allow_html=True,
     )
 
+
+def render_index_cards(summary_df: pd.DataFrame) -> None:
+    cards = []
+    for _, row in summary_df.iterrows():
+        delta = pd.to_numeric(row["当日涨跌幅(%)"], errors="coerce")
+        delta_class = "positive" if delta >= 0 else "negative"
+        arrow = "↑" if delta >= 0 else "↓"
+        cards.append(
+            '<div class="index-card">'
+            f'<div class="index-card-title">{html.escape(str(row["指数"]))}</div>'
+            f'<div class="index-card-code">{html.escape(str(row["代码"]))}</div>'
+            f'<div class="index-card-value">{float(row["收盘价"]):.2f}</div>'
+            f'<div class="index-card-delta {delta_class}">'
+            f"<span>{arrow}</span>"
+            f"<span>{delta:+.2f}%</span>"
+            "</div>"
+            "</div>"
+        )
+
+    st.markdown(
+        "<style>"
+        ".index-card-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;margin:0.4rem 0 1rem;}"
+        ".index-card{min-height:12.25rem;border:1px solid rgba(49,51,63,.14);border-radius:8px;background:rgba(255,255,255,.78);padding:1.35rem 1.5rem;box-shadow:0 10px 26px rgba(15,23,42,.06);}"
+        ".index-card-title{min-height:2.4rem;color:rgba(49,51,63,.72);font-size:1.18rem;font-weight:700;line-height:1.25;overflow-wrap:anywhere;}"
+        ".index-card-code{min-height:1.65rem;margin-top:.22rem;color:rgba(49,51,63,.58);font-size:1rem;line-height:1.25;overflow-wrap:anywhere;}"
+        ".index-card-value{margin-top:1.05rem;color:rgb(31,41,55);font-size:1.85rem;font-weight:650;line-height:1.08;font-variant-numeric:tabular-nums;white-space:normal;overflow-wrap:anywhere;}"
+        ".index-card-delta{display:inline-flex;align-items:center;gap:.35rem;margin-top:1.05rem;border-radius:999px;padding:.35rem .85rem;font-size:1.05rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}"
+        ".index-card-delta.positive{color:rgb(190,18,60);background:rgba(254,226,226,.9);}"
+        ".index-card-delta.negative{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
+        "@media (max-width:980px){.index-card-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}"
+        "@media (max-width:640px){.index-card-grid{grid-template-columns:1fr;}}"
+        "</style>"
+        f'<div class="index-card-grid">{"".join(cards)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
@@ -184,15 +221,7 @@ if report_df is not None:
     if not summary_df.empty:
         summary_date = summary_df["日期"].max()
         st.subheader(f"最新摘要 · {summary_date}")
-        metric_cols = st.columns(min(4, len(summary_df)))
-        for idx, row in summary_df.iterrows():
-            with metric_cols[idx % len(metric_cols)]:
-                st.metric(
-                    label=f"{row['指数']}  {row['代码']}",
-                    value=f"{row['收盘价']:.2f}",
-                    delta=f"{row['当日涨跌幅(%)']:+.2f}%",
-                    delta_color="inverse",
-                )
+        render_index_cards(summary_df)
 
         display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
         if "偏离率(%)" in display_summary_df.columns:

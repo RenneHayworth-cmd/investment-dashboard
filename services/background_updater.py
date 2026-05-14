@@ -5,6 +5,7 @@ import os
 import signal
 import time
 from datetime import datetime
+from datetime import time as datetime_time
 
 from core.db import finish_job, init_db, start_job
 from core.paths import BACKGROUND_PID_PATH, ensure_dirs
@@ -12,6 +13,8 @@ from services.update_tasks import run_index_ma20_update
 
 
 STOP_REQUESTED = False
+UPDATE_WINDOW_START = datetime_time(9, 30)
+UPDATE_WINDOW_END = datetime_time(15, 0)
 
 
 def request_stop(signum, frame) -> None:
@@ -61,6 +64,11 @@ def run_once(api_key: str, days: int, force_refresh: bool = False) -> None:
     print(f"[{datetime.now().isoformat(timespec='seconds')}] {result.message}", flush=True)
 
 
+def is_update_window(now: datetime | None = None) -> bool:
+    current_time = (now or datetime.now()).time()
+    return UPDATE_WINDOW_START <= current_time <= UPDATE_WINDOW_END
+
+
 def run_loop(api_key: str, days: int, interval_minutes: int, force_refresh: bool = False) -> None:
     interval_seconds = max(interval_minutes, 1) * 60
     running_pid = read_running_pid()
@@ -71,7 +79,14 @@ def run_loop(api_key: str, days: int, interval_minutes: int, force_refresh: bool
     scheduler_job_id = start_job("后台更新调度器")
     try:
         while not STOP_REQUESTED:
-            run_once(api_key=api_key, days=days, force_refresh=force_refresh)
+            if is_update_window():
+                run_once(api_key=api_key, days=days, force_refresh=force_refresh)
+            else:
+                print(
+                    f"[{datetime.now().isoformat(timespec='seconds')}] "
+                    "非刷新时段，跳过本轮更新（刷新时段：09:30-15:00）",
+                    flush=True,
+                )
             for _ in range(interval_seconds):
                 if STOP_REQUESTED:
                     break
