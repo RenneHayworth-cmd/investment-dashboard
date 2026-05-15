@@ -194,20 +194,25 @@ def build_info_summary_df(
 
 
 with st.sidebar:
-    st.subheader("参数")
-    raw_symbol = st.text_input("合约代码", value="IM2606", placeholder="例如 IM2606、IM0、IM主连、mo2606C5800")
+    st.subheader("分析设置")
     data_type = st.selectbox("数据类型", options=[DATA_TYPE_AUTO, DATA_TYPE_FUTURES, DATA_TYPE_OPTIONS], index=0)
     period = st.selectbox("K线周期", options=["1d", "1w", "1M", "1Q", "1Y"], index=0)
     count = st.number_input("获取条数", min_value=20, max_value=10000, value=500, step=100)
     ma_periods = st.multiselect("均线周期", options=[5, 10, 20, 60, 120], default=[5, 20, 60])
-    api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     use_free = st.checkbox("使用免费历史数据服务", value=True)
     force_refresh = st.checkbox("联网更新数据", value=False)
     save_to_cache = st.checkbox("分析后保存到本地缓存", value=True)
-    analyze_clicked = st.button("获取数据并分析", type="primary")
+
+with st.form("futures_option_fetch_form"):
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        raw_symbol = st.text_input("合约代码", value="IM2606", placeholder="例如 IM2606、IM0、IM主连、mo2606C5800")
+    with col2:
+        api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
+    analyze_clicked = st.form_submit_button("获取数据并分析", type="primary")
 
 if not analyze_clicked:
-    st.info("输入期货或期权合约后点击左侧「获取数据并分析」。期货主连可输入 IM0、I0、AU0，或 IM主连、I主连、AU主连。期权支持股指期权 io/ho/mo 和铁矿石期权 i。")
+    st.info("输入期货或期权合约后点击「获取数据并分析」。期货主连可输入 IM0、I0、AU0，或 IM主连、I主连、AU主连。期权支持股指期权 io/ho/mo 和铁矿石期权 i。")
     st.stop()
 
 if not raw_symbol.strip():

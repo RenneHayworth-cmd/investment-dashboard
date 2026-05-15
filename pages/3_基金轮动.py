@@ -119,17 +119,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.subheader("回测参数")
-    data_source = st.radio("数据来源", options=["上传文件", "TickFlow获取", "场外基金"], index=0)
-    uploaded_files = []
-    tickflow_codes = ""
-    eastmoney_codes = ""
-    count = 5000
-    adjust_option = "前复权"
-    api_key = ""
-    max_workers = 8
-    force_refresh = False
+uploaded_files = []
+tickflow_codes = ""
+eastmoney_codes = ""
+count = 5000
+adjust_option = "前复权"
+api_key = ""
+max_workers = 8
+force_refresh = False
+
+st.subheader("数据来源")
+data_source = st.radio("数据来源", options=["上传文件", "TickFlow获取", "场外基金"], index=0, horizontal=True)
+
+with st.form("fund_rotation_data_form"):
     if data_source == "上传文件":
         uploaded_files = st.file_uploader(
             "基金数据文件",
@@ -155,6 +157,10 @@ with st.sidebar:
             placeholder="可输入多个 6 位代码，例如：000001 110022",
         )
         max_workers = st.number_input("并发数", min_value=1, max_value=12, value=8, step=1)
+    run_clicked = st.form_submit_button("运行轮动回测", type="primary")
+
+with st.sidebar:
+    st.subheader("回测参数")
     frequency_label = st.selectbox("轮动频率", options=["每周一", "每月1号"], index=0)
     lookback_period = st.number_input("动量周期", min_value=1, max_value=500, value=22, step=1)
     num_positions = st.number_input("持仓数量", min_value=1, max_value=20, value=1, step=1)
@@ -166,10 +172,9 @@ with st.sidebar:
         step=0.1,
         key=f"rotation_transaction_cost_bp_{data_source}",
     )
-    run_clicked = st.button("运行轮动回测", type="primary")
 
 if data_source == "上传文件" and not uploaded_files:
-    st.info("请在左侧上传至少两个 CSV 或 Excel 文件。文件需要包含日期列和价格列，例如 trade_date / close。")
+    st.info("请在数据来源区域上传至少两个 CSV 或 Excel 文件。文件需要包含日期列和价格列，例如 trade_date / close。")
     st.stop()
 
 if data_source == "TickFlow获取" and not tickflow_codes.strip():
@@ -181,7 +186,7 @@ if data_source == "场外基金" and not eastmoney_codes.strip():
     st.stop()
 
 if not run_clicked:
-    st.info("参数设置完成后点击左侧「运行轮动回测」。当前策略为始终满仓，信号用前一交易日收盘计算，调仓按开盘价成交并计入买卖滑点。")
+    st.info("参数设置完成后点击「运行轮动回测」。当前策略为始终满仓，信号用前一交易日收盘计算，调仓按开盘价成交并计入买卖滑点。")
     st.stop()
 
 try:

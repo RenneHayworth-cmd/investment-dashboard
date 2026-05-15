@@ -2,12 +2,13 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import streamlit as st
 
 from core.cache import list_datasets
 from core.db import init_db, list_jobs
 from core.paths import BACKGROUND_PID_PATH, ROOT_DIR
-from services.background_updater import read_running_pid
+from services.background_updater import describe_update_windows, read_running_pid
 from services.update_tasks import run_index_ma20_update
 
 
@@ -15,6 +16,8 @@ st.set_page_config(page_title="任务与数据", layout="wide")
 init_db()
 
 st.title("任务与数据")
+
+running_pid = read_running_pid()
 
 with st.sidebar:
     st.subheader("后台更新")
@@ -26,15 +29,23 @@ with st.sidebar:
     )
     days = st.number_input("报表天数", min_value=10, max_value=365, value=30, step=5)
     interval_minutes = st.number_input("后台间隔（分钟）", min_value=1, max_value=1440, value=60)
-    st.caption("后台循环仅在 09:30-15:00 刷新，其余时间跳过。")
+    max_workers = st.number_input("并发数", min_value=1, max_value=8, value=4, step=1)
+    st.caption(describe_update_windows())
     force_refresh = st.checkbox("强制重新获取", value=False)
     run_once_clicked = st.button("立即运行一次", type="primary")
-    start_loop_clicked = st.button("启动后台循环")
-    stop_loop_clicked = st.button("停止后台循环")
+    loop_button_label = "停止后台循环" if running_pid else "启动后台循环"
+    loop_button_type = "secondary" if running_pid else "primary"
+    loop_button_clicked = st.button(loop_button_label, type=loop_button_type)
 
-running_pid = read_running_pid()
+notice = st.session_state.pop("background_loop_notice", None)
+if notice:
+    level, message = notice
+    getattr(st, level)(message)
+
 if running_pid:
     st.info(f"后台更新调度器运行中，PID={running_pid}")
+else:
+    st.caption("后台更新调度器未运行。")
 
 if run_once_clicked:
     with st.spinner("正在运行指数 MA20 更新任务..."):
@@ -43,6 +54,7 @@ if run_once_clicked:
             days=int(days),
             cache_source="auto",
             use_fresh_cache=not force_refresh,
+            max_workers=int(max_workers),
         )
     if result.status == "success":
         st.success(result.message)
@@ -50,10 +62,14 @@ if run_once_clicked:
     else:
         st.error(result.message)
 
-if start_loop_clicked:
+if loop_button_clicked and not running_pid:
     running_pid = read_running_pid()
     if running_pid:
-        st.warning(f"已有后台更新调度器正在运行，PID={running_pid}。")
+        st.session_state["background_loop_notice"] = (
+            "warning",
+            f"已有后台更新调度器正在运行，PID={running_pid}。",
+        )
+        st.rerun()
     else:
         env = os.environ.copy()
         if api_key:
@@ -66,6 +82,8 @@ if start_loop_clicked:
             str(int(interval_minutes)),
             "--days",
             str(int(days)),
+            "--max-workers",
+            str(int(max_workers)),
         ]
         if force_refresh:
             command.append("--force-refresh")
@@ -76,20 +94,49 @@ if start_loop_clicked:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        st.success(f"已启动后台循环，PID={process.pid}。刷新本页可查看任务记录。")
+        BACKGROUND_PID_PATH.write_text(str(process.pid), encoding="utf-8")
+        st.session_state["background_loop_notice"] = (
+            "success",
+            f"已启动后台循环，PID={process.pid}。按钮已切换为停止。",
+        )
+        st.rerun()
 
-if stop_loop_clicked:
+if loop_button_clicked and running_pid:
     running_pid = read_running_pid()
     if not running_pid:
         BACKGROUND_PID_PATH.unlink(missing_ok=True)
-        st.warning("没有发现正在运行的后台更新调度器。")
+        st.session_state["background_loop_notice"] = (
+            "warning",
+            "没有发现正在运行的后台更新调度器。",
+        )
+        st.rerun()
     else:
         try:
             os.kill(running_pid, signal.SIGTERM)
-            st.success(f"已发送停止信号，PID={running_pid}。")
+            stopped = False
+            for _ in range(20):
+                time.sleep(0.1)
+                if read_running_pid() is None:
+                    stopped = True
+                    break
+            if stopped:
+                st.session_state["background_loop_notice"] = (
+                    "success",
+                    f"已停止后台循环，PID={running_pid}。按钮已切换为启动。",
+                )
+            else:
+                st.session_state["background_loop_notice"] = (
+                    "warning",
+                    f"已发送停止信号，PID={running_pid}，调度器正在退出。",
+                )
+            st.rerun()
         except ProcessLookupError:
             BACKGROUND_PID_PATH.unlink(missing_ok=True)
-            st.warning("后台更新调度器已经退出，已清理 PID 文件。")
+            st.session_state["background_loop_notice"] = (
+                "warning",
+                "后台更新调度器已经退出，已清理 PID 文件。",
+            )
+            st.rerun()
         except PermissionError as exc:
             st.error(f"没有权限停止 PID={running_pid}：{exc}")
 

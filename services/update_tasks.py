@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
@@ -36,14 +37,27 @@ def run_index_ma20_update(
     cache_source: str = "auto",
     use_fresh_cache: bool = True,
     progress_callback: ProgressCallback | None = None,
+    market_names: set[str] | list[str] | tuple[str, ...] | None = None,
+    max_workers: int = 4,
 ) -> UpdateResult:
-    job_id = start_job("更新指数MA20")
+    selected_markets = set(market_names or [])
+    job_name = "更新指数MA20" if not selected_markets else f"更新指数MA20（{'、'.join(sorted(selected_markets))}）"
+    job_id = start_job(job_name)
     all_data = []
     errors = []
-    total = len(INDEX_CONFIG)
+    selected_items = [
+        (index_name, index_config)
+        for index_name, index_config in INDEX_CONFIG.items()
+        if not selected_markets or index_config.get("market_group") in selected_markets
+    ]
+    total = len(selected_items)
 
     try:
-        if use_fresh_cache:
+        if not selected_items:
+            raise RuntimeError(f"没有匹配的指数市场分组：{'、'.join(sorted(selected_markets))}")
+
+        cached_df = None
+        if use_fresh_cache and not selected_markets:
             cached_df, meta = load_dataset(
                 "index_ma20_latest",
                 cache_source,
@@ -56,61 +70,43 @@ def run_index_ma20_update(
                     message = f"使用今日缓存，更新时间：{last_update_time}"
                     finish_job(job_id, "success", message)
                     return UpdateResult("success", message, cached_df)
+        elif selected_markets:
+            cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
 
-        for idx, (index_name, index_config) in enumerate(INDEX_CONFIG.items(), start=1):
-            if progress_callback:
-                progress_callback(index_name, idx, total, "running")
-
-            try:
-                df = None
-                tickflow_symbol = index_config.get("tickflow_symbol") if isinstance(index_config, dict) else None
-                if tickflow_symbol:
-                    try:
-                        cache_symbol = raw_cache_symbol(index_name, index_config)
-                        cached_raw, _ = load_dataset(
-                            cache_symbol,
-                            "tickflow",
-                            "index_daily_raw",
-                        )
-                        fetch_count = 30 if cached_raw is not None and not cached_raw.empty else max(days * 2, 80)
-                        latest_raw = get_index_raw_from_tickflow(
-                            api_key,
-                            tickflow_symbol,
-                            count=fetch_count,
-                        )
-                        if latest_raw is not None and not latest_raw.empty:
-                            raw_df = merge_raw_index_data(cached_raw, latest_raw)
-                            save_dataset(
-                                symbol=cache_symbol,
-                                name=f"{index_name} 指数原始日线",
-                                source="tickflow",
-                                data_type="index_daily_raw",
-                                df=raw_df,
-                            )
-                            df = build_export_df(raw_df, index_name, days=days)
-                    except Exception:
-                        df = None
-
-                if df is None:
-                    df = fetch_one_index(index_name, index_config, api_key=api_key, days=days)
-
-                if df is not None and not df.empty:
-                    all_data.append(df)
+        workers = min(max(int(max_workers), 1), total)
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(fetch_index_report, index_name, index_config, api_key, days): (
+                    index_name,
+                    index_config,
+                )
+                for index_name, index_config in selected_items
+            }
+            for future in as_completed(future_map):
+                index_name, _ = future_map[future]
+                completed += 1
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        all_data.append(df)
+                        if progress_callback:
+                            progress_callback(index_name, completed, total, "success")
+                    else:
+                        errors.append(f"{index_name}: 无数据")
+                        if progress_callback:
+                            progress_callback(index_name, completed, total, "empty")
+                except Exception as exc:
+                    errors.append(f"{index_name}: {exc}")
                     if progress_callback:
-                        progress_callback(index_name, idx, total, "success")
-                else:
-                    errors.append(f"{index_name}: 无数据")
-                    if progress_callback:
-                        progress_callback(index_name, idx, total, "empty")
-            except Exception as exc:
-                errors.append(f"{index_name}: {exc}")
-                if progress_callback:
-                    progress_callback(index_name, idx, total, "failed")
+                        progress_callback(index_name, completed, total, "failed")
 
         if not all_data:
             raise RuntimeError("未获取到任何指数数据。" + " | ".join(errors))
 
         report = merge_by_date(all_data)
+        if selected_markets and cached_df is not None and not cached_df.empty:
+            report = merge_index_report(cached_df, report)
         report.attrs["errors"] = errors
         save_dataset(
             symbol="index_ma20_latest",
@@ -120,7 +116,7 @@ def run_index_ma20_update(
             df=report,
         )
 
-        message = "更新成功"
+        message = "更新成功" if not selected_markets else f"{'、'.join(sorted(selected_markets))}更新成功"
         if errors:
             message += "；部分指数失败：" + " | ".join(errors)
 
@@ -129,3 +125,54 @@ def run_index_ma20_update(
     except Exception as exc:
         finish_job(job_id, "failed", str(exc))
         return UpdateResult("failed", f"更新失败：{exc}", errors=errors)
+
+
+def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd.DataFrame:
+    existing = existing_df.copy()
+    update = update_df.copy()
+    if existing.empty:
+        return update
+    if update.empty:
+        return existing
+
+    existing["日期"] = existing["日期"].astype(str)
+    update["日期"] = update["日期"].astype(str)
+    replaced_columns = [column for column in update.columns if column != "日期"]
+    preserved = existing.drop(columns=[column for column in replaced_columns if column in existing.columns])
+    merged = pd.merge(preserved, update, on="日期", how="outer")
+    return merged.sort_values("日期").reset_index(drop=True)
+
+
+def fetch_index_report(index_name: str, index_config: dict, api_key: str, days: int) -> pd.DataFrame | None:
+    df = None
+    tickflow_symbol = index_config.get("tickflow_symbol") if isinstance(index_config, dict) else None
+    if tickflow_symbol:
+        try:
+            cache_symbol = raw_cache_symbol(index_name, index_config)
+            cached_raw, _ = load_dataset(
+                cache_symbol,
+                "tickflow",
+                "index_daily_raw",
+            )
+            fetch_count = 30 if cached_raw is not None and not cached_raw.empty else max(days * 2, 80)
+            latest_raw = get_index_raw_from_tickflow(
+                api_key,
+                tickflow_symbol,
+                count=fetch_count,
+            )
+            if latest_raw is not None and not latest_raw.empty:
+                raw_df = merge_raw_index_data(cached_raw, latest_raw)
+                save_dataset(
+                    symbol=cache_symbol,
+                    name=f"{index_name} 指数原始日线",
+                    source="tickflow",
+                    data_type="index_daily_raw",
+                    df=raw_df,
+                )
+                df = build_export_df(raw_df, index_name, days=days)
+        except Exception:
+            df = None
+
+    if df is None:
+        df = fetch_one_index(index_name, index_config, api_key=api_key, days=days)
+    return df

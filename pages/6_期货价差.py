@@ -89,27 +89,33 @@ def centered_table(df: pd.DataFrame) -> None:
     )
 
 with st.sidebar:
-    st.subheader("参数")
-    contracts_text = st.text_area("合约代码", value="IM2606 IM2612", height=90)
-    api_key = st.text_input(
-        "TickFlow API Key",
-        value=os.getenv("TICKFLOW_API_KEY", ""),
-        type="password",
-        placeholder="可选；填入后使用实时更新的日线",
-    )
-    contracts = parse_contracts(contracts_text)
-    if contracts:
-        base_contract = st.selectbox(
-            "基准合约",
-            options=contracts,
-            format_func=contract_name,
-        )
-    else:
-        base_contract = ""
+    st.subheader("分析设置")
     max_workers = st.slider("并发请求数", min_value=1, max_value=8, value=5)
     force_refresh = st.checkbox("联网更新数据", value=False)
     save_to_cache = st.checkbox("分析后保存到本地缓存", value=True)
-    analyze_clicked = st.button("获取数据并分析", type="primary")
+
+contracts_text = st.text_area("合约代码", value="IM2606 IM2612", height=90)
+contracts = parse_contracts(contracts_text)
+
+with st.form("futures_spread_fetch_form"):
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if contracts:
+            base_contract = st.selectbox(
+                "基准合约",
+                options=contracts,
+                format_func=contract_name,
+            )
+        else:
+            base_contract = ""
+    with col2:
+        api_key = st.text_input(
+            "TickFlow API Key",
+            value=os.getenv("TICKFLOW_API_KEY", ""),
+            type="password",
+            placeholder="可选；填入后使用实时更新的日线",
+        )
+    analyze_clicked = st.form_submit_button("获取数据并分析", type="primary")
 
 if not contracts:
     st.info("请输入至少两个合约代码，例如：IM2606 IM2612。")
@@ -120,7 +126,7 @@ if len(contracts) < 2:
     st.stop()
 
 if not analyze_clicked:
-    st.info("设置合约和基准后，点击左侧「获取数据并分析」。")
+    st.info("设置合约和基准后，点击「获取数据并分析」。")
     st.stop()
 
 cache_symbol = f"futures_spread_{base_contract}"

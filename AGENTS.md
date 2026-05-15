@@ -51,6 +51,20 @@ before a larger handoff or commit.
 - The `指数监控` page should not block first render with a synchronous daily
   update. Show cached data immediately; if today's cache is stale, start a
   one-shot background update and ask the user to refresh later.
+- The `任务与数据` page uses one background-loop toggle button. When no loop is
+  running, show `启动后台循环`; when a PID is active, show `停止后台循环`; after a
+  click, display an immediate status message and rerun so the button state
+  changes visibly.
+- The background update loop should use market-specific trading windows rather
+  than a China-only 09:30-15:00 gate. Keep A-share, HK, Japan, Korea, and US
+  windows in `services.background_updater`; US market checks must use
+  `America/New_York` so daylight saving time is handled by `zoneinfo`.
+- Background updates are market-scoped. When only US markets are active, update
+  only the US index group, not all index columns. Also keep the close-plus-five
+  minute one-shot refresh per market so same-day close values can be captured.
+- Index MA20 updates use controlled concurrency through
+  `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
+  a data source becomes unstable.
 - The `指数监控` latest summary uses dashboard-style index cards: four columns
   on desktop, fixed-height cards, index name and code on separate lines,
   A-share color convention for deltas (red up, green down), and a summary table
@@ -61,6 +75,9 @@ before a larger handoff or commit.
 - Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
+- Analysis pages should follow the same control layout: keep analysis settings
+  in the sidebar, and keep data input, upload, API key fields, and run/analyze
+  buttons in the main page area.
 
 ## Structure
 

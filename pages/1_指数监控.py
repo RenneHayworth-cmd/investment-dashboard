@@ -157,6 +157,7 @@ with st.sidebar:
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
+    max_workers = st.number_input("并发数", min_value=1, max_value=8, value=4, step=1)
     force_refresh = st.checkbox("强制重新获取", value=False)
     update_clicked = st.button("更新指数数据", type="primary")
 
@@ -165,18 +166,15 @@ if update_clicked:
     status_box = st.empty()
 
     def show_progress(index_name: str, idx: int, total: int, status: str) -> None:
-        if status == "running":
-            progress.progress((idx - 1) / total)
-            status_box.info(f"正在获取 {index_name} ({idx}/{total})...")
-        elif status == "success":
+        if status == "success":
             progress.progress(idx / total)
-            status_box.success(f"{index_name} 获取完成")
+            status_box.success(f"{index_name} 获取完成，进度 {idx}/{total}")
         elif status == "empty":
             progress.progress(idx / total)
-            status_box.warning(f"{index_name} 无数据")
+            status_box.warning(f"{index_name} 无数据，进度 {idx}/{total}")
         else:
             progress.progress(idx / total)
-            status_box.warning(f"{index_name} 获取失败")
+            status_box.warning(f"{index_name} 获取失败，进度 {idx}/{total}")
 
     result = run_index_ma20_update(
         api_key=api_key,
@@ -184,6 +182,7 @@ if update_clicked:
         cache_source="auto",
         use_fresh_cache=not force_refresh,
         progress_callback=show_progress,
+        max_workers=int(max_workers),
     )
     if result.status == "success":
         if result.errors:

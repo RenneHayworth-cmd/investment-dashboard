@@ -40,38 +40,43 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 with st.sidebar:
+    st.subheader("分析设置")
+    count = st.number_input("日线条数", min_value=60, max_value=10000, value=2500, step=100)
+    adjust_option = st.selectbox("股票/ETF复权", options=["前复权", "后复权", "不复权"], index=0)
+    correlation_method = st.selectbox("计算方式", options=["收盘价相关", "日收益率相关"], index=1)
+    force_refresh = st.checkbox("联网更新数据", value=False)
+
+with st.form("correlation_data_form"):
     st.subheader("数据来源")
     uploaded_files = st.file_uploader(
         "上传 CSV/Excel",
         type=["csv", "xlsx", "xls"],
         accept_multiple_files=True,
     )
-    cn_codes = st.text_area(
-        "A股ETF代码",
-        value="159915 512890",
-        height=76,
-        placeholder="例如：159915 512890，或 510300.SH",
-    )
-    us_codes = st.text_area(
-        "美股代码",
-        value="",
-        height=76,
-        placeholder="例如：AAPL MSFT SPY COWZ",
-    )
-    futures_codes = st.text_area(
-        "期货主连代码",
-        value="",
-        height=76,
-        placeholder="例如：IM0 I0 AU0，或 IM主连 I主连",
-    )
-
-    st.subheader("参数")
-    count = st.number_input("日线条数", min_value=60, max_value=10000, value=2500, step=100)
-    adjust_option = st.selectbox("股票/ETF复权", options=["前复权", "后复权", "不复权"], index=0)
-    correlation_method = st.selectbox("计算方式", options=["收盘价相关", "日收益率相关"], index=1)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        cn_codes = st.text_area(
+            "A股ETF代码",
+            value="159915 512890",
+            height=96,
+            placeholder="例如：159915 512890，或 510300.SH",
+        )
+    with col2:
+        us_codes = st.text_area(
+            "美股代码",
+            value="",
+            height=96,
+            placeholder="例如：AAPL MSFT SPY COWZ",
+        )
+    with col3:
+        futures_codes = st.text_area(
+            "期货主连代码",
+            value="",
+            height=96,
+            placeholder="例如：IM0 I0 AU0，或 IM主连 I主连",
+        )
     api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
-    force_refresh = st.checkbox("联网更新数据", value=False)
-    calculate_clicked = st.button("计算相关系数", type="primary")
+    calculate_clicked = st.form_submit_button("计算相关系数", type="primary")
 
 def render_results_panel() -> None:
     st.subheader("相关性分析结果")
@@ -424,7 +429,7 @@ def futures_product_name(code: str) -> str:
 
 if not calculate_clicked:
     render_results_panel()
-    st.info("在左侧任意输入 A股ETF、美股、期货主连或上传文件，至少两个标的即可混合计算相关系数。上传文件需要包含日期列和收盘价/净值列。")
+    st.info("在数据来源区域任意输入 A股ETF、美股、期货主连或上传文件，至少两个标的即可混合计算相关系数。上传文件需要包含日期列和收盘价/净值列。")
     st.stop()
 
 items = []
