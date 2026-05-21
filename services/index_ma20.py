@@ -38,7 +38,6 @@ INDEX_CONFIG = {
         "source": "akshare_csindex",
         "code": "H30269",
         "market_group": "A股",
-        "tickflow_symbol": "H30269.SH",
     },
     "国证自由现金流": {
         "source": "akshare_cn",
@@ -222,6 +221,51 @@ def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd
     return normalized
 
 
+def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    latest_history_date = normalized["trade_date"].max().date()
+
+    try:
+        import requests
+
+        quote = None
+        session = requests.Session()
+        session.trust_env = False
+        params = {
+            "secid": secid,
+            "fields": "f43,f57,f58,f86",
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "fltt": "2",
+            "invt": "2",
+        }
+        for host in ("push2.eastmoney.com", "36.push2.eastmoney.com", "48.push2.eastmoney.com"):
+            try:
+                response = session.get(f"https://{host}/api/qt/stock/get", params=params, timeout=3)
+                response.raise_for_status()
+                quote = response.json().get("data") or {}
+                if quote:
+                    break
+            except Exception:
+                continue
+        if not quote:
+            return normalized
+        latest_price = pd.to_numeric(quote.get("f43"), errors="coerce")
+        quote_timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
+        if pd.isna(latest_price) or pd.isna(quote_timestamp):
+            return normalized
+        quote_date = datetime.fromtimestamp(float(quote_timestamp)).date()
+        if quote_date <= latest_history_date:
+            return normalized
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
+        return pd.concat([normalized, supplement], ignore_index=True)
+    except Exception:
+        return normalized
+
+
 def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: int = 30):
     import akshare as ak
 
@@ -245,7 +289,8 @@ def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: 
             if raw_df is None or raw_df.empty:
                 continue
             df = normalize_akshare_index_df(raw_df)
-            df = append_akshare_latest_index_row(ak, df, index_code)
+            if index_code.upper() == "H30269":
+                df = append_eastmoney_quote_row(df, "2.H30269")
             return build_export_df(df, index_name, days=days)
         except Exception as exc:
             last_error = exc

@@ -19,8 +19,12 @@ init_db()
 
 st.title("指数监控")
 
+INDEX_UPDATE_WORKERS = 8
+
 if "index_auto_update_done" not in st.session_state:
     st.session_state.index_auto_update_done = False
+if "index_update_notice" not in st.session_state:
+    st.session_state.index_update_notice = None
 
 
 def format_update_time(value: str | None) -> str:
@@ -157,9 +161,12 @@ with st.sidebar:
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
     days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
-    max_workers = st.number_input("并发数", min_value=1, max_value=8, value=4, step=1)
-    force_refresh = st.checkbox("强制重新获取", value=False)
     update_clicked = st.button("更新指数数据", type="primary")
+
+notice = st.session_state.pop("index_update_notice", None)
+if notice:
+    level, message = notice
+    getattr(st, level)(message)
 
 if update_clicked:
     progress = st.progress(0)
@@ -180,15 +187,15 @@ if update_clicked:
         api_key=api_key,
         days=int(days),
         cache_source="auto",
-        use_fresh_cache=not force_refresh,
+        use_fresh_cache=False,
         progress_callback=show_progress,
-        max_workers=int(max_workers),
+        max_workers=INDEX_UPDATE_WORKERS,
     )
     if result.status == "success":
         if result.errors:
-            st.warning(result.message)
+            st.session_state.index_update_notice = ("warning", result.message)
         else:
-            st.success(result.message)
+            st.session_state.index_update_notice = ("success", result.message)
         st.rerun()
     else:
         st.error(result.message)
