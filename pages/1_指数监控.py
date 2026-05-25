@@ -56,6 +56,9 @@ def start_background_update_once(api_key: str, days: int) -> bool:
         "--once",
         "--days",
         str(days),
+        "--max-workers",
+        str(INDEX_UPDATE_WORKERS),
+        "--force-refresh",
     ]
     if api_key:
         cmd.extend(["--api-key", api_key])

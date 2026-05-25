@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -266,6 +267,61 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         return normalized
 
 
+def append_hk_index_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    latest_history_date = normalized["trade_date"].max().date()
+    today = datetime.now().date()
+    if latest_history_date >= today:
+        return normalized
+
+    try:
+        spot_df = ak.stock_hk_index_spot_sina()
+        code_col = spot_df.columns[0]
+        price_col = "最新价" if "最新价" in spot_df.columns else spot_df.columns[2]
+        matched = spot_df[spot_df[code_col].astype(str).str.upper() == index_code.upper()]
+        if matched.empty:
+            return normalized
+        latest_price = pd.to_numeric(matched.iloc[0][price_col], errors="coerce")
+        if pd.isna(latest_price):
+            return normalized
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+        return pd.concat([normalized, supplement], ignore_index=True)
+    except Exception:
+        return normalized
+
+
+def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    latest_history_date = normalized["trade_date"].max().date()
+    now = datetime.now()
+    today = now.date()
+    if latest_history_date >= today or now.time() < time(15, 0):
+        return normalized
+
+    try:
+        spot_df = ak.futures_zh_spot(symbol=index_code.upper(), market="CF", adjust="0")
+        if spot_df is None or spot_df.empty:
+            return normalized
+        price_col = "current_price" if "current_price" in spot_df.columns else "last_close"
+        if price_col not in spot_df.columns:
+            return normalized
+        latest_price = pd.to_numeric(spot_df.iloc[0][price_col], errors="coerce")
+        if pd.isna(latest_price):
+            return normalized
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+        return pd.concat([normalized, supplement], ignore_index=True)
+    except Exception:
+        return normalized
+
+
 def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: int = 30):
     import akshare as ak
 
@@ -340,6 +396,8 @@ def get_index_data_from_akshare_hk(index_code: str, index_name: str, days: int =
 
     raw_df = ak.stock_hk_index_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
+    if index_code.upper() == "HSTECH":
+        df = append_hk_index_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
 
 
@@ -395,6 +453,8 @@ def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, d
 
     raw_df = ak.futures_zh_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
+    if index_code.upper() == "I0":
+        df = append_futures_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
 
 
@@ -406,7 +466,51 @@ def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str,
     df = client.klines.get(index_code, period="1d", count=count, as_dataframe=True)
     if df is None or df.empty:
         return None
+    if api_key:
+        df = append_tickflow_quote_row(client, df, index_code)
     return build_export_df(df, index_name, days=days)
+
+
+def tickflow_quote_date(symbol: str, timestamp) -> pd.Timestamp:
+    quote_time = pd.to_numeric(timestamp, errors="coerce")
+    if pd.isna(quote_time):
+        if str(symbol).upper().endswith(".US"):
+            return pd.Timestamp(datetime.now(ZoneInfo("America/New_York")).date())
+        return pd.Timestamp(datetime.now().date())
+
+    timestamp_value = float(quote_time)
+    if timestamp_value > 10_000_000_000:
+        timestamp_value = timestamp_value / 1000
+
+    market_zone = ZoneInfo("America/New_York") if str(symbol).upper().endswith(".US") else ZoneInfo("Asia/Shanghai")
+    quote_dt = datetime.fromtimestamp(timestamp_value, tz=timezone.utc).astimezone(market_zone)
+    return pd.Timestamp(quote_dt.date())
+
+
+def append_tickflow_quote_row(client, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    normalized = normalize_tickflow_index_df(df)
+    try:
+        quote_df = client.quotes.get_by_symbols([index_code], as_dataframe=True)
+        if quote_df is None or quote_df.empty:
+            return normalized
+        quote_row = quote_df.iloc[0]
+        latest_price = pd.to_numeric(quote_row.get("last_price"), errors="coerce")
+        if pd.isna(latest_price):
+            return normalized
+
+        quote_timestamp = quote_row.get("timestamp")
+        quote_date = tickflow_quote_date(index_code, quote_timestamp)
+        latest_history_date = normalized["trade_date"].max()
+        if quote_date < latest_history_date:
+            return normalized
+
+        supplement = pd.DataFrame([{"trade_date": quote_date, "close": float(latest_price)}])
+        return merge_raw_index_data(normalized, supplement)
+    except Exception:
+        return normalized
 
 
 def normalize_tickflow_index_df(df: pd.DataFrame) -> pd.DataFrame:
