@@ -63,11 +63,132 @@ MARKET_WINDOWS = (
 )
 
 
+MARKET_HOLIDAYS = {
+    "A股": {
+        2026: {
+            "2026-01-01",
+            "2026-02-16",
+            "2026-02-17",
+            "2026-02-18",
+            "2026-02-19",
+            "2026-02-20",
+            "2026-02-23",
+            "2026-04-06",
+            "2026-05-01",
+            "2026-05-04",
+            "2026-05-05",
+            "2026-06-19",
+            "2026-09-25",
+            "2026-10-01",
+            "2026-10-02",
+            "2026-10-05",
+            "2026-10-06",
+            "2026-10-07",
+        },
+    },
+    "港股": {
+        2026: {
+            "2026-01-01",
+            "2026-02-17",
+            "2026-02-18",
+            "2026-02-19",
+            "2026-04-03",
+            "2026-04-06",
+            "2026-04-07",
+            "2026-05-01",
+            "2026-05-25",
+            "2026-06-19",
+            "2026-07-01",
+            "2026-10-01",
+            "2026-10-19",
+            "2026-12-25",
+        },
+    },
+    "日本": {
+        2026: {
+            "2026-01-01",
+            "2026-01-02",
+            "2026-01-12",
+            "2026-02-11",
+            "2026-02-23",
+            "2026-03-20",
+            "2026-04-29",
+            "2026-05-04",
+            "2026-05-05",
+            "2026-05-06",
+            "2026-07-20",
+            "2026-08-11",
+            "2026-09-21",
+            "2026-09-22",
+            "2026-09-23",
+            "2026-10-12",
+            "2026-11-03",
+            "2026-11-23",
+            "2026-12-31",
+        },
+    },
+    "韩国": {
+        2026: {
+            "2026-01-01",
+            "2026-02-16",
+            "2026-02-17",
+            "2026-02-18",
+            "2026-03-02",
+            "2026-05-01",
+            "2026-05-05",
+            "2026-05-25",
+            "2026-06-03",
+            "2026-07-17",
+            "2026-08-17",
+            "2026-09-24",
+            "2026-09-25",
+            "2026-10-05",
+            "2026-10-09",
+            "2026-12-25",
+            "2026-12-31",
+        },
+    },
+    "美股": {
+        2026: {
+            "2026-01-01",
+            "2026-01-19",
+            "2026-02-16",
+            "2026-04-03",
+            "2026-05-25",
+            "2026-06-19",
+            "2026-07-03",
+            "2026-09-07",
+            "2026-11-26",
+            "2026-12-25",
+        },
+    },
+}
+
+
+MARKET_EARLY_CLOSES = {
+    "港股": {
+        2026: {
+            "2026-02-16": datetime_time(12, 0),
+            "2026-12-24": datetime_time(12, 0),
+            "2026-12-31": datetime_time(12, 0),
+        },
+    },
+    "美股": {
+        2026: {
+            "2026-07-02": datetime_time(13, 0),
+            "2026-11-27": datetime_time(13, 0),
+            "2026-12-24": datetime_time(13, 0),
+        },
+    },
+}
+
+
 def describe_update_windows() -> str:
     return (
         "按主要市场交易时段刷新：A股 09:30-11:30/13:00-15:00，"
         "港股 09:30-12:00/13:00-16:00，日韩约北京时间 08:00-14:30，"
-        "美股按美东 09:30-16:00 自动适配夏令时；各市场收盘 5 分钟后补刷一次。"
+        "美股按美东 09:30-16:00 自动适配夏令时；各市场按本地节假日跳过，"
+        "收盘 5 分钟后补刷一次。"
     )
 
 
@@ -135,15 +256,37 @@ def normalize_datetime(now: datetime | None = None) -> datetime:
     return current
 
 
+def is_market_trading_day(market: MarketWindow, market_now: datetime) -> bool:
+    if market_now.weekday() >= 5:
+        return False
+    market_date = market_now.date().isoformat()
+    holidays = MARKET_HOLIDAYS.get(market.name, {}).get(market_now.year, set())
+    return market_date not in holidays
+
+
+def get_market_sessions(market: MarketWindow, market_now: datetime) -> tuple[tuple[datetime_time, datetime_time], ...]:
+    market_date = market_now.date().isoformat()
+    early_close = MARKET_EARLY_CLOSES.get(market.name, {}).get(market_now.year, {}).get(market_date)
+    if early_close is None:
+        return market.sessions
+
+    sessions = []
+    for start, end in market.sessions:
+        if start >= early_close:
+            continue
+        sessions.append((start, min(end, early_close)))
+    return tuple(sessions)
+
+
 def get_active_market_names(now: datetime | None = None) -> list[str]:
     current = normalize_datetime(now)
     active_markets: list[str] = []
     for market in MARKET_WINDOWS:
         market_now = current.astimezone(ZoneInfo(market.timezone))
-        if market_now.weekday() >= 5:
+        if not is_market_trading_day(market, market_now):
             continue
         current_time = market_now.time()
-        if any(start <= current_time <= end for start, end in market.sessions):
+        if any(start <= current_time <= end for start, end in get_market_sessions(market, market_now)):
             active_markets.append(market.name)
     return active_markets
 
@@ -163,10 +306,13 @@ def get_market_close_due_names(
     due_markets: list[str] = []
     for market in MARKET_WINDOWS:
         market_now = current.astimezone(ZoneInfo(market.timezone))
-        if market_now.weekday() >= 5:
+        if not is_market_trading_day(market, market_now):
             continue
 
-        close_time = market.sessions[-1][1]
+        sessions = get_market_sessions(market, market_now)
+        if not sessions:
+            continue
+        close_time = sessions[-1][1]
         close_at = market_now.replace(
             hour=close_time.hour,
             minute=close_time.minute,

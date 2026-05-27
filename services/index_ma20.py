@@ -236,6 +236,11 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         quote = None
         session = requests.Session()
         session.trust_env = False
+        headers = {
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/",
+            "User-Agent": "Mozilla/5.0",
+        }
         params = {
             "secid": secid,
             "fields": "f43,f57,f58,f86",
@@ -243,9 +248,19 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
             "fltt": "2",
             "invt": "2",
         }
-        for host in ("push2.eastmoney.com", "36.push2.eastmoney.com", "48.push2.eastmoney.com"):
+        for host in (
+            "push2.eastmoney.com",
+            "36.push2.eastmoney.com",
+            "48.push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+        ):
             try:
-                response = session.get(f"https://{host}/api/qt/stock/get", params=params, timeout=3)
+                response = session.get(
+                    f"https://{host}/api/qt/stock/get",
+                    params=params,
+                    headers=headers,
+                    timeout=3,
+                )
                 response.raise_for_status()
                 quote = response.json().get("data") or {}
                 if quote:

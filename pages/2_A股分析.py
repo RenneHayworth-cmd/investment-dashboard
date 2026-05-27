@@ -171,7 +171,7 @@ st.caption("输入场外基金、场内基金或 A 股股票代码，或上传�
 
 with st.sidebar:
     st.subheader("分析设置")
-    input_mode = st.radio("数据来源", options=["场外基金", "场内基金/股票", "上传文件"], horizontal=False)
+    input_mode = st.radio("数据来源", options=["场外基金", "场内基金/股票", "上传文件"], index=1, horizontal=False)
     ma_periods = st.multiselect(
         "均线周期",
         options=[20, 60, 120, 250],
