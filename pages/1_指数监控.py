@@ -3,6 +3,7 @@ import html
 import os
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -10,7 +11,8 @@ import streamlit as st
 from core.cache import load_dataset
 from core.db import init_db
 from core.paths import OUTPUT_DIR, ensure_dirs
-from services.index_ma20 import build_summary
+from services.background_updater import MARKET_WINDOWS, is_market_trading_day
+from services.index_ma20 import INDEX_CONFIG, build_summary
 from services.update_tasks import run_index_ma20_update
 
 
@@ -155,6 +157,59 @@ def render_index_cards(summary_df: pd.DataFrame) -> None:
     )
 
 
+def render_freshness_bar(summary_df: pd.DataFrame) -> None:
+    market_windows = {market.name: market for market in MARKET_WINDOWS}
+    rows = []
+    for _, row in summary_df.iterrows():
+        index_name = str(row["指数"])
+        market_name = INDEX_CONFIG.get(index_name, {}).get("market_group", "")
+        market = market_windows.get(market_name)
+        latest_date = pd.to_datetime(row["日期"], errors="coerce")
+        if latest_date is pd.NaT or market is None:
+            continue
+
+        market_now = datetime.now(ZoneInfo(market.timezone))
+        market_date = market_now.date()
+        is_trading_day = is_market_trading_day(market, market_now)
+        latest_day = latest_date.date()
+
+        if latest_day >= market_date:
+            status = "已更新"
+            status_class = "fresh"
+        elif not is_trading_day:
+            status = "休市"
+            status_class = "closed"
+        else:
+            status = "待更新"
+            status_class = "stale"
+
+        rows.append(
+            '<div class="freshness-item">'
+            f'<span class="freshness-name">{html.escape(index_name)}</span>'
+            f'<span class="freshness-pill {status_class}">{status}</span>'
+            f'<span class="freshness-date">{latest_day:%m-%d}</span>'
+            "</div>"
+        )
+
+    if not rows:
+        return
+
+    st.markdown(
+        "<style>"
+        ".freshness-strip{display:flex;gap:.5rem;overflow-x:auto;padding:.1rem 0 .8rem;margin-top:-.15rem;}"
+        ".freshness-item{display:inline-flex;align-items:center;gap:.45rem;flex:0 0 auto;border-bottom:1px solid rgba(49,51,63,.14);padding:.25rem .05rem .35rem;font-size:.86rem;}"
+        ".freshness-name{font-weight:600;color:rgba(49,51,63,.82);}"
+        ".freshness-date{color:rgba(49,51,63,.58);font-variant-numeric:tabular-nums;}"
+        ".freshness-pill{border-radius:999px;padding:.12rem .45rem;font-size:.76rem;font-weight:700;line-height:1.25;}"
+        ".freshness-pill.fresh{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
+        ".freshness-pill.closed{color:rgb(75,85,99);background:rgba(243,244,246,.95);}"
+        ".freshness-pill.stale{color:rgb(146,64,14);background:rgba(254,243,199,.95);}"
+        "</style>"
+        f'<div class="freshness-strip">{"".join(rows)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
@@ -230,6 +285,7 @@ if report_df is not None:
     if not summary_df.empty:
         summary_date = summary_df["日期"].max()
         st.subheader(f"最新摘要 · {summary_date}")
+        render_freshness_bar(summary_df)
         render_index_cards(summary_df)
 
         display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")

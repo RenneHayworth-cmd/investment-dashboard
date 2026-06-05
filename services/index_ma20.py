@@ -56,6 +56,7 @@ INDEX_CONFIG = {
     "铁矿石主连": {
         "source": "akshare_futures_main",
         "code": "I0",
+        "tickflow_symbol": "i2609.DCE",
         "display_symbol": "I0",
         "market_group": "A股",
     },
