@@ -49,19 +49,9 @@ before a larger handoff or commit.
   cache count, latest cache update time, latest trade date, today-focus notes,
   and common page entry text. Avoid rebuilding it as a heavy card dashboard.
 - The `指数监控` page should not block first render with a synchronous daily
-  update. Show cached data immediately; if today's cache is stale, start a
-  one-shot background update and ask the user to refresh later.
-- The `任务与数据` page uses one background-loop toggle button. When no loop is
-  running, show `启动后台循环`; when a PID is active, show `停止后台循环`; after a
-  click, display an immediate status message and rerun so the button state
-  changes visibly.
-- The background update loop should use market-specific trading windows rather
-  than a China-only 09:30-15:00 gate. Keep A-share, HK, Japan, Korea, and US
-  windows in `services.background_updater`; US market checks must use
-  `America/New_York` so daylight saving time is handled by `zoneinfo`.
-- Background updates are market-scoped. When only US markets are active, update
-  only the US index group, not all index columns. Also keep the close-plus-five
-  minute one-shot refresh per market so same-day close values can be captured.
+  update. Show cached data immediately and let the user refresh manually.
+- The `任务与数据` page provides manual index updates, dataset metadata, and job
+  records. Do not add a background-loop toggle or auto-started updater.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
   a data source becomes unstable.

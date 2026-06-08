@@ -43,6 +43,14 @@ INDEX_CONFIG = {
         "tickflow_symbol": "932000.SH",
         "eastmoney_quote_secid": "2.932000",
     },
+    "微盘股": {
+        "source": "eastmoney_kline",
+        "code": "90.BK1158",
+        "display_symbol": "BK1158",
+        "market_group": "A股",
+        "fqt": "1",
+        "akshare_board_symbol": "BK1158",
+    },
     "中证红利低波": {
         "source": "akshare_csindex",
         "code": "H30269",
@@ -54,14 +62,6 @@ INDEX_CONFIG = {
         "market": "sz",
         "market_group": "A股",
         "tickflow_symbol": "980092.SZ",
-    },
-    "微盘股": {
-        "source": "eastmoney_kline",
-        "code": "90.BK1158",
-        "display_symbol": "BK1158",
-        "market_group": "A股",
-        "fqt": "1",
-        "akshare_board_symbol": "BK1158",
     },
     "恒生科技": {
         "source": "akshare_hk",
@@ -77,31 +77,6 @@ INDEX_CONFIG = {
         "akshare_hk_em_symbol": "HSHYLV",
         "optional": True,
     },
-    "铁矿石主连": {
-        "source": "akshare_futures_main",
-        "code": "I0",
-        "tickflow_symbol": "i2609.DCE",
-        "display_symbol": "I0",
-        "market_group": "A股",
-    },
-    "沪金主连": {
-        "source": "akshare_futures_main",
-        "code": "AU0",
-        "display_symbol": "AU0",
-        "market_group": "A股",
-    },
-    "原油主连": {
-        "source": "akshare_futures_main",
-        "code": "SC0",
-        "display_symbol": "SC0",
-        "market_group": "A股",
-    },
-    "沪银主连": {
-        "source": "akshare_futures_main",
-        "code": "AG0",
-        "display_symbol": "AG0",
-        "market_group": "A股",
-    },
     "标普500": {
         "source": "akshare_us",
         "code": ".INX",
@@ -110,9 +85,9 @@ INDEX_CONFIG = {
         "market_group": "美股",
     },
     "纳斯达克综合": {
-        "source": "akshare_us",
-        "code": ".IXIC",
-        "tickflow_symbol": ".IXIC.US",
+        "source": "yahoo",
+        "code": "^IXIC",
+        "display_symbol": "IXIC",
         "market_group": "美股",
     },
     "纳斯达克100": {
@@ -142,6 +117,31 @@ INDEX_CONFIG = {
         "display_symbol": "KOSPI",
         "market_group": "韩国",
     },
+    "铁矿石主连": {
+        "source": "akshare_futures_main",
+        "code": "I0",
+        "tickflow_symbol": "i2609.DCE",
+        "display_symbol": "I0",
+        "market_group": "A股",
+    },
+    "沪金主连": {
+        "source": "akshare_futures_main",
+        "code": "AU0",
+        "display_symbol": "AU0",
+        "market_group": "A股",
+    },
+    "沪银主连": {
+        "source": "akshare_futures_main",
+        "code": "AG0",
+        "display_symbol": "AG0",
+        "market_group": "A股",
+    },
+    "原油主连": {
+        "source": "akshare_futures_main",
+        "code": "SC0",
+        "display_symbol": "SC0",
+        "market_group": "A股",
+    },
 }
 
 
@@ -160,6 +160,7 @@ def build_export_df(df: pd.DataFrame, index_name: str, days: int = 30) -> pd.Dat
 
     result["MA20"] = result["close"].rolling(window=20).mean()
     result["偏离率"] = (result["close"] - result["MA20"]) / result["MA20"] * 100
+    transition_date, interval_return_pct = calculate_ma20_transition(result, "close", "MA20", date_col="trade_date")
 
     start_date = datetime.now() - timedelta(days=days)
     recent_data = result[result["trade_date"] >= start_date].copy()
@@ -171,11 +172,15 @@ def build_export_df(df: pd.DataFrame, index_name: str, days: int = 30) -> pd.Dat
     export_df["close"] = export_df["close"].round(2)
     export_df["MA20"] = export_df["MA20"].round(2)
     export_df["偏离率"] = export_df["偏离率"].round(2)
+    export_df["状态转变时间"] = transition_date
+    export_df["区间涨幅"] = round(interval_return_pct, 2) if not pd.isna(interval_return_pct) else pd.NA
     export_df.columns = [
         "日期",
         f"{index_name}_收盘价",
         f"{index_name}_MA20",
         f"{index_name}_偏离率(%)",
+        f"{index_name}_状态转变时间",
+        f"{index_name}_区间涨幅(%)",
     ]
     return export_df
 
@@ -939,6 +944,20 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
             continue
         latest = valid_rows.iloc[-1]
         show_deviation = index_config.get("show_ma20_deviation", True)
+        transition_col = f"{index_name}_状态转变时间"
+        interval_col = f"{index_name}_区间涨幅(%)"
+        transition_date, interval_return_pct = (pd.NA, pd.NA)
+        if show_deviation:
+            if transition_col in latest and interval_col in latest and not pd.isna(latest[transition_col]):
+                transition_date = latest[transition_col]
+                interval_return_pct = latest[interval_col]
+            else:
+                transition_date, interval_return_pct = calculate_ma20_transition(
+                    valid_rows,
+                    close_col,
+                    ma20_col,
+                    date_col="日期",
+                )
         previous_close = pd.NA
         daily_change_pct = pd.NA
         if len(valid_rows) >= 2:
@@ -955,8 +974,45 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
                 "当日涨跌幅(%)": daily_change_pct,
                 "MA20": latest[ma20_col],
                 "偏离率(%)": latest[deviation_col] if show_deviation and deviation_col in latest else pd.NA,
+                "状态转变时间": transition_date,
+                "区间涨幅(%)": interval_return_pct,
             }
         )
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def calculate_ma20_transition(
+    valid_rows: pd.DataFrame,
+    close_col: str,
+    ma20_col: str,
+    date_col: str = "日期",
+) -> tuple[object, object]:
+    if len(valid_rows) < 2 or date_col not in valid_rows.columns:
+        return pd.NA, pd.NA
+
+    data = valid_rows[[date_col, close_col, ma20_col]].copy()
+    data[close_col] = pd.to_numeric(data[close_col], errors="coerce")
+    data[ma20_col] = pd.to_numeric(data[ma20_col], errors="coerce")
+    data = data.dropna(subset=[close_col, ma20_col]).reset_index(drop=True)
+    if len(data) < 2:
+        return pd.NA, pd.NA
+
+    latest = data.iloc[-1]
+    latest_close = latest[close_col]
+    latest_above = latest_close >= latest[ma20_col]
+
+    for idx in range(len(data) - 1, 0, -1):
+        current = data.iloc[idx]
+        previous = data.iloc[idx - 1]
+        current_above = current[close_col] >= current[ma20_col]
+        previous_above = previous[close_col] >= previous[ma20_col]
+        if current_above == latest_above and previous_above != current_above:
+            transition_close = current[close_col]
+            if pd.isna(transition_close) or transition_close == 0:
+                return pd.NA, pd.NA
+            transition_date = pd.Timestamp(current[date_col]).strftime("%Y-%m-%d")
+            interval_return = (latest_close / transition_close - 1) * 100
+            return transition_date, interval_return
+    return pd.NA, pd.NA

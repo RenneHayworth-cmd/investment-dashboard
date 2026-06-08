@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from typing import Callable
 
 import pandas as pd
@@ -20,7 +21,7 @@ from services.index_ma20 import (
 )
 
 
-ProgressCallback = Callable[[str, int, int, str], None]
+ProgressCallback = Callable[[str, int, int, str, float | None], None]
 
 
 @dataclass
@@ -29,6 +30,7 @@ class UpdateResult:
     message: str
     dataframe: pd.DataFrame | None = None
     errors: list[str] = field(default_factory=list)
+    timings: list[dict] = field(default_factory=list)
 
 
 def run_index_ma20_update(
@@ -45,6 +47,7 @@ def run_index_ma20_update(
     job_id = start_job(job_name)
     all_data = []
     errors = []
+    timings = []
     selected_items = [
         (index_name, index_config)
         for index_name, index_config in INDEX_CONFIG.items()
@@ -82,38 +85,45 @@ def run_index_ma20_update(
                 executor.submit(fetch_index_report, index_name, index_config, api_key, days): (
                     index_name,
                     index_config,
+                    time.perf_counter(),
                 )
                 for index_name, index_config in selected_items
             }
             for future in as_completed(future_map):
-                index_name, index_config = future_map[future]
+                index_name, index_config, started_at = future_map[future]
                 completed += 1
+                elapsed_seconds = time.perf_counter() - started_at
                 try:
                     df = future.result()
                     if df is not None and not df.empty:
                         all_data.append(df)
+                        timings.append(build_timing_row(index_name, index_config, "success", elapsed_seconds))
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "success")
+                            progress_callback(index_name, completed, total, "success", elapsed_seconds)
                     else:
+                        timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds))
                         if not index_config.get("optional"):
                             errors.append(f"{index_name}: 无数据")
                             if progress_callback:
-                                progress_callback(index_name, completed, total, "empty")
+                                progress_callback(index_name, completed, total, "empty", elapsed_seconds)
                         elif progress_callback:
-                            progress_callback(index_name, completed, total, "empty")
+                            progress_callback(index_name, completed, total, "empty", elapsed_seconds)
                 except Exception as exc:
                     cached_index_df = extract_cached_index_report(cached_df, index_name)
                     if cached_index_df is not None and not cached_index_df.empty:
                         all_data.append(cached_index_df)
+                        timings.append(build_timing_row(index_name, index_config, "cached", elapsed_seconds, str(exc)))
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "success")
+                            progress_callback(index_name, completed, total, "cached", elapsed_seconds)
                     elif index_config.get("optional"):
+                        timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds, str(exc)))
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "empty")
+                            progress_callback(index_name, completed, total, "empty", elapsed_seconds)
                     else:
+                        timings.append(build_timing_row(index_name, index_config, "failed", elapsed_seconds, str(exc)))
                         errors.append(f"{index_name}: {exc}")
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "failed")
+                            progress_callback(index_name, completed, total, "failed", elapsed_seconds)
 
         if not all_data:
             raise RuntimeError("未获取到任何指数数据。" + " | ".join(errors))
@@ -133,12 +143,38 @@ def run_index_ma20_update(
         message = "更新成功" if not selected_markets else f"{'、'.join(sorted(selected_markets))}更新成功"
         if errors:
             message += "；部分指数失败：" + " | ".join(errors)
+        if timings:
+            slowest = max(timings, key=lambda item: item["耗时(秒)"])
+            message += f"；最慢：{slowest['指数']} {slowest['耗时(秒)']:.2f}秒"
 
         finish_job(job_id, "success", message)
-        return UpdateResult("success", message, report, errors)
+        return UpdateResult("success", message, report, errors, timings)
     except Exception as exc:
         finish_job(job_id, "failed", str(exc))
-        return UpdateResult("failed", f"更新失败：{exc}", errors=errors)
+        return UpdateResult("failed", f"更新失败：{exc}", errors=errors, timings=timings)
+
+
+def build_timing_row(
+    index_name: str,
+    index_config: dict,
+    status: str,
+    elapsed_seconds: float,
+    message: str = "",
+) -> dict:
+    status_labels = {
+        "success": "成功",
+        "cached": "使用缓存",
+        "empty": "无数据",
+        "failed": "失败",
+    }
+    return {
+        "指数": index_name,
+        "市场": index_config.get("market_group", "-"),
+        "来源": index_config.get("source", "-"),
+        "状态": status_labels.get(status, status),
+        "耗时(秒)": round(elapsed_seconds, 2),
+        "说明": message[:240],
+    }
 
 
 def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd.DataFrame:

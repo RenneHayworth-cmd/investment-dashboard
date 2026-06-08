@@ -1,8 +1,6 @@
 from datetime import datetime
 import html
 import os
-import subprocess
-import sys
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -12,9 +10,8 @@ import streamlit as st
 
 from core.cache import load_dataset
 from core.db import init_db
-from core.paths import OUTPUT_DIR, ensure_dirs
-from services.background_updater import MARKET_WINDOWS, is_market_trading_day
 from services.index_ma20 import INDEX_CONFIG, build_summary, fetch_index_history
+from services.market_calendar import MARKET_WINDOWS, is_market_trading_day
 from services.update_tasks import run_index_ma20_update
 
 
@@ -25,12 +22,12 @@ st.title("指数监控")
 
 INDEX_UPDATE_WORKERS = 8
 
-if "index_auto_update_done" not in st.session_state:
-    st.session_state.index_auto_update_done = False
 if "index_update_notice" not in st.session_state:
     st.session_state.index_update_notice = None
 if "selected_index_detail" not in st.session_state:
     st.session_state.selected_index_detail = None
+if "index_update_timings" not in st.session_state:
+    st.session_state.index_update_timings = []
 
 
 def format_update_time(value: str | None) -> str:
@@ -40,46 +37,6 @@ def format_update_time(value: str | None) -> str:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return value.replace("T", " ")
-
-
-def is_today_cache(meta: dict | None) -> bool:
-    last_update_time = (meta or {}).get("last_update_time")
-    if not last_update_time:
-        return False
-    try:
-        return datetime.fromisoformat(last_update_time).date() == datetime.now().date()
-    except ValueError:
-        return False
-
-
-def start_background_update_once(api_key: str, days: int) -> bool:
-    ensure_dirs()
-    log_path = OUTPUT_DIR / "index_auto_update.log"
-    cmd = [
-        sys.executable,
-        "-m",
-        "services.background_updater",
-        "--once",
-        "--days",
-        str(days),
-        "--max-workers",
-        str(INDEX_UPDATE_WORKERS),
-        "--force-refresh",
-    ]
-    if api_key:
-        cmd.extend(["--api-key", api_key])
-    try:
-        with log_path.open("ab") as log_file:
-            subprocess.Popen(
-                cmd,
-                cwd=str(OUTPUT_DIR.parent),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        return True
-    except Exception:
-        return False
 
 
 def format_number(value) -> str:
@@ -425,7 +382,7 @@ def render_index_card(row: pd.Series) -> None:
         ".index-card-title a:hover{color:rgb(37,99,235);text-decoration:none;}"
         ".index-card-code{min-height:1.65rem;margin-top:.22rem;color:rgba(49,51,63,.58);font-size:1rem;line-height:1.25;overflow-wrap:anywhere;}"
         ".index-card-value{margin-top:1.05rem;color:rgb(31,41,55);font-size:1.85rem;font-weight:650;line-height:1.08;font-variant-numeric:tabular-nums;white-space:normal;overflow-wrap:anywhere;}"
-        ".index-card-delta{display:inline-flex;align-items:center;gap:.35rem;margin-top:1.05rem;border-radius:999px;padding:.35rem .85rem;font-size:1.05rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}"
+        ".index-card-delta{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;margin-top:1.05rem;border-radius:999px;padding:.35rem .85rem;font-size:1.05rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}"
         ".index-card-delta.positive{color:rgb(190,18,60);background:rgba(254,226,226,.9);}"
         ".index-card-delta.negative{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
         "</style>"
@@ -498,6 +455,17 @@ def render_freshness_bar(summary_df: pd.DataFrame) -> None:
     )
 
 
+def render_update_timings() -> None:
+    if not st.session_state.index_update_timings:
+        return
+    timing_df = pd.DataFrame(st.session_state.index_update_timings)
+    if timing_df.empty or "耗时(秒)" not in timing_df.columns:
+        return
+    timing_df = timing_df.sort_values("耗时(秒)", ascending=False).reset_index(drop=True)
+    with st.expander("上次指数更新耗时", expanded=False):
+        st.dataframe(timing_df, use_container_width=True, hide_index=True)
+
+
 with st.sidebar:
     st.subheader("更新设置")
     api_key = st.text_input(
@@ -518,16 +486,20 @@ if update_clicked:
     progress = st.progress(0)
     status_box = st.empty()
 
-    def show_progress(index_name: str, idx: int, total: int, status: str) -> None:
+    def show_progress(index_name: str, idx: int, total: int, status: str, elapsed_seconds: float | None = None) -> None:
+        elapsed_text = "" if elapsed_seconds is None else f"，耗时 {elapsed_seconds:.2f} 秒"
         if status == "success":
             progress.progress(idx / total)
-            status_box.success(f"{index_name} 获取完成，进度 {idx}/{total}")
+            status_box.success(f"{index_name} 获取完成{elapsed_text}，进度 {idx}/{total}")
+        elif status == "cached":
+            progress.progress(idx / total)
+            status_box.info(f"{index_name} 联网失败，已沿用缓存{elapsed_text}，进度 {idx}/{total}")
         elif status == "empty":
             progress.progress(idx / total)
-            status_box.warning(f"{index_name} 无数据，进度 {idx}/{total}")
+            status_box.warning(f"{index_name} 无数据{elapsed_text}，进度 {idx}/{total}")
         else:
             progress.progress(idx / total)
-            status_box.warning(f"{index_name} 获取失败，进度 {idx}/{total}")
+            status_box.warning(f"{index_name} 获取失败{elapsed_text}，进度 {idx}/{total}")
 
     result = run_index_ma20_update(
         api_key=api_key,
@@ -537,6 +509,7 @@ if update_clicked:
         progress_callback=show_progress,
         max_workers=INDEX_UPDATE_WORKERS,
     )
+    st.session_state.index_update_timings = result.timings
     if result.status == "success":
         if result.errors:
             st.session_state.index_update_notice = ("warning", result.message)
@@ -558,13 +531,6 @@ for source in ("auto", "manual"):
         report_meta = meta
         break
 
-if not update_clicked and not st.session_state.index_auto_update_done and not is_today_cache(report_meta):
-    st.session_state.index_auto_update_done = True
-    if start_background_update_once(api_key=api_key or os.getenv("TICKFLOW_API_KEY", ""), days=int(days)):
-        st.info("今日指数数据正在后台更新。当前先显示本地缓存，稍后刷新页面即可查看最新数据。")
-    else:
-        st.warning("后台更新启动失败，可以点击左侧按钮手动更新。")
-
 if report_df is not None and report_meta is not None:
     st.caption(f"更新时间：{format_update_time(report_meta['last_update_time'])}")
 
@@ -575,6 +541,7 @@ if report_df is not None:
         summary_date = summary_df["日期"].max()
         st.subheader(f"最新摘要 · {summary_date}")
         render_freshness_bar(summary_df)
+        render_update_timings()
         if selected_index:
             render_index_detail(report_df, selected_index)
         render_index_cards(summary_df)

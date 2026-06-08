@@ -14,7 +14,6 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 OUTPUT_DIR = RUNTIME_DIR / "output"
 DB_PATH = RUNTIME_DIR / "cache.db"
-BACKGROUND_PID_PATH = OUTPUT_DIR / "background_updater.pid"
 
 
 def ensure_dirs() -> None:
