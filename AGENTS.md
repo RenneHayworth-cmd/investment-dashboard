@@ -67,11 +67,16 @@ before a larger handoff or commit.
   a data source becomes unstable.
 - The `指数监控` latest summary uses dashboard-style index cards: four columns
   on desktop, fixed-height cards, index name and code on separate lines,
-  A-share color convention for deltas (red up, green down), and a summary table
+  A-share color convention for deltas (red up, green down), click-through
+  detail views with long-history trend/drawdown summaries, and a summary table
   sorted by MA20 deviation.
-- The monitored set includes mainland China indices, US indices, Hang Seng Tech,
-  Nikkei 225, Korea KOSPI, and iron ore main-continuous futures. Global indices
-  may use Yahoo chart fallback when the AkShare Eastmoney global endpoint fails.
+- The monitored set includes mainland China indices, EastMoney micro-cap board
+  index, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
+  Dividend Low Volatility, Nikkei 225, Korea KOSPI, and iron ore/gold/crude
+  oil/silver main-continuous futures. Main-continuous futures should try to
+  supplement same-day spot prices so they do not remain stale during the
+  trading day. Global indices may use Yahoo chart fallback when the AkShare
+  Eastmoney global endpoint fails.
 - Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.

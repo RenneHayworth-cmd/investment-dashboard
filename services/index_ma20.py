@@ -7,19 +7,19 @@ import pandas as pd
 
 
 INDEX_CONFIG = {
-    "沪深300": {
-        "source": "akshare_cn",
-        "code": "000300",
-        "market": "sh",
-        "market_group": "A股",
-        "tickflow_symbol": "000300.SH",
-    },
     "创业板指": {
         "source": "akshare_cn",
         "code": "399006",
         "market": "sz",
         "market_group": "A股",
         "tickflow_symbol": "399006.SZ",
+    },
+    "沪深300": {
+        "source": "akshare_cn",
+        "code": "000300",
+        "market": "sh",
+        "market_group": "A股",
+        "tickflow_symbol": "000300.SH",
     },
     "中证500": {
         "source": "akshare_cn",
@@ -35,6 +35,14 @@ INDEX_CONFIG = {
         "market_group": "A股",
         "tickflow_symbol": "000852.SH",
     },
+    "中证2000": {
+        "source": "akshare_cn",
+        "code": "932000",
+        "market": "sh",
+        "market_group": "A股",
+        "tickflow_symbol": "932000.SH",
+        "eastmoney_quote_secid": "2.932000",
+    },
     "中证红利低波": {
         "source": "akshare_csindex",
         "code": "H30269",
@@ -47,17 +55,51 @@ INDEX_CONFIG = {
         "market_group": "A股",
         "tickflow_symbol": "980092.SZ",
     },
+    "微盘股": {
+        "source": "eastmoney_kline",
+        "code": "90.BK1158",
+        "display_symbol": "BK1158",
+        "market_group": "A股",
+        "fqt": "1",
+        "akshare_board_symbol": "BK1158",
+    },
     "恒生科技": {
         "source": "akshare_hk",
         "code": "HSTECH",
         "display_symbol": "HSTECH",
         "market_group": "港股",
     },
+    "恒生港股通高息低波": {
+        "source": "eastmoney_kline",
+        "code": "124.HSHYLV",
+        "display_symbol": "HSHYLV",
+        "market_group": "港股",
+        "akshare_hk_em_symbol": "HSHYLV",
+        "optional": True,
+    },
     "铁矿石主连": {
         "source": "akshare_futures_main",
         "code": "I0",
         "tickflow_symbol": "i2609.DCE",
         "display_symbol": "I0",
+        "market_group": "A股",
+    },
+    "沪金主连": {
+        "source": "akshare_futures_main",
+        "code": "AU0",
+        "display_symbol": "AU0",
+        "market_group": "A股",
+    },
+    "原油主连": {
+        "source": "akshare_futures_main",
+        "code": "SC0",
+        "display_symbol": "SC0",
+        "market_group": "A股",
+    },
+    "沪银主连": {
+        "source": "akshare_futures_main",
+        "code": "AG0",
+        "display_symbol": "AG0",
         "market_group": "A股",
     },
     "标普500": {
@@ -72,6 +114,19 @@ INDEX_CONFIG = {
         "code": ".IXIC",
         "tickflow_symbol": ".IXIC.US",
         "market_group": "美股",
+    },
+    "纳斯达克100": {
+        "source": "yahoo",
+        "code": "^NDX",
+        "display_symbol": "NDX",
+        "market_group": "美股",
+    },
+    "VIX恐慌指数": {
+        "source": "yahoo",
+        "code": "^VIX",
+        "display_symbol": "VIX",
+        "market_group": "美股",
+        "show_ma20_deviation": False,
     },
     "日经225": {
         "source": "akshare_global",
@@ -317,9 +372,8 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
     normalized = df.copy()
     normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
     latest_history_date = normalized["trade_date"].max().date()
-    now = datetime.now()
-    today = now.date()
-    if latest_history_date >= today or now.time() < time(15, 0):
+    today = datetime.now().date()
+    if latest_history_date >= today:
         return normalized
 
     try:
@@ -327,6 +381,10 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
         if spot_df is None or spot_df.empty:
             return normalized
         price_col = "current_price" if "current_price" in spot_df.columns else "last_close"
+        if price_col not in spot_df.columns and "最新价" in spot_df.columns:
+            price_col = "最新价"
+        if price_col not in spot_df.columns and "price" in spot_df.columns:
+            price_col = "price"
         if price_col not in spot_df.columns:
             return normalized
         latest_price = pd.to_numeric(spot_df.iloc[0][price_col], errors="coerce")
@@ -341,7 +399,7 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
 def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: int = 30):
     import akshare as ak
 
-    start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
     attempts = [
         lambda: ak.stock_zh_index_hist_csindex(
@@ -369,10 +427,16 @@ def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: 
     raise RuntimeError(f"{index_name} AkShare 获取失败：{last_error}")
 
 
-def get_index_data_from_akshare_cn(index_code: str, market: str, index_name: str, days: int = 30):
+def get_index_data_from_akshare_cn(
+    index_code: str,
+    market: str,
+    index_name: str,
+    days: int = 30,
+    eastmoney_quote_secid: str | None = None,
+):
     import akshare as ak
 
-    start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
     market_symbol = f"{market}{index_code}".lower()
     attempts = [
@@ -393,6 +457,9 @@ def get_index_data_from_akshare_cn(index_code: str, market: str, index_name: str
             if raw_df is None or raw_df.empty:
                 continue
             df = normalize_akshare_index_df(raw_df)
+            df = append_akshare_latest_index_row(ak, df, index_code)
+            if eastmoney_quote_secid:
+                df = append_eastmoney_quote_row(df, eastmoney_quote_secid)
             return build_export_df(df, index_name, days=days)
         except Exception as exc:
             last_error = exc
@@ -421,7 +488,7 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
     import requests
 
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "1y", "interval": "1d"}
+    params = {"range": "max" if days > 365 else "1y", "interval": "1d"}
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, params=params, headers=headers, timeout=10)
     response.raise_for_status()
@@ -449,6 +516,126 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
     return build_export_df(pd.DataFrame(rows), index_name, days=days)
 
 
+def get_index_data_from_eastmoney_kline(
+    secid: str,
+    index_name: str,
+    days: int = 30,
+    fqt: str = "0",
+    akshare_board_symbol: str | None = None,
+    akshare_hk_em_symbol: str | None = None,
+) -> pd.DataFrame | None:
+    import requests
+
+    params = {
+        "secid": secid,
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": fqt,
+        "end": "20500101",
+        "lmt": str(max(days * 3, 120)),
+    }
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/",
+        "User-Agent": "Mozilla/5.0",
+    }
+    last_error = None
+    payload = None
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        for host in (
+            "push2his.eastmoney.com",
+            "91.push2his.eastmoney.com",
+            "45.push2his.eastmoney.com",
+            "7.push2his.eastmoney.com",
+        ):
+            try:
+                response = session.get(
+                    f"https://{host}/api/qt/stock/kline/get",
+                    params=params,
+                    headers=headers,
+                    timeout=10,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("data"):
+                    break
+            except Exception as exc:
+                last_error = exc
+        if payload is not None and payload.get("data"):
+            break
+    if payload is None:
+        return get_index_data_from_akshare_eastmoney_fallback(
+            index_name,
+            days=days,
+            fqt=fqt,
+            board_symbol=akshare_board_symbol,
+            hk_em_symbol=akshare_hk_em_symbol,
+            last_error=last_error,
+        )
+    data = payload.get("data") or {}
+    klines = data.get("klines") or []
+    rows = []
+    for item in klines:
+        fields = str(item).split(",")
+        if len(fields) < 3:
+            continue
+        rows.append(
+            {
+                "trade_date": fields[0],
+                "close": fields[2],
+            }
+        )
+    if not rows:
+        return get_index_data_from_akshare_eastmoney_fallback(
+            index_name,
+            days=days,
+            fqt=fqt,
+            board_symbol=akshare_board_symbol,
+            hk_em_symbol=akshare_hk_em_symbol,
+            last_error=last_error,
+        )
+    df = normalize_akshare_index_df(pd.DataFrame(rows))
+    return build_export_df(df, index_name, days=days)
+
+
+def get_index_data_from_akshare_eastmoney_fallback(
+    index_name: str,
+    days: int,
+    fqt: str,
+    board_symbol: str | None,
+    hk_em_symbol: str | None,
+    last_error: Exception | None,
+) -> pd.DataFrame | None:
+    import akshare as ak
+
+    start_date = (datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d")
+    end_date = "20500101"
+    try:
+        if board_symbol:
+            adjust = {"0": "", "1": "qfq", "2": "hfq"}.get(str(fqt), "")
+            raw_df = ak.stock_board_concept_hist_em(
+                symbol=board_symbol,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+            df = normalize_akshare_index_df(raw_df)
+            return build_export_df(df, index_name, days=days)
+        if hk_em_symbol:
+            raw_df = ak.stock_hk_index_daily_em(symbol=hk_em_symbol)
+            df = normalize_akshare_index_df(raw_df)
+            return build_export_df(df, index_name, days=days)
+    except Exception as exc:
+        raise RuntimeError(f"东方财富K线失败：{last_error}；AkShare兜底失败：{exc}") from exc
+
+    raise RuntimeError(f"东方财富K线获取失败：{last_error}")
+
+
 def get_index_data_from_akshare_global(index_code: str, index_name: str, days: int = 30, yahoo_symbol: str | None = None):
     import akshare as ak
 
@@ -469,9 +656,68 @@ def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, d
 
     raw_df = ak.futures_zh_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
-    if index_code.upper() == "I0":
-        df = append_futures_spot_row(ak, df, index_code)
+    df = append_futures_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
+
+
+def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.DataFrame | None:
+    if not isinstance(index_config, dict):
+        return None
+
+    source = index_config.get("source")
+    code = index_config.get("code")
+    tickflow_symbol = index_config.get("tickflow_symbol")
+    if tickflow_symbol:
+        try:
+            df = get_index_data_from_tickflow("", tickflow_symbol, index_name, days=days)
+            if df is not None and not df.empty:
+                eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
+                if eastmoney_quote_secid:
+                    close_col = f"{index_name}_收盘价"
+                    raw_df = df[["日期", close_col]].rename(
+                        columns={"日期": "trade_date", close_col: "close"}
+                    )
+                    raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
+                    return build_export_df(raw_df, index_name, days=days)
+                return df
+        except Exception:
+            pass
+
+    if source == "akshare_cn":
+        return get_index_data_from_akshare_cn(
+            code,
+            index_config.get("market", "sh"),
+            index_name,
+            days=days,
+            eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
+        )
+    if source == "akshare_csindex":
+        return get_index_data_from_akshare_csindex(code, index_name, days=days)
+    if source == "akshare_us":
+        return get_index_data_from_akshare_us(code, index_name, days=days)
+    if source == "akshare_hk":
+        return get_index_data_from_akshare_hk(code, index_name, days=days)
+    if source == "akshare_global":
+        return get_index_data_from_akshare_global(
+            code,
+            index_name,
+            days=days,
+            yahoo_symbol=index_config.get("yahoo_symbol"),
+        )
+    if source == "akshare_futures_main":
+        return get_index_data_from_akshare_futures_main(code, index_name, days=days)
+    if source == "eastmoney_kline":
+        return get_index_data_from_eastmoney_kline(
+            code,
+            index_name,
+            days=days,
+            fqt=str(index_config.get("fqt", "0")),
+            akshare_board_symbol=index_config.get("akshare_board_symbol"),
+            akshare_hk_em_symbol=index_config.get("akshare_hk_em_symbol"),
+        )
+    if source == "yahoo":
+        return get_index_data_from_yahoo(code, index_name, days=days)
+    return None
 
 
 def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str, days: int = 30):
@@ -622,6 +868,14 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
                     days=days,
                 )
                 if df is not None and not df.empty:
+                    eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
+                    if eastmoney_quote_secid:
+                        close_col = f"{index_name}_收盘价"
+                        raw_df = df[["日期", close_col]].rename(
+                            columns={"日期": "trade_date", close_col: "close"}
+                        )
+                        raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
+                        return build_export_df(raw_df, index_name, days=days)
                     return df
             except Exception as exc:
                 tickflow_error = exc
@@ -635,6 +889,7 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
                     index_config.get("market", "sh"),
                     index_name,
                     days=days,
+                    eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
                 )
             if source == "akshare_csindex":
                 return get_index_data_from_akshare_csindex(code, index_name, days=days)
@@ -651,6 +906,17 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
                 )
             if source == "akshare_futures_main":
                 return get_index_data_from_akshare_futures_main(code, index_name, days=days)
+            if source == "eastmoney_kline":
+                return get_index_data_from_eastmoney_kline(
+                    code,
+                    index_name,
+                    days=days,
+                    fqt=str(index_config.get("fqt", "0")),
+                    akshare_board_symbol=index_config.get("akshare_board_symbol"),
+                    akshare_hk_em_symbol=index_config.get("akshare_hk_em_symbol"),
+                )
+            if source == "yahoo":
+                return get_index_data_from_yahoo(code, index_name, days=days)
             raise ValueError(f"未知数据源：{source}")
         except Exception as exc:
             if tickflow_error:
@@ -668,10 +934,11 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
         deviation_col = f"{index_name}_偏离率(%)"
         if close_col not in report_df.columns:
             continue
-        valid_rows = report_df.dropna(subset=[close_col, ma20_col, deviation_col])
+        valid_rows = report_df.dropna(subset=[close_col, ma20_col])
         if valid_rows.empty:
             continue
         latest = valid_rows.iloc[-1]
+        show_deviation = index_config.get("show_ma20_deviation", True)
         previous_close = pd.NA
         daily_change_pct = pd.NA
         if len(valid_rows) >= 2:
@@ -687,7 +954,7 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
                 "前收盘价": previous_close,
                 "当日涨跌幅(%)": daily_change_pct,
                 "MA20": latest[ma20_col],
-                "偏离率(%)": latest[deviation_col],
+                "偏离率(%)": latest[deviation_col] if show_deviation and deviation_col in latest else pd.NA,
             }
         )
     if not rows:

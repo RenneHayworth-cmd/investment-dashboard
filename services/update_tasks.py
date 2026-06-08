@@ -72,6 +72,8 @@ def run_index_ma20_update(
                     return UpdateResult("success", message, cached_df)
         elif selected_markets:
             cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
+        if cached_df is None:
+            cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
 
         workers = min(max(int(max_workers), 1), total)
         completed = 0
@@ -84,7 +86,7 @@ def run_index_ma20_update(
                 for index_name, index_config in selected_items
             }
             for future in as_completed(future_map):
-                index_name, _ = future_map[future]
+                index_name, index_config = future_map[future]
                 completed += 1
                 try:
                     df = future.result()
@@ -93,13 +95,25 @@ def run_index_ma20_update(
                         if progress_callback:
                             progress_callback(index_name, completed, total, "success")
                     else:
-                        errors.append(f"{index_name}: 无数据")
-                        if progress_callback:
+                        if not index_config.get("optional"):
+                            errors.append(f"{index_name}: 无数据")
+                            if progress_callback:
+                                progress_callback(index_name, completed, total, "empty")
+                        elif progress_callback:
                             progress_callback(index_name, completed, total, "empty")
                 except Exception as exc:
-                    errors.append(f"{index_name}: {exc}")
-                    if progress_callback:
-                        progress_callback(index_name, completed, total, "failed")
+                    cached_index_df = extract_cached_index_report(cached_df, index_name)
+                    if cached_index_df is not None and not cached_index_df.empty:
+                        all_data.append(cached_index_df)
+                        if progress_callback:
+                            progress_callback(index_name, completed, total, "success")
+                    elif index_config.get("optional"):
+                        if progress_callback:
+                            progress_callback(index_name, completed, total, "empty")
+                    else:
+                        errors.append(f"{index_name}: {exc}")
+                        if progress_callback:
+                            progress_callback(index_name, completed, total, "failed")
 
         if not all_data:
             raise RuntimeError("未获取到任何指数数据。" + " | ".join(errors))
@@ -141,6 +155,26 @@ def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd
     preserved = existing.drop(columns=[column for column in replaced_columns if column in existing.columns])
     merged = pd.merge(preserved, update, on="日期", how="outer")
     return merged.sort_values("日期").reset_index(drop=True)
+
+
+def extract_cached_index_report(cached_df: pd.DataFrame | None, index_name: str) -> pd.DataFrame | None:
+    if cached_df is None or cached_df.empty or "日期" not in cached_df.columns:
+        return None
+
+    index_columns = [
+        column
+        for column in cached_df.columns
+        if column == "日期" or str(column).startswith(f"{index_name}_")
+    ]
+    if len(index_columns) <= 1:
+        return None
+
+    result = cached_df[index_columns].copy()
+    value_columns = [column for column in result.columns if column != "日期"]
+    result = result.dropna(how="all", subset=value_columns)
+    if result.empty:
+        return None
+    return result
 
 
 def fetch_index_report(index_name: str, index_config: dict, api_key: str, days: int) -> pd.DataFrame | None:
