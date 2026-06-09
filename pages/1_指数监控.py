@@ -10,6 +10,7 @@ import streamlit as st
 
 from core.cache import load_dataset
 from core.db import init_db
+from core.ui import DEFAULT_CHART_HEIGHT, apply_global_style, apply_plotly_layout, render_page_header
 from services.index_ma20 import INDEX_CONFIG, build_summary, fetch_index_history
 from services.market_calendar import MARKET_WINDOWS, is_market_trading_day
 from services.update_tasks import run_index_ma20_update
@@ -17,8 +18,9 @@ from services.update_tasks import run_index_ma20_update
 
 st.set_page_config(page_title="指数监控", layout="wide")
 init_db()
+apply_global_style()
 
-st.title("指数监控")
+render_page_header("指数监控", "跟踪主要指数、跨市场指数和期货主连相对 MA20 的位置与趋势。", eyebrow="Index Monitor")
 
 INDEX_UPDATE_WORKERS = 8
 
@@ -268,13 +270,8 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
                     line={"width": 1.3, "color": ma_colors[period]},
                 )
             )
-        fig.update_layout(
-            height=520,
-            margin={"l": 10, "r": 10, "t": 30, "b": 10},
-            hovermode="x unified",
-            legend={"orientation": "h", "y": 1.02},
-            yaxis={"type": price_axis, "title": "价格"},
-        )
+        apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
+        fig.update_layout(yaxis={"type": price_axis, "title": "价格"})
         st.plotly_chart(fig, use_container_width=True)
 
     with drawdown_tab:
@@ -304,12 +301,8 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
             ax=36,
             ay=28,
         )
-        fig.update_layout(
-            height=420,
-            margin={"l": 10, "r": 10, "t": 30, "b": 10},
-            hovermode="x unified",
-            yaxis_title="回撤(%)",
-        )
+        apply_plotly_layout(fig, height=420, showlegend=False)
+        fig.update_layout(yaxis_title="回撤(%)")
         st.plotly_chart(fig, use_container_width=True)
 
     with summary_tab:

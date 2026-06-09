@@ -1,4 +1,3 @@
-import html
 import os
 
 import pandas as pd
@@ -8,6 +7,15 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
+from core.ui import (
+    LARGE_CHART_HEIGHT,
+    SECONDARY_CHART_HEIGHT,
+    apply_global_style,
+    apply_plotly_layout,
+    render_metric_card,
+    render_metric_grid,
+    render_page_header,
+)
 from services.fund_analysis import (
     analyze_fund_nav,
     calculate_current_drawdown_info,
@@ -51,97 +59,11 @@ def _compact_date_range(start: str | None, end: str | None) -> str:
 
 
 def _text_metric(label: str, display_value: str, tooltip: str) -> None:
-    safe_label = html.escape(label)
-    safe_value = html.escape(display_value)
-    safe_tooltip = html.escape(tooltip)
-    st.markdown(
-        f"""
-        <div title="{safe_tooltip}" style="
-            border: 1px solid rgba(49, 51, 63, 0.2);
-            border-radius: 6px;
-            padding: 0.65rem 0.75rem;
-            min-height: 84px;
-            background: rgba(255, 255, 255, 0.02);
-        ">
-            <div style="
-                font-size: 0.875rem;
-                color: rgba(49, 51, 63, 0.72);
-                margin-bottom: 0.35rem;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            ">{safe_label}</div>
-            <div style="
-                font-size: 1.25rem;
-                line-height: 1.25;
-                font-weight: 600;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            ">{safe_value}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_metric_card(label, display_value, tooltip)
 
 
 def _drawdown_metric_grid(items: list[tuple[str, str, str]]) -> None:
-    cards = []
-    for label, value, tooltip in items:
-        cards.append(
-            (
-                f'<div class="drawdown-metric-card" title="{html.escape(tooltip)}">'
-                f'<div class="drawdown-metric-label">{html.escape(label)}</div>'
-                f'<div class="drawdown-metric-value">{html.escape(value)}</div>'
-                "</div>"
-            )
-        )
-    st.markdown(
-        f"""
-        <style>
-        .drawdown-metric-grid {{
-            display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
-            gap: 1.35rem;
-            margin: 0.75rem 0 1.25rem;
-        }}
-        .drawdown-metric-card {{
-            min-width: 0;
-            min-height: 72px;
-            padding: 0;
-            border: 0;
-            border-radius: 0;
-            background: transparent;
-        }}
-        .drawdown-metric-label {{
-            color: rgba(49, 51, 63, 0.72);
-            font-size: clamp(0.9rem, 1.05vw, 1rem);
-            line-height: 1.25;
-            margin-bottom: 0.35rem;
-            overflow-wrap: anywhere;
-        }}
-        .drawdown-metric-value {{
-            color: rgb(49, 51, 63);
-            font-size: clamp(1.15rem, 1.55vw, 1.55rem);
-            line-height: 1.2;
-            font-weight: 600;
-            overflow-wrap: anywhere;
-        }}
-        @media (max-width: 760px) {{
-            .drawdown-metric-grid {{
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }}
-        }}
-        @media (max-width: 480px) {{
-            .drawdown-metric-grid {{
-                grid-template-columns: 1fr;
-            }}
-        }}
-        </style>
-        <div class="drawdown-metric-grid">{''.join(cards)}</div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_metric_grid(items)
 
 
 def _load_cache(symbol: str, source: str, data_type: str, period: str = "1d"):
@@ -165,9 +87,13 @@ def _merge_raw_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.Dat
 
 st.set_page_config(page_title="A股分析", layout="wide")
 init_db()
+apply_global_style()
 
-st.title("A股分析")
-st.caption("输入场外基金、场内基金或 A 股股票代码，或上传净值/价格文件，计算均线、RSI、涨跌幅、波动率、百分位和回撤。")
+render_page_header(
+    "A股分析",
+    "输入场外基金、场内基金或 A 股股票代码，或上传净值/价格文件，计算均线、RSI、涨跌幅、波动率、百分位和回撤。",
+    eyebrow="A Share",
+)
 
 with st.sidebar:
     st.subheader("分析设置")
@@ -378,7 +304,7 @@ for idx, item in enumerate(metric_items):
     value = item[1]
     suffix = item[2] if len(item) > 2 else ""
     with metric_cols[idx]:
-        st.metric(label, _format_metric(value, suffix))
+        render_metric_card(label, _format_metric(value, suffix))
 
 tabs = st.tabs(["走势", "回撤分析", "摘要", "指标数据", "原始数据"])
 
@@ -440,7 +366,7 @@ with tabs[0]:
         col=1,
     )
     fig.add_hline(y=0, line_color="#6b7280", row=4, col=1)
-    fig.update_layout(height=900, hovermode="x unified", legend=dict(orientation="h"))
+    apply_plotly_layout(fig, height=LARGE_CHART_HEIGHT)
     fig.update_xaxes(hoverformat="%Y-%m-%d")
     fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06), row=4, col=1)
     price_yaxis_options = {
@@ -545,7 +471,7 @@ with tabs[1]:
                 row=2,
                 col=1,
             )
-    dd_fig.update_layout(height=720, hovermode="x unified", legend=dict(orientation="h"))
+    apply_plotly_layout(dd_fig, height=SECONDARY_CHART_HEIGHT)
     dd_fig.update_xaxes(hoverformat="%Y-%m-%d")
     dd_fig.update_yaxes(
         title_text="价格（对数）" if price_axis_type == "log" else "价格",

@@ -3,6 +3,7 @@ import streamlit as st
 
 from core.cache import list_datasets
 from core.db import init_db
+from core.ui import apply_global_style, render_metric_card, render_page_header
 
 
 st.set_page_config(
@@ -12,9 +13,13 @@ st.set_page_config(
 )
 
 init_db()
+apply_global_style()
 
-st.title("投资分析工作台")
-st.caption("本地缓存行情数据，左侧进入各分析页面。分析页统一左侧设置、右侧获取数据。")
+render_page_header(
+    "投资分析工作台",
+    "本地缓存行情数据，左侧进入各分析页面。分析页统一左侧设置、右侧获取数据。",
+    eyebrow="Dashboard",
+)
 
 
 def format_cache_time(value: object) -> str:
@@ -42,9 +47,12 @@ if datasets is not None and not datasets.empty:
         latest_trade_date = str(trade_dates.max())
 
 status_cols = st.columns(3)
-status_cols[0].metric("缓存数据集", cache_count)
-status_cols[1].metric("最近缓存更新时间", latest_update)
-status_cols[2].metric("最近交易日", latest_trade_date)
+with status_cols[0]:
+    render_metric_card("缓存数据集", cache_count, "当前 SQLite 记录的数据集数量")
+with status_cols[1]:
+    render_metric_card("最近缓存更新时间", latest_update, "最近一次写入本地缓存的时间")
+with status_cols[2]:
+    render_metric_card("最近交易日", latest_trade_date, "本地缓存中记录的最新交易日")
 
 st.subheader("今日重点")
 st.write("先看「指数监控」确认主要指数与 MA20 偏离情况；需要做标的比较时进入「相关性分析」查看按类别合并的相关矩阵。")
