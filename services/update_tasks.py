@@ -40,10 +40,17 @@ def run_index_ma20_update(
     use_fresh_cache: bool = True,
     progress_callback: ProgressCallback | None = None,
     market_names: set[str] | list[str] | tuple[str, ...] | None = None,
+    index_names: set[str] | list[str] | tuple[str, ...] | None = None,
     max_workers: int = 4,
 ) -> UpdateResult:
     selected_markets = set(market_names or [])
-    job_name = "更新指数MA20" if not selected_markets else f"更新指数MA20（{'、'.join(sorted(selected_markets))}）"
+    selected_indexes = set(index_names or [])
+    if selected_indexes:
+        job_name = f"更新指数MA20（{'、'.join(sorted(selected_indexes))}）"
+    elif selected_markets:
+        job_name = f"更新指数MA20（{'、'.join(sorted(selected_markets))}）"
+    else:
+        job_name = "更新指数MA20"
     job_id = start_job(job_name)
     all_data = []
     errors = []
@@ -51,16 +58,20 @@ def run_index_ma20_update(
     selected_items = [
         (index_name, index_config)
         for index_name, index_config in INDEX_CONFIG.items()
-        if not selected_markets or index_config.get("market_group") in selected_markets
+        if (not selected_markets or index_config.get("market_group") in selected_markets)
+        and (not selected_indexes or index_name in selected_indexes)
     ]
     total = len(selected_items)
 
     try:
         if not selected_items:
+            if selected_indexes:
+                raise RuntimeError(f"没有匹配的指数：{'、'.join(sorted(selected_indexes))}")
             raise RuntimeError(f"没有匹配的指数市场分组：{'、'.join(sorted(selected_markets))}")
 
         cached_df = None
-        if use_fresh_cache and not selected_markets:
+        is_partial_update = bool(selected_markets or selected_indexes)
+        if use_fresh_cache and not is_partial_update:
             cached_df, meta = load_dataset(
                 "index_ma20_latest",
                 cache_source,
@@ -73,7 +84,7 @@ def run_index_ma20_update(
                     message = f"使用今日缓存，更新时间：{last_update_time}"
                     finish_job(job_id, "success", message)
                     return UpdateResult("success", message, cached_df)
-        elif selected_markets:
+        elif is_partial_update:
             cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
         if cached_df is None:
             cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
@@ -129,7 +140,7 @@ def run_index_ma20_update(
             raise RuntimeError("未获取到任何指数数据。" + " | ".join(errors))
 
         report = merge_by_date(all_data)
-        if selected_markets and cached_df is not None and not cached_df.empty:
+        if is_partial_update and cached_df is not None and not cached_df.empty:
             report = merge_index_report(cached_df, report)
         report.attrs["errors"] = errors
         save_dataset(
@@ -140,7 +151,12 @@ def run_index_ma20_update(
             df=report,
         )
 
-        message = "更新成功" if not selected_markets else f"{'、'.join(sorted(selected_markets))}更新成功"
+        if selected_indexes:
+            message = f"{'、'.join(sorted(selected_indexes))}更新成功"
+        elif selected_markets:
+            message = f"{'、'.join(sorted(selected_markets))}更新成功"
+        else:
+            message = "更新成功"
         if errors:
             message += "；部分指数失败：" + " | ".join(errors)
         if timings:

@@ -296,7 +296,6 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
 
         quote = None
         session = requests.Session()
-        session.trust_env = False
         headers = {
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
@@ -334,7 +333,10 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         quote_timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
         if pd.isna(latest_price) or pd.isna(quote_timestamp):
             return normalized
-        quote_date = datetime.fromtimestamp(float(quote_timestamp)).date()
+        quote_timestamp_value = float(quote_timestamp)
+        if quote_timestamp_value > 10_000_000_000:
+            quote_timestamp_value = quote_timestamp_value / 1000
+        quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
         if quote_date <= latest_history_date:
             return normalized
         supplement = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
@@ -426,6 +428,14 @@ def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: 
             df = normalize_akshare_index_df(raw_df)
             if index_code.upper() == "H30269":
                 df = append_eastmoney_quote_row(df, "2.H30269")
+                shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+                latest_date = pd.to_datetime(df["trade_date"]).max().date()
+                if (
+                    shanghai_now.weekday() < 5
+                    and shanghai_now.time() >= time(11, 30)
+                    and latest_date < shanghai_now.date()
+                ):
+                    raise RuntimeError("东方财富实时报价未返回今日数据，保留缓存等待重试")
             return build_export_df(df, index_name, days=days)
         except Exception as exc:
             last_error = exc

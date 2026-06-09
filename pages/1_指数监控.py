@@ -399,9 +399,9 @@ def render_index_card(row: pd.Series) -> None:
     st.markdown(card_html, unsafe_allow_html=True)
 
 
-def render_freshness_bar(summary_df: pd.DataFrame) -> None:
+def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
     market_windows = {market.name: market for market in MARKET_WINDOWS}
-    rows = []
+    items = []
     for _, row in summary_df.iterrows():
         index_name = str(row["指数"])
         market_name = INDEX_CONFIG.get(index_name, {}).get("market_group", "")
@@ -425,16 +425,31 @@ def render_freshness_bar(summary_df: pd.DataFrame) -> None:
             status = "待更新"
             status_class = "stale"
 
+        items.append(
+            {
+                "index_name": index_name,
+                "status": status,
+                "status_class": status_class,
+                "latest_day": latest_day,
+            }
+        )
+    return items
+
+
+def render_freshness_bar(summary_df: pd.DataFrame) -> list[str]:
+    items = build_freshness_items(summary_df)
+    rows = []
+    for item in items:
         rows.append(
             '<div class="freshness-item">'
-            f'<span class="freshness-name">{html.escape(index_name)}</span>'
-            f'<span class="freshness-pill {status_class}">{status}</span>'
-            f'<span class="freshness-date">{latest_day:%m-%d}</span>'
+            f'<span class="freshness-name">{html.escape(item["index_name"])}</span>'
+            f'<span class="freshness-pill {item["status_class"]}">{item["status"]}</span>'
+            f'<span class="freshness-date">{item["latest_day"]:%m-%d}</span>'
             "</div>"
         )
 
     if not rows:
-        return
+        return []
 
     st.markdown(
         "<style>"
@@ -453,6 +468,7 @@ def render_freshness_bar(summary_df: pd.DataFrame) -> None:
         f'<div class="freshness-strip">{"".join(rows)}</div>',
         unsafe_allow_html=True,
     )
+    return [item["index_name"] for item in items if item["status"] == "待更新"]
 
 
 def render_update_timings() -> None:
@@ -464,6 +480,41 @@ def render_update_timings() -> None:
     timing_df = timing_df.sort_values("耗时(秒)", ascending=False).reset_index(drop=True)
     with st.expander("上次指数更新耗时", expanded=False):
         st.dataframe(timing_df, use_container_width=True, hide_index=True)
+
+
+def run_single_index_update(index_name: str, api_key: str, days: int) -> None:
+    with st.spinner(f"正在更新 {index_name}..."):
+        result = run_index_ma20_update(
+            api_key=api_key,
+            days=int(days),
+            cache_source="auto",
+            use_fresh_cache=False,
+            index_names=[index_name],
+            max_workers=1,
+        )
+    st.session_state.index_update_timings = result.timings
+    if result.status == "success":
+        if result.errors:
+            st.session_state.index_update_notice = ("warning", result.message)
+        else:
+            st.session_state.index_update_notice = ("success", result.message)
+        st.rerun()
+    else:
+        st.error(result.message)
+
+
+def render_single_index_update(stale_indexes: list[str], api_key: str, days: int) -> None:
+    if not stale_indexes:
+        return
+    update_col, button_col = st.columns([3, 1])
+    selected_index = update_col.selectbox(
+        "只更新单个待更新指数",
+        options=stale_indexes,
+        key="single_index_update_target",
+        label_visibility="collapsed",
+    )
+    if button_col.button("只更新选中指数", use_container_width=True):
+        run_single_index_update(selected_index, api_key, days)
 
 
 with st.sidebar:
@@ -540,7 +591,8 @@ if report_df is not None:
         selected_index = get_query_index_detail()
         summary_date = summary_df["日期"].max()
         st.subheader(f"最新摘要 · {summary_date}")
-        render_freshness_bar(summary_df)
+        stale_indexes = render_freshness_bar(summary_df)
+        render_single_index_update(stale_indexes, api_key, int(days))
         render_update_timings()
         if selected_index:
             render_index_detail(report_df, selected_index)
