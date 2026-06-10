@@ -486,6 +486,7 @@ def run_single_index_update(index_name: str, api_key: str, days: int) -> None:
             max_workers=1,
         )
     st.session_state.index_update_timings = result.timings
+    load_index_detail.clear()
     if result.status == "success":
         if result.errors:
             st.session_state.index_update_notice = ("warning", result.message)
@@ -554,6 +555,7 @@ if update_clicked:
         max_workers=INDEX_UPDATE_WORKERS,
     )
     st.session_state.index_update_timings = result.timings
+    load_index_detail.clear()
     if result.status == "success":
         if result.errors:
             st.session_state.index_update_notice = ("warning", result.message)

@@ -503,7 +503,16 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
     import requests
 
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": "max" if days > 365 else "1y", "interval": "1d"}
+    if days > 365:
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=days + 30)
+        params = {
+            "period1": int(start_time.timestamp()),
+            "period2": int(end_time.timestamp()),
+            "interval": "1d",
+        }
+    else:
+        params = {"range": "1y", "interval": "1d"}
     headers = {"User-Agent": "Mozilla/5.0"}
     response = requests.get(url, params=params, headers=headers, timeout=10)
     response.raise_for_status()
@@ -514,6 +523,7 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
 
     item = result[0]
     timestamps = item.get("timestamp") or []
+    meta = item.get("meta") or {}
     quote = item.get("indicators", {}).get("quote", [{}])[0]
     closes = quote.get("close") or []
     rows = []
@@ -526,9 +536,28 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
                 "close": float(close),
             }
         )
+    latest_price = pd.to_numeric(meta.get("regularMarketPrice"), errors="coerce")
+    latest_timestamp = pd.to_numeric(meta.get("regularMarketTime"), errors="coerce")
+    if not pd.isna(latest_price) and not pd.isna(latest_timestamp):
+        market_timezone = ZoneInfo(str(meta.get("exchangeTimezoneName") or "America/New_York"))
+        latest_date = datetime.fromtimestamp(float(latest_timestamp), tz=market_timezone).date()
+        if not rows or latest_date > rows[-1]["trade_date"].date():
+            rows.append({"trade_date": pd.Timestamp(latest_date), "close": float(latest_price)})
     if not rows:
         return None
     return build_export_df(pd.DataFrame(rows), index_name, days=days)
+
+
+def is_sparse_daily_history(df: pd.DataFrame) -> bool:
+    if df is None or df.empty or "trade_date" not in df.columns:
+        return True
+    dates = pd.to_datetime(df["trade_date"], errors="coerce").dropna().sort_values()
+    if len(dates) < 20:
+        return True
+    gaps = dates.diff().dt.days.dropna()
+    if gaps.empty:
+        return True
+    return bool(gaps.median() > 7 or (gaps > 10).sum() > len(gaps) * 0.3)
 
 
 def get_index_data_from_eastmoney_kline(
@@ -657,6 +686,10 @@ def get_index_data_from_akshare_global(index_code: str, index_name: str, days: i
     try:
         raw_df = ak.index_global_hist_em(symbol=index_code)
         df = normalize_akshare_index_df(raw_df)
+        if yahoo_symbol and is_sparse_daily_history(df):
+            yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
+            if yahoo_df is not None and not yahoo_df.empty:
+                return yahoo_df
         return build_export_df(df, index_name, days=days)
     except Exception:
         if yahoo_symbol:
