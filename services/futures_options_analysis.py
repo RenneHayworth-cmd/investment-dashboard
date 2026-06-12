@@ -10,6 +10,7 @@ import pandas as pd
 DATA_TYPE_AUTO = "自动"
 DATA_TYPE_FUTURES = "期货"
 DATA_TYPE_OPTIONS = "期权"
+FUTURES_OPTION_DATA_VERSION = "futures_option_v2"
 
 FINANCIAL_FUTURES_PREFIXES = ("IF", "IC", "IH", "IM", "T", "TF", "TS", "TL")
 DCE_PREFIXES = ("i", "j", "jm", "l", "m", "p", "pp", "v", "y", "a", "b", "c", "cs", "eg", "eb", "pg", "lh")
@@ -265,6 +266,24 @@ def normalize_market_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
+def choose_latest_futures_daily(
+    tickflow_df: pd.DataFrame | None,
+    akshare_df: pd.DataFrame | None,
+) -> tuple[pd.DataFrame | None, str]:
+    if tickflow_df is None or tickflow_df.empty:
+        return akshare_df, "AkShare"
+    if akshare_df is None or akshare_df.empty:
+        return tickflow_df, "TickFlow"
+
+    tickflow_normalized = normalize_market_dataframe(tickflow_df)
+    akshare_normalized = normalize_market_dataframe(akshare_df)
+    tickflow_latest = tickflow_normalized["date"].max()
+    akshare_latest = akshare_normalized["date"].max()
+    if pd.notna(akshare_latest) and pd.notna(tickflow_latest) and akshare_latest > tickflow_latest:
+        return akshare_df, "AkShare（TickFlow数据不完整）"
+    return tickflow_df, "TickFlow"
+
+
 def build_summary(df: pd.DataFrame) -> dict[str, object]:
     close = pd.to_numeric(df["close"], errors="coerce")
     latest = df.iloc[-1]
@@ -344,6 +363,7 @@ def fetch_futures_option_data(
         if current_main:
             normalized["current_main_contract"] = current_main
         analyzed = add_indicators(normalized, ma_periods)
+        analyzed["_data_version"] = FUTURES_OPTION_DATA_VERSION
         return FuturesOptionResult(
             symbol=main_symbol,
             source="AkShare主连",
@@ -356,22 +376,36 @@ def fetch_futures_option_data(
     source = "TickFlow"
     tickflow_error = None
     try:
-        raw_df = fetch_from_tickflow(symbol, period, count, api_key, use_free)
+        tickflow_df = fetch_from_tickflow(symbol, period, count, api_key, use_free)
     except Exception as exc:
-        raw_df = None
+        tickflow_df = None
         tickflow_error = exc
 
-    if raw_df is None or raw_df.empty:
-        source = "AkShare"
+    akshare_df = None
+    akshare_error = None
+    if period == "1d":
         try:
-            raw_df = fetch_from_akshare(symbol, period, count)
+            akshare_df = fetch_from_akshare(symbol, period, count)
         except Exception as exc:
-            if tickflow_error is not None:
-                raise RuntimeError(f"TickFlow 失败：{tickflow_error}；AkShare 失败：{exc}") from exc
-            raise
+            akshare_error = exc
+
+    try:
+        raw_df, source = choose_latest_futures_daily(tickflow_df, akshare_df)
+    except Exception:
+        raw_df = tickflow_df
+
+    if raw_df is None or raw_df.empty:
+        if tickflow_error is not None and akshare_error is not None:
+            raise RuntimeError(f"TickFlow 失败：{tickflow_error}；AkShare 失败：{akshare_error}") from akshare_error
+        if tickflow_error is not None:
+            raise RuntimeError(f"TickFlow 失败：{tickflow_error}") from tickflow_error
+        if akshare_error is not None:
+            raise RuntimeError(f"AkShare 失败：{akshare_error}") from akshare_error
+        raise RuntimeError("TickFlow 和 AkShare 都没有获取到数据，请检查合约代码。")
 
     normalized = normalize_market_dataframe(raw_df)
     analyzed = add_indicators(normalized, ma_periods)
+    analyzed["_data_version"] = FUTURES_OPTION_DATA_VERSION
     return FuturesOptionResult(
         symbol=symbol,
         source=source,

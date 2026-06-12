@@ -8,11 +8,14 @@ import streamlit as st
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
 from services.futures_spread import (
+    SPREAD_CALCULATION_VERSION,
+    build_cutoff_notes,
     build_spread_summary,
     calculate_spreads,
     contract_name,
     fetch_contracts,
     parse_contracts,
+    spread_respects_contract_cutoffs,
 )
 
 
@@ -51,7 +54,13 @@ def cache_matches_contracts(df: pd.DataFrame, contracts: list[str], base_contrac
         for contract in contracts
         if contract != base_contract
     )
-    return all(column in df.columns for column in required_columns)
+    if not all(column in df.columns for column in required_columns):
+        return False
+    if "_calculation_version" not in df.columns:
+        return False
+    if not df["_calculation_version"].eq(SPREAD_CALCULATION_VERSION).all():
+        return False
+    return spread_respects_contract_cutoffs(df, contracts, base_contract)
 
 
 def centered_table(df: pd.DataFrame) -> None:
@@ -163,6 +172,7 @@ available_contracts = [
     if f"{contract}_close" in spread_df.columns
 ]
 summary_df = build_spread_summary(spread_df, available_contracts, base_contract)
+cutoff_notes = build_cutoff_notes(available_contracts)
 
 if save_to_cache and (force_refresh or cached_df is None or not cache_matches_contracts(cached_df, contracts, base_contract)):
     save_dataset(
@@ -172,6 +182,9 @@ if save_to_cache and (force_refresh or cached_df is None or not cache_matches_co
         data_type="futures_spread",
         df=spread_df,
     )
+
+if cutoff_notes:
+    st.info("已应用个人投资者持仓截止规则：" + "；".join(cutoff_notes))
 
 st.subheader("统计汇总")
 if summary_df.empty:
@@ -207,11 +220,16 @@ with tabs[0]:
 
 with tabs[1]:
     detail_df = spread_df.drop(
-        columns=[col for col in spread_df.columns if col.endswith("_pct")],
+        columns=[
+            col
+            for col in spread_df.columns
+            if col.endswith("_pct") or col.startswith("_")
+        ],
         errors="ignore",
     ).sort_values("date", ascending=False)
     centered_table(detail_df)
-    csv_bytes = spread_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    export_df = spread_df.drop(columns=[col for col in spread_df.columns if col.startswith("_")], errors="ignore")
+    csv_bytes = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "下载价差数据 CSV",
         data=csv_bytes,

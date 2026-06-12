@@ -19,6 +19,7 @@ from services.futures_options_analysis import (
     DATA_TYPE_AUTO,
     DATA_TYPE_FUTURES,
     DATA_TYPE_OPTIONS,
+    FUTURES_OPTION_DATA_VERSION,
     add_indicators,
     build_summary,
     fetch_futures_option_data,
@@ -92,6 +93,17 @@ def display_data_kind(symbol: str, data_kind: str) -> str:
         return data_kind
     product = match.group(1).upper()
     return CONTRACT_PREFIXES.get(product, data_kind)
+
+
+def cache_is_valid(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    is_chain = "date" not in df.columns or "close" not in df.columns
+    if is_chain:
+        return True
+    if "_data_version" not in df.columns:
+        return False
+    return df["_data_version"].eq(FUTURES_OPTION_DATA_VERSION).all()
 
 
 def centered_table(df: pd.DataFrame) -> None:
@@ -228,7 +240,7 @@ symbol_key = cache_key(symbol_for_cache, data_type, period, int(count))
 cached_df, cache_meta = load_dataset(symbol_key, "market", "futures_option", period=period)
 result = None
 
-if cached_df is not None and not force_refresh:
+if cached_df is not None and not force_refresh and cache_is_valid(cached_df):
     st.info(f"已使用本地缓存，缓存时间：{format_cache_time(cache_meta['last_update_time'])}")
     is_chain = "date" not in cached_df.columns or "close" not in cached_df.columns
     result_df = cached_df.copy()
@@ -248,6 +260,8 @@ if cached_df is not None and not force_refresh:
     source = "本地缓存"
     data_kind = "期权链" if is_chain else ("期权日线" if should_fetch_options(raw_symbol, data_type) else ("期货主连" if is_main_continuous_symbol(raw_symbol) else "期货"))
 else:
+    if cached_df is not None and not force_refresh:
+        st.warning("本地缓存版本较旧，已重新联网获取。")
     with st.spinner("正在获取行情数据..."):
         try:
             result = fetch_futures_option_data(
@@ -457,7 +471,9 @@ with summary_tab:
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 with detail_tab:
-    detail_df = result_df.sort_values("date", ascending=False)
+    detail_df = result_df.drop(columns=[col for col in result_df.columns if col.startswith("_")], errors="ignore")
+    detail_df = detail_df.sort_values("date", ascending=False)
     st.dataframe(detail_df, use_container_width=True, hide_index=True)
-    csv_bytes = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    export_df = result_df.drop(columns=[col for col in result_df.columns if col.startswith("_")], errors="ignore")
+    csv_bytes = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button("下载行情数据 CSV", data=csv_bytes, file_name=f"{display_symbol(raw_symbol)}_market.csv", mime="text/csv")
