@@ -74,8 +74,8 @@ def clear_index_detail() -> None:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_index_detail(index_name: str) -> pd.DataFrame | None:
-    return fetch_index_history(index_name, INDEX_CONFIG[index_name], days=10000)
+def load_index_detail(index_name: str, index_config: dict) -> pd.DataFrame | None:
+    return fetch_index_history(index_name, index_config, days=10000)
 
 
 def build_detail_dataframe(detail_df: pd.DataFrame, index_name: str) -> pd.DataFrame:
@@ -198,7 +198,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
 
     with st.spinner(f"正在读取 {index_name} 的长历史数据..."):
         try:
-            detail_df = load_index_detail(index_name)
+            detail_df = load_index_detail(index_name, INDEX_CONFIG[index_name])
         except Exception as exc:
             st.warning(f"{index_name} 历史详情获取失败：{exc}")
             detail_df = None
