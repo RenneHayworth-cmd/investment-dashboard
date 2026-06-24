@@ -240,7 +240,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     view_max_drawdown = view_df["回撤(%)"].min()
     view_max_drawdown_date = view_df.loc[view_df["回撤(%)"].idxmin(), "日期"]
 
-    price_axis = "log" if view_df["收盘价"].min() > 0 and view_df["收盘价"].max() / view_df["收盘价"].min() > 5 else "linear"
+    price_axis = "log" if view_df["收盘价"].min() > 0 else "linear"
     trend_tab, drawdown_tab, summary_tab, table_tab = st.tabs(["走势", "回撤", "摘要", "数据"])
     with trend_tab:
         fig = go.Figure()
