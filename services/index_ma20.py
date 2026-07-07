@@ -50,6 +50,7 @@ INDEX_CONFIG = {
         "market_group": "A股",
         "fqt": "1",
         "akshare_board_symbol": "BK1158",
+        "require_current_quote": True,
     },
     "中证红利低波": {
         "source": "akshare_csindex",
@@ -68,6 +69,8 @@ INDEX_CONFIG = {
         "code": "HSTECH",
         "display_symbol": "HSTECH",
         "market_group": "港股",
+        "eastmoney_quote_secid": "124.HSTECH",
+        "require_current_quote": True,
     },
     "恒生港股通高息低波": {
         "source": "eastmoney_kline",
@@ -76,31 +79,39 @@ INDEX_CONFIG = {
         "market_group": "港股",
         "akshare_hk_em_symbol": "HSHYLV",
         "optional": True,
+        "require_current_quote": True,
     },
     "标普500": {
         "source": "akshare_us",
         "code": ".INX",
         "tickflow_symbol": ".INX.US",
+        "yahoo_symbol": "^GSPC",
         "display_symbol": "SPX",
         "market_group": "美股",
+        "require_current_quote": True,
     },
     "纳斯达克综合": {
-        "source": "yahoo",
-        "code": "^IXIC",
+        "source": "akshare_us",
+        "code": ".IXIC",
+        "yahoo_symbol": "^IXIC",
         "display_symbol": "IXIC",
         "market_group": "美股",
+        "require_current_quote": True,
     },
     "纳斯达克100": {
-        "source": "yahoo",
-        "code": "^NDX",
+        "source": "akshare_us",
+        "code": ".NDX",
+        "yahoo_symbol": "^NDX",
         "display_symbol": "NDX",
         "market_group": "美股",
+        "require_current_quote": True,
     },
     "VIX恐慌指数": {
         "source": "yahoo",
         "code": "^VIX",
         "display_symbol": "VIX",
         "market_group": "美股",
+        "require_current_quote": True,
         "show_ma20_deviation": False,
     },
     "日经225": {
@@ -109,6 +120,7 @@ INDEX_CONFIG = {
         "yahoo_symbol": "^N225",
         "display_symbol": "N225",
         "market_group": "日本",
+        "require_current_quote": True,
     },
     "韩国KOSPI": {
         "source": "akshare_global",
@@ -116,6 +128,7 @@ INDEX_CONFIG = {
         "yahoo_symbol": "^KS11",
         "display_symbol": "KOSPI",
         "market_group": "韩国",
+        "require_current_quote": True,
     },
     "铁矿石主连": {
         "source": "akshare_futures_main",
@@ -282,7 +295,7 @@ def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd
     return normalized
 
 
-def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
+def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
@@ -294,7 +307,6 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         import requests
 
         quote = None
-        session = requests.Session()
         headers = {
             "Accept": "application/json,text/plain,*/*",
             "Referer": "https://quote.eastmoney.com/",
@@ -307,25 +319,30 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
             "fltt": "2",
             "invt": "2",
         }
-        for host in (
-            "push2.eastmoney.com",
-            "36.push2.eastmoney.com",
-            "48.push2.eastmoney.com",
-            "push2delay.eastmoney.com",
-        ):
-            try:
-                response = session.get(
-                    f"https://{host}/api/qt/stock/get",
-                    params=params,
-                    headers=headers,
-                    timeout=3,
-                )
-                response.raise_for_status()
-                quote = response.json().get("data") or {}
-                if quote:
-                    break
-            except Exception:
-                continue
+        for trust_env in (False, True):
+            session = requests.Session()
+            session.trust_env = trust_env
+            for host in (
+                "push2.eastmoney.com",
+                "36.push2.eastmoney.com",
+                "48.push2.eastmoney.com",
+                "push2delay.eastmoney.com",
+            ):
+                try:
+                    response = session.get(
+                        f"https://{host}/api/qt/stock/get",
+                        params=params,
+                        headers=headers,
+                        timeout=3,
+                    )
+                    response.raise_for_status()
+                    quote = response.json().get("data") or {}
+                    if quote:
+                        break
+                except Exception:
+                    continue
+            if quote:
+                break
         if not quote:
             return normalized
         latest_price = pd.to_numeric(quote.get("f43"), errors="coerce")
@@ -336,7 +353,12 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         if quote_timestamp_value > 10_000_000_000:
             quote_timestamp_value = quote_timestamp_value / 1000
         quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
-        if quote_date <= latest_history_date:
+        if quote_date < latest_history_date:
+            return normalized
+        if quote_date == latest_history_date:
+            if not replace_same_day:
+                return normalized
+            normalized.loc[normalized["trade_date"].dt.date == quote_date, "close"] = float(latest_price)
             return normalized
         supplement = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
         return pd.concat([normalized, supplement], ignore_index=True)
@@ -344,14 +366,64 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str) -> pd.DataFrame:
         return normalized
 
 
-def append_hk_index_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
+def append_eastmoney_latest_index_row(
+    ak,
+    df: pd.DataFrame,
+    secid: str,
+    board_symbol: str | None = None,
+    hk_em_symbol: str | None = None,
+) -> pd.DataFrame:
+    """Append a same-day EastMoney spot quote when daily history is delayed."""
+    normalized = append_eastmoney_quote_row(df, secid)
+    if normalized is None or normalized.empty:
+        return normalized
+
+    market_timezone = "Asia/Hong_Kong" if hk_em_symbol else "Asia/Shanghai"
+    today = datetime.now(ZoneInfo(market_timezone)).date()
+    latest_history_date = pd.to_datetime(normalized["trade_date"], errors="coerce").max().date()
+    if latest_history_date >= today:
+        return normalized
+
+    latest_price = None
+    try:
+        if board_symbol:
+            spot_df = ak.stock_board_concept_spot_em(symbol=board_symbol)
+            matched = spot_df[spot_df["item"].astype(str) == "最新"]
+            if not matched.empty:
+                latest_price = matched.iloc[0].get("value")
+        elif hk_em_symbol:
+            spot_df = ak.stock_hk_index_spot_em()
+            matched = spot_df[spot_df["代码"].astype(str).str.upper() == hk_em_symbol.upper()]
+            if not matched.empty:
+                latest_price = matched.iloc[0].get("最新价")
+    except Exception:
+        return normalized
+
+    latest_price = pd.to_numeric(latest_price, errors="coerce")
+    if pd.isna(latest_price):
+        return normalized
+    supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+    return pd.concat([normalized, supplement], ignore_index=True)
+
+
+def append_hk_index_spot_row(
+    ak,
+    df: pd.DataFrame,
+    index_code: str,
+    eastmoney_quote_secid: str | None = None,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
     normalized = df.copy()
     normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    if eastmoney_quote_secid:
+        quoted = append_eastmoney_quote_row(normalized, eastmoney_quote_secid, replace_same_day=True)
+        if quoted is not None and not quoted.empty:
+            normalized = quoted
+
     latest_history_date = normalized["trade_date"].max().date()
-    today = datetime.now().date()
+    today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
     if latest_history_date >= today:
         return normalized
 
@@ -480,21 +552,75 @@ def get_index_data_from_akshare_cn(
     raise RuntimeError(f"{index_name} AkShare 获取失败：{last_error}")
 
 
-def get_index_data_from_akshare_us(index_code: str, index_name: str, days: int = 30):
+def extract_raw_from_export_df(export_df: pd.DataFrame, index_name: str) -> pd.DataFrame | None:
+    if export_df is None or export_df.empty:
+        return None
+    close_col = f"{index_name}_收盘价"
+    if "日期" not in export_df.columns or close_col not in export_df.columns:
+        return None
+    raw_df = export_df[["日期", close_col]].rename(columns={"日期": "trade_date", close_col: "close"}).copy()
+    raw_df["trade_date"] = pd.to_datetime(raw_df["trade_date"], errors="coerce")
+    raw_df["close"] = pd.to_numeric(raw_df["close"], errors="coerce")
+    raw_df = raw_df.dropna(subset=["trade_date", "close"])
+    if raw_df.empty:
+        return None
+    return raw_df
+
+
+def merge_newer_index_rows(df: pd.DataFrame, newer_df: pd.DataFrame | None) -> pd.DataFrame:
+    if newer_df is None or newer_df.empty:
+        return df
+    normalized = df.copy()
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"], errors="coerce")
+    newer = newer_df.copy()
+    newer["trade_date"] = pd.to_datetime(newer["trade_date"], errors="coerce")
+    latest_history_date = normalized["trade_date"].max()
+    newer_rows = newer[newer["trade_date"] > latest_history_date]
+    if newer_rows.empty:
+        return normalized
+    return pd.concat([normalized, newer_rows], ignore_index=True)
+
+
+def get_index_data_from_akshare_us(
+    index_code: str,
+    index_name: str,
+    days: int = 30,
+    yahoo_symbol: str | None = None,
+):
     import akshare as ak
 
-    raw_df = ak.index_us_stock_sina(symbol=index_code)
-    df = normalize_akshare_index_df(raw_df)
-    return build_export_df(df, index_name, days=days)
+    try:
+        raw_df = ak.index_us_stock_sina(symbol=index_code)
+        df = normalize_akshare_index_df(raw_df)
+        if yahoo_symbol:
+            yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=min(max(days, 60), 365))
+            df = merge_newer_index_rows(df, extract_raw_from_export_df(yahoo_df, index_name))
+        return build_export_df(df, index_name, days=days)
+    except Exception:
+        if yahoo_symbol:
+            yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
+            if yahoo_df is not None and not yahoo_df.empty:
+                return yahoo_df
+        raise
 
 
-def get_index_data_from_akshare_hk(index_code: str, index_name: str, days: int = 30):
+def get_index_data_from_akshare_hk(
+    index_code: str,
+    index_name: str,
+    days: int = 30,
+    eastmoney_quote_secid: str | None = None,
+):
     import akshare as ak
 
     raw_df = ak.stock_hk_index_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
     if index_code.upper() == "HSTECH":
-        df = append_hk_index_spot_row(ak, df, index_code)
+        df = append_hk_index_spot_row(
+            ak,
+            df,
+            index_code,
+            eastmoney_quote_secid=eastmoney_quote_secid,
+        )
     return build_export_df(df, index_name, days=days)
 
 
@@ -612,6 +738,7 @@ def get_index_data_from_eastmoney_kline(
             break
     if payload is None:
         return get_index_data_from_akshare_eastmoney_fallback(
+            secid,
             index_name,
             days=days,
             fqt=fqt,
@@ -634,6 +761,7 @@ def get_index_data_from_eastmoney_kline(
         )
     if not rows:
         return get_index_data_from_akshare_eastmoney_fallback(
+            secid,
             index_name,
             days=days,
             fqt=fqt,
@@ -642,10 +770,20 @@ def get_index_data_from_eastmoney_kline(
             last_error=last_error,
         )
     df = normalize_akshare_index_df(pd.DataFrame(rows))
+    import akshare as ak
+
+    df = append_eastmoney_latest_index_row(
+        ak,
+        df,
+        secid,
+        board_symbol=akshare_board_symbol,
+        hk_em_symbol=akshare_hk_em_symbol,
+    )
     return build_export_df(df, index_name, days=days)
 
 
 def get_index_data_from_akshare_eastmoney_fallback(
+    secid: str,
     index_name: str,
     days: int,
     fqt: str,
@@ -668,10 +806,24 @@ def get_index_data_from_akshare_eastmoney_fallback(
                 adjust=adjust,
             )
             df = normalize_akshare_index_df(raw_df)
+            df = append_eastmoney_latest_index_row(
+                ak,
+                df,
+                secid,
+                board_symbol=board_symbol,
+                hk_em_symbol=hk_em_symbol,
+            )
             return build_export_df(df, index_name, days=days)
         if hk_em_symbol:
             raw_df = ak.stock_hk_index_daily_em(symbol=hk_em_symbol)
             df = normalize_akshare_index_df(raw_df)
+            df = append_eastmoney_latest_index_row(
+                ak,
+                df,
+                secid,
+                board_symbol=board_symbol,
+                hk_em_symbol=hk_em_symbol,
+            )
             return build_export_df(df, index_name, days=days)
     except Exception as exc:
         raise RuntimeError(f"东方财富K线失败：{last_error}；AkShare兜底失败：{exc}") from exc
@@ -685,10 +837,24 @@ def get_index_data_from_akshare_global(index_code: str, index_name: str, days: i
     try:
         raw_df = ak.index_global_hist_em(symbol=index_code)
         df = normalize_akshare_index_df(raw_df)
-        if yahoo_symbol and is_sparse_daily_history(df):
+        latest_history_date = pd.to_datetime(df["trade_date"], errors="coerce").max().date()
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        if yahoo_symbol and (is_sparse_daily_history(df) or latest_history_date < today):
             yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
             if yahoo_df is not None and not yahoo_df.empty:
-                return yahoo_df
+                if is_sparse_daily_history(df):
+                    return yahoo_df
+                close_col = f"{index_name}_收盘价"
+                yahoo_raw = yahoo_df[["日期", close_col]].rename(
+                    columns={"日期": "trade_date", close_col: "close"}
+                )
+                yahoo_raw["trade_date"] = pd.to_datetime(yahoo_raw["trade_date"], errors="coerce")
+                yahoo_latest_date = yahoo_raw["trade_date"].max().date()
+                if yahoo_latest_date > latest_history_date:
+                    df = pd.concat(
+                        [df, yahoo_raw[yahoo_raw["trade_date"] > pd.Timestamp(latest_history_date)]],
+                        ignore_index=True,
+                    )
         return build_export_df(df, index_name, days=days)
     except Exception:
         if yahoo_symbol:
@@ -707,28 +873,9 @@ def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, d
     return build_export_df(df, index_name, days=days)
 
 
-def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.DataFrame | None:
-    if not isinstance(index_config, dict):
-        return None
-
+def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30) -> pd.DataFrame | None:
     source = index_config.get("source")
     code = index_config.get("code")
-    tickflow_symbol = index_config.get("tickflow_symbol")
-    if tickflow_symbol:
-        try:
-            df = get_index_data_from_tickflow("", tickflow_symbol, index_name, days=days)
-            if df is not None and not df.empty:
-                eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
-                if eastmoney_quote_secid:
-                    close_col = f"{index_name}_收盘价"
-                    raw_df = df[["日期", close_col]].rename(
-                        columns={"日期": "trade_date", close_col: "close"}
-                    )
-                    raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
-                    return build_export_df(raw_df, index_name, days=days)
-                return df
-        except Exception:
-            pass
 
     if source == "akshare_cn":
         return get_index_data_from_akshare_cn(
@@ -741,9 +888,19 @@ def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.
     if source == "akshare_csindex":
         return get_index_data_from_akshare_csindex(code, index_name, days=days)
     if source == "akshare_us":
-        return get_index_data_from_akshare_us(code, index_name, days=days)
+        return get_index_data_from_akshare_us(
+            code,
+            index_name,
+            days=days,
+            yahoo_symbol=index_config.get("yahoo_symbol"),
+        )
     if source == "akshare_hk":
-        return get_index_data_from_akshare_hk(code, index_name, days=days)
+        return get_index_data_from_akshare_hk(
+            code,
+            index_name,
+            days=days,
+            eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
+        )
     if source == "akshare_global":
         return get_index_data_from_akshare_global(
             code,
@@ -764,7 +921,31 @@ def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.
         )
     if source == "yahoo":
         return get_index_data_from_yahoo(code, index_name, days=days)
-    return None
+    raise ValueError(f"未知数据源：{source}")
+
+
+def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.DataFrame | None:
+    if not isinstance(index_config, dict):
+        return None
+
+    tickflow_symbol = index_config.get("tickflow_symbol")
+    if tickflow_symbol:
+        try:
+            df = get_index_data_from_tickflow("", tickflow_symbol, index_name, days=days)
+            if df is not None and not df.empty:
+                eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
+                if eastmoney_quote_secid:
+                    close_col = f"{index_name}_收盘价"
+                    raw_df = df[["日期", close_col]].rename(
+                        columns={"日期": "trade_date", close_col: "close"}
+                    )
+                    raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
+                    return build_export_df(raw_df, index_name, days=days)
+                return df
+        except Exception:
+            pass
+
+    return fetch_index_from_source(index_name, index_config, days=days)
 
 
 def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str, days: int = 30):
@@ -927,44 +1108,8 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
             except Exception as exc:
                 tickflow_error = exc
 
-        source = index_config.get("source")
-        code = index_config.get("code")
         try:
-            if source == "akshare_cn":
-                return get_index_data_from_akshare_cn(
-                    code,
-                    index_config.get("market", "sh"),
-                    index_name,
-                    days=days,
-                    eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
-                )
-            if source == "akshare_csindex":
-                return get_index_data_from_akshare_csindex(code, index_name, days=days)
-            if source == "akshare_us":
-                return get_index_data_from_akshare_us(code, index_name, days=days)
-            if source == "akshare_hk":
-                return get_index_data_from_akshare_hk(code, index_name, days=days)
-            if source == "akshare_global":
-                return get_index_data_from_akshare_global(
-                    code,
-                    index_name,
-                    days=days,
-                    yahoo_symbol=index_config.get("yahoo_symbol"),
-                )
-            if source == "akshare_futures_main":
-                return get_index_data_from_akshare_futures_main(code, index_name, days=days)
-            if source == "eastmoney_kline":
-                return get_index_data_from_eastmoney_kline(
-                    code,
-                    index_name,
-                    days=days,
-                    fqt=str(index_config.get("fqt", "0")),
-                    akshare_board_symbol=index_config.get("akshare_board_symbol"),
-                    akshare_hk_em_symbol=index_config.get("akshare_hk_em_symbol"),
-                )
-            if source == "yahoo":
-                return get_index_data_from_yahoo(code, index_name, days=days)
-            raise ValueError(f"未知数据源：{source}")
+            return fetch_index_from_source(index_name, index_config, days=days)
         except Exception as exc:
             if tickflow_error:
                 raise RuntimeError(f"TickFlow失败：{tickflow_error}；AkShare失败：{exc}") from exc

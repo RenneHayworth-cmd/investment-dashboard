@@ -5,14 +5,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import time
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from core.cache import load_dataset, save_dataset
 from core.db import finish_job, start_job
+from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date
 from services.index_ma20 import (
     INDEX_CONFIG,
     build_export_df,
+    fetch_index_from_source,
     fetch_one_index,
     get_index_raw_from_tickflow,
     merge_by_date,
@@ -80,7 +83,10 @@ def run_index_ma20_update(
             last_update_time = (meta or {}).get("last_update_time")
             if cached_df is not None and last_update_time:
                 last_update_date = datetime.fromisoformat(last_update_time).date()
-                if last_update_date == datetime.now().date():
+                if last_update_date == datetime.now().date() and cached_report_satisfies_current_quotes(
+                    cached_df,
+                    selected_items,
+                ):
                     message = f"使用今日缓存，更新时间：{last_update_time}"
                     finish_job(job_id, "success", message)
                     return UpdateResult("success", message, cached_df)
@@ -107,10 +113,14 @@ def run_index_ma20_update(
                 try:
                     df = future.result()
                     if df is not None and not df.empty:
+                        current_enough = has_current_index_quote(df, index_name, index_config)
                         all_data.append(df)
-                        timings.append(build_timing_row(index_name, index_config, "success", elapsed_seconds))
+                        status = "success" if current_enough else "stale"
+                        timings.append(build_timing_row(index_name, index_config, status, elapsed_seconds))
+                        if not current_enough and index_config.get("require_current_quote"):
+                            errors.append(build_stale_quote_message(index_name, index_config, df, "已保存最新可得数据"))
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "success", elapsed_seconds)
+                            progress_callback(index_name, completed, total, status, elapsed_seconds)
                     else:
                         timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds))
                         if not index_config.get("optional"):
@@ -124,6 +134,10 @@ def run_index_ma20_update(
                     if cached_index_df is not None and not cached_index_df.empty:
                         all_data.append(cached_index_df)
                         timings.append(build_timing_row(index_name, index_config, "cached", elapsed_seconds, str(exc)))
+                        if index_config.get("require_current_quote") and not has_current_index_quote(
+                            cached_index_df, index_name, index_config
+                        ):
+                            errors.append(build_stale_quote_message(index_name, index_config, cached_index_df, "已沿用本地缓存"))
                         if progress_callback:
                             progress_callback(index_name, completed, total, "cached", elapsed_seconds)
                     elif index_config.get("optional"):
@@ -179,6 +193,7 @@ def build_timing_row(
 ) -> dict:
     status_labels = {
         "success": "成功",
+        "stale": "最新可得",
         "cached": "使用缓存",
         "empty": "无数据",
         "failed": "失败",
@@ -191,6 +206,22 @@ def build_timing_row(
         "耗时(秒)": round(elapsed_seconds, 2),
         "说明": message[:240],
     }
+
+
+def cached_report_satisfies_current_quotes(
+    cached_df: pd.DataFrame | None,
+    selected_items: list[tuple[str, dict]],
+) -> bool:
+    if cached_df is None or cached_df.empty:
+        return False
+
+    for index_name, index_config in selected_items:
+        cached_index_df = extract_cached_index_report(cached_df, index_name)
+        if cached_index_df is None or cached_index_df.empty:
+            return False
+        if not has_current_index_quote(cached_index_df, index_name, index_config):
+            return False
+    return True
 
 
 def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd.DataFrame:
@@ -229,6 +260,52 @@ def extract_cached_index_report(cached_df: pd.DataFrame | None, index_name: str)
     return result
 
 
+def latest_index_trade_date(df: pd.DataFrame | None, index_name: str) -> pd.Timestamp | None:
+    if df is None or df.empty:
+        return None
+    close_column = f"{index_name}_收盘价"
+    if "日期" not in df.columns or close_column not in df.columns:
+        return None
+    latest_date = pd.to_datetime(df.loc[df[close_column].notna(), "日期"], errors="coerce").max()
+    if pd.isna(latest_date):
+        return None
+    return pd.Timestamp(latest_date)
+
+
+def build_stale_quote_message(index_name: str, index_config: dict, df: pd.DataFrame, action_text: str) -> str:
+    source_label = (
+        "东方财富"
+        if index_config.get("source") == "eastmoney_kline"
+        else str(index_config.get("source", "上游数据源"))
+    )
+    latest_date = latest_index_trade_date(df, index_name)
+    latest_text = latest_date.strftime("%Y-%m-%d") if latest_date is not None else "未知日期"
+
+    expected_text = "预期交易日"
+    market_name = index_config.get("market_group")
+    market = next((item for item in MARKET_WINDOWS if item.name == market_name), None)
+    if market is not None:
+        market_now = datetime.now(ZoneInfo(market.timezone))
+        expected_text = expected_latest_trade_date(market, market_now).strftime("%Y-%m-%d")
+
+    return f"{index_name}: {source_label} 最新到 {latest_text}，预期 {expected_text}，{action_text}"
+
+
+def has_current_index_quote(df: pd.DataFrame, index_name: str, index_config: dict) -> bool:
+    if df is None or df.empty or not index_config.get("require_current_quote"):
+        return True
+
+    market_name = index_config.get("market_group")
+    market = next((item for item in MARKET_WINDOWS if item.name == market_name), None)
+    if market is None:
+        return True
+    market_now = datetime.now(ZoneInfo(market.timezone))
+    expected_date = expected_latest_trade_date(market, market_now)
+
+    latest_date = latest_index_trade_date(df, index_name)
+    return not pd.isna(latest_date) and latest_date.date() >= expected_date
+
+
 def fetch_index_report(index_name: str, index_config: dict, api_key: str, days: int) -> pd.DataFrame | None:
     df = None
     tickflow_symbol = index_config.get("tickflow_symbol") if isinstance(index_config, dict) else None
@@ -256,6 +333,8 @@ def fetch_index_report(index_name: str, index_config: dict, api_key: str, days: 
                     df=raw_df,
                 )
                 df = build_export_df(raw_df, index_name, days=days)
+                if df is not None and not df.empty and not has_current_index_quote(df, index_name, index_config):
+                    df = fetch_index_from_source(index_name, index_config, days=days)
         except Exception:
             df = None
 
