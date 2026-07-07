@@ -145,6 +145,10 @@ def normalize_option_symbol(symbol: str) -> str:
     return f"{product}{month}"
 
 
+def _today_china() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+
+
 def is_option_symbol(symbol: str) -> bool:
     base = normalize_option_symbol(symbol)
     match = re.match(r"^([a-z]+)\d{4}([CP]\d+)?$", base)
@@ -214,7 +218,8 @@ def fetch_option_from_akshare(symbol: str, period: str, count: int) -> tuple[pd.
         df = daily_func(symbol=option_symbol)
         if df is None or df.empty:
             raise RuntimeError("AkShare 没有获取到期权日线数据，请检查月份、行权价或合约是否存在。")
-        return df.tail(count).reset_index(drop=True), "AkShare期权日线", False
+        df = append_option_spot_row(df, option_symbol)
+        return df.tail(count).reset_index(drop=True), "AkShare期权日线/实时快照", False
 
     if product == "i":
         df = ak.option_commodity_contract_table_sina(symbol="铁矿石期权", contract=option_symbol)
@@ -223,6 +228,94 @@ def fetch_option_from_akshare(symbol: str, period: str, count: int) -> tuple[pd.
     if df is None or df.empty:
         raise RuntimeError("AkShare 没有获取到期权链数据，请检查月份是否存在。")
     return df.reset_index(drop=True), "AkShare期权链", True
+
+
+def append_option_spot_row(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    option_symbol = normalize_option_symbol(symbol)
+    match = re.match(r"^([a-z]+)(\d{4})([CP])(\d+)$", option_symbol)
+    if not match:
+        return df
+
+    product, month, option_type, strike = match.groups()
+    today = _today_china()
+    if today.weekday() >= 5:
+        return df
+
+    result = df.copy()
+    date_col = "date" if "date" in result.columns else "日期" if "日期" in result.columns else None
+    if date_col is not None:
+        dates = pd.to_datetime(result[date_col], errors="coerce")
+        latest_history_date = dates.dropna().max()
+        if pd.notna(latest_history_date) and latest_history_date.normalize() >= today:
+            return result
+
+    try:
+        import akshare as ak
+
+        if product == "i":
+            chain_df = ak.option_commodity_contract_table_sina(
+                symbol="铁矿石期权",
+                contract=f"{product}{month}",
+            )
+        elif product == "mo":
+            chain_df = ak.option_cffex_zz1000_spot_sina(symbol=f"{product}{month}")
+        elif product == "io":
+            chain_df = ak.option_cffex_hs300_spot_sina(symbol=f"{product}{month}")
+        elif product == "ho":
+            chain_df = ak.option_cffex_sz50_spot_sina(symbol=f"{product}{month}")
+        else:
+            return result
+    except Exception:
+        return result
+
+    if chain_df is None or chain_df.empty:
+        return result
+
+    side = "看跌" if option_type == "P" else "看涨"
+    contract_col = f"{side}合约-{side}期权合约"
+    price_col = f"{side}合约-最新价"
+    hold_col = f"{side}合约-持仓量"
+    bid_col = f"{side}合约-买价"
+    ask_col = f"{side}合约-卖价"
+    change_col = f"{side}合约-涨跌"
+    required_cols = {contract_col, price_col}
+    if not required_cols.issubset(set(chain_df.columns)):
+        return result
+
+    matched = chain_df[
+        chain_df[contract_col].astype(str).str.lower() == option_symbol.lower()
+    ]
+    if matched.empty:
+        return result
+
+    row = matched.iloc[0]
+    latest_price = pd.to_numeric(row.get(price_col), errors="coerce")
+    if pd.isna(latest_price) or latest_price <= 0:
+        return result
+
+    supplement = {
+        "date": today,
+        "close": float(latest_price),
+    }
+    if hold_col in row.index:
+        supplement["open_interest"] = pd.to_numeric(row.get(hold_col), errors="coerce")
+    if bid_col in row.index:
+        supplement["bid_price"] = pd.to_numeric(row.get(bid_col), errors="coerce")
+    if ask_col in row.index:
+        supplement["ask_price"] = pd.to_numeric(row.get(ask_col), errors="coerce")
+    if change_col in row.index:
+        supplement["spot_change_pct"] = pd.to_numeric(row.get(change_col), errors="coerce")
+
+    return (
+        pd.concat([result, pd.DataFrame([supplement])], ignore_index=True)
+        .assign(date=lambda data: pd.to_datetime(data["date"], errors="coerce"))
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
 
 
 def normalize_market_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -343,6 +436,7 @@ def fetch_futures_option_data(
             )
         normalized = normalize_market_dataframe(raw_df)
         analyzed = add_indicators(normalized, ma_periods)
+        analyzed["_data_version"] = FUTURES_OPTION_DATA_VERSION
         return FuturesOptionResult(
             symbol=symbol,
             source=source,

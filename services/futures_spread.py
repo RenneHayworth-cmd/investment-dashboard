@@ -194,6 +194,67 @@ def infer_tickflow_futures_symbol(contract: str) -> str:
     return f"{code_prefix}{month}.{exchange}"
 
 
+def _today_china() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+
+
+def _spot_market_for_contract(contract: str) -> str:
+    match = re.match(r"^([A-Za-z]+)", contract.strip())
+    if not match:
+        return "CF"
+    exchange = FUTURES_EXCHANGES.get(match.group(1).upper(), "")
+    return "CFFEX" if exchange == "CFX" else "CF"
+
+
+def append_futures_spot_row(df: pd.DataFrame, contract: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    result = df.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    today = _today_china()
+    if today.weekday() >= 5:
+        return result
+
+    latest_history_date = result["date"].dropna().max()
+    if pd.notna(latest_history_date) and latest_history_date.normalize() >= today:
+        return result
+
+    try:
+        import akshare as ak
+
+        spot_df = ak.futures_zh_spot(
+            symbol=contract.strip().upper(),
+            market=_spot_market_for_contract(contract),
+            adjust="0",
+        )
+    except Exception:
+        return result
+
+    if spot_df is None or spot_df.empty:
+        return result
+
+    price_col = None
+    for candidate in ("current_price", "最新价", "price", "last_close"):
+        if candidate in spot_df.columns:
+            price_col = candidate
+            break
+    if price_col is None:
+        return result
+
+    latest_price = pd.to_numeric(spot_df.iloc[0][price_col], errors="coerce")
+    if pd.isna(latest_price) or latest_price <= 0:
+        return result
+
+    supplement = pd.DataFrame([{"date": today, "close": float(latest_price)}])
+    return (
+        pd.concat([result, supplement], ignore_index=True)
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
 def normalize_futures_daily(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError("返回空数据")
@@ -244,19 +305,19 @@ def fetch_futures_daily(contract: str, api_key: str = "") -> pd.DataFrame:
         akshare_df = fetch_futures_daily_from_akshare(contract)
     except Exception:
         if tickflow_df is not None:
-            return tickflow_df
+            return append_futures_spot_row(tickflow_df, contract)
         if tickflow_error is not None:
             raise tickflow_error
         raise
 
     if tickflow_df is None:
-        return akshare_df
+        return append_futures_spot_row(akshare_df, contract)
 
     tickflow_latest = tickflow_df["date"].max()
     akshare_latest = akshare_df["date"].max()
     if pd.notna(akshare_latest) and pd.notna(tickflow_latest) and akshare_latest > tickflow_latest:
-        return akshare_df
-    return tickflow_df
+        return append_futures_spot_row(akshare_df, contract)
+    return append_futures_spot_row(tickflow_df, contract)
 
 
 def fetch_contracts(

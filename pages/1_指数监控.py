@@ -12,7 +12,7 @@ from core.cache import load_dataset
 from core.db import init_db
 from core.ui import DEFAULT_CHART_HEIGHT, apply_global_style, apply_plotly_layout, render_page_header
 from services.index_ma20 import INDEX_CONFIG, build_summary, fetch_index_history
-from services.market_calendar import MARKET_WINDOWS, is_market_trading_day
+from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date, is_market_trading_day
 from services.update_tasks import run_index_ma20_update
 
 
@@ -404,14 +404,14 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
             continue
 
         market_now = datetime.now(ZoneInfo(market.timezone))
-        market_date = market_now.date()
         is_trading_day = is_market_trading_day(market, market_now)
+        expected_day = expected_latest_trade_date(market, market_now)
         latest_day = latest_date.date()
 
-        if latest_day >= market_date:
+        if latest_day >= expected_day and is_trading_day:
             status = "已更新"
             status_class = "fresh"
-        elif not is_trading_day:
+        elif latest_day >= expected_day:
             status = "休市"
             status_class = "closed"
         else:
@@ -536,6 +536,9 @@ if update_clicked:
         if status == "success":
             progress.progress(idx / total)
             status_box.success(f"{index_name} 获取完成{elapsed_text}，进度 {idx}/{total}")
+        elif status == "stale":
+            progress.progress(idx / total)
+            status_box.info(f"{index_name} 已保存最新可得数据{elapsed_text}，进度 {idx}/{total}")
         elif status == "cached":
             progress.progress(idx / total)
             status_box.info(f"{index_name} 联网失败，已沿用缓存{elapsed_text}，进度 {idx}/{total}")

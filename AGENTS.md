@@ -70,6 +70,12 @@ before a larger handoff or commit.
 - Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
+- The `持仓分析` page tracks a fixed personal holding list across ETF, futures
+  spread, and futures option data. It should read local cache on first render,
+  fetch only after the user clicks the load button, refresh stale futures
+  spread/option cache to the current trading day when a same-day quote is
+  available, and use the force-refresh setting only to refetch cache that is
+  already current.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -137,6 +143,10 @@ For fund rotation:
 - TickFlow fund rotation data is cached with `core.cache`; default behavior is
   to reuse local cache and fetch fresh data only when the page's refresh option
   is enabled.
+- Single-asset MA20 timing on the `基金轮动` page uses the same day's close for
+  both signal and execution. Its configurable trigger threshold defaults to 1%:
+  close above MA20 by the threshold buys, close below MA20 by the threshold
+  sells, with 100-share lot-size rounding by default.
 - Rotation signals use the previous trading day's close/NAV and require a full
   lookback window before the first rebalance date.
 - Exchange-traded ETFs are modeled with rebalance execution at the trading day's

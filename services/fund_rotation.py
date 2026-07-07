@@ -36,6 +36,17 @@ class RotationResult:
     yearly_stats: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
+@dataclass
+class TimingBacktestResult:
+    start_date: pd.Timestamp
+    end_date: pd.Timestamp
+    data: pd.DataFrame
+    trades: pd.DataFrame
+    drawdown: pd.DataFrame
+    yearly_stats: pd.DataFrame
+    summary: dict[str, object]
+
+
 def normalize_rotation_dataframe(df: pd.DataFrame, fallback_name: str) -> RotationInput:
     if df is None or df.empty:
         raise ValueError("文件中没有可回测的数据。")
@@ -68,6 +79,140 @@ def normalize_rotation_dataframe(df: pd.DataFrame, fallback_name: str) -> Rotati
         raise ValueError("日期和价格列解析后没有有效数据。")
 
     return RotationInput(symbol=str(symbol), name=str(name), dataframe=normalized)
+
+
+def run_ma20_timing_backtest(
+    fund: RotationInput,
+    ma_period: int = 20,
+    threshold_pct: float = 0.0,
+    initial_capital: float = 100000.0,
+    transaction_cost: float = 0.00006,
+    lot_size: int = 100,
+) -> TimingBacktestResult:
+    if ma_period < 1:
+        raise ValueError("均线周期必须大于 0。")
+    if threshold_pct < 0:
+        raise ValueError("触发阈值不能为负数。")
+    if initial_capital <= 0:
+        raise ValueError("初始资金必须大于 0。")
+
+    data = fund.dataframe[["trade_date", "close"]].copy()
+    data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce")
+    data["close"] = pd.to_numeric(data["close"], errors="coerce")
+    data = data.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
+    if len(data) <= ma_period:
+        raise ValueError("数据长度不足，无法计算 MA20 策略。")
+
+    ma_col = f"MA{ma_period}"
+    data[ma_col] = data["close"].rolling(window=ma_period).mean()
+    data = data.dropna(subset=[ma_col]).reset_index(drop=True)
+    if data.empty:
+        raise ValueError("没有生成有效均线数据。")
+
+    cash = float(initial_capital)
+    shares = 0.0
+    total_buy_cost = 0.0
+    total_sell_cost = 0.0
+    rows: list[dict[str, object]] = []
+    trades: list[dict[str, object]] = []
+    benchmark_first_close = float(data["close"].iloc[0])
+
+    for _, row in data.iterrows():
+        trade_date = pd.Timestamp(row["trade_date"])
+        close_price = float(row["close"])
+        ma_value = float(row[ma_col])
+        threshold = float(threshold_pct) / 100
+        buy_line = ma_value * (1 + threshold)
+        sell_line = ma_value * (1 - threshold)
+        desired_position = 1 if close_price > buy_line else 0 if close_price < sell_line else int(shares > 0)
+        action = "持有"
+
+        if desired_position == 1 and shares <= 0:
+            affordable_shares = cash / (close_price * (1 + transaction_cost)) if close_price > 0 else 0.0
+            buy_shares = _round_lot_shares(affordable_shares, lot_size=lot_size)
+            if buy_shares > 0:
+                gross_value = buy_shares * close_price
+                cost = gross_value * transaction_cost
+                cash -= gross_value + cost
+                shares = buy_shares
+                total_buy_cost += cost
+                action = "买入"
+                trades.append(
+                    {
+                        "日期": trade_date,
+                        "操作": "买入",
+                        "成交价": round(close_price, 4),
+                        "份额": round(buy_shares, 2),
+                        "成交金额": round(gross_value, 2),
+                        "手续费": round(cost, 2),
+                        "现金余额": round(cash, 2),
+                        "原因": f"收盘价 {close_price:.4f} > 买入线 {buy_line:.4f}",
+                    }
+                )
+        elif desired_position == 0 and shares > 0:
+            gross_value = shares * close_price
+            cost = gross_value * transaction_cost
+            cash += gross_value - cost
+            total_sell_cost += cost
+            action = "卖出"
+            trades.append(
+                {
+                    "日期": trade_date,
+                    "操作": "卖出",
+                    "成交价": round(close_price, 4),
+                    "份额": round(shares, 2),
+                    "成交金额": round(gross_value, 2),
+                    "手续费": round(cost, 2),
+                    "现金余额": round(cash, 2),
+                    "原因": f"收盘价 {close_price:.4f} < 卖出线 {sell_line:.4f}",
+                }
+            )
+            shares = 0.0
+
+        account_value = cash + shares * close_price
+        benchmark_value = close_price / benchmark_first_close * initial_capital if benchmark_first_close > 0 else initial_capital
+        rows.append(
+            {
+                "日期": trade_date,
+                "收盘价": round(close_price, 4),
+                ma_col: round(ma_value, 4),
+                "买入线": round(buy_line, 4),
+                "卖出线": round(sell_line, 4),
+                "信号": "持仓" if desired_position == 1 else "空仓",
+                "操作": action,
+                "持仓份额": round(shares, 2),
+                "现金余额": round(cash, 2),
+                "账户净值": round(account_value, 2),
+                "策略累计收益率(%)": round((account_value / initial_capital - 1) * 100, 2),
+                "单独持有净值": round(benchmark_value, 2),
+                "单独持有收益率(%)": round((benchmark_value / initial_capital - 1) * 100, 2),
+            }
+        )
+
+    result_df = pd.DataFrame(rows)
+    trades_df = pd.DataFrame(trades)
+    drawdown_df = _calculate_drawdown(result_df)
+    yearly_stats = _calculate_yearly_stats(result_df)
+    summary = _build_timing_summary(
+        result_df=result_df,
+        trades_df=trades_df,
+        drawdown_df=drawdown_df,
+        fund=fund,
+        ma_period=ma_period,
+        threshold_pct=threshold_pct,
+        initial_capital=initial_capital,
+        total_buy_cost=total_buy_cost,
+        total_sell_cost=total_sell_cost,
+    )
+    return TimingBacktestResult(
+        start_date=pd.Timestamp(result_df["日期"].iloc[0]),
+        end_date=pd.Timestamp(result_df["日期"].iloc[-1]),
+        data=result_df,
+        trades=trades_df,
+        drawdown=drawdown_df,
+        yearly_stats=yearly_stats,
+        summary=summary,
+    )
 
 
 def run_fund_rotation_backtest(
@@ -538,6 +683,73 @@ def _build_summary(
         "年化波动率(%)": round(annual_vol * 100, 2),
         "夏普比率": round(sharpe, 2),
         "调仓次数": switch_count,
+        "累计买入手续费": round(total_buy_cost, 2),
+        "累计卖出手续费": round(total_sell_cost, 2),
+        "累计总成本": round(total_buy_cost + total_sell_cost, 2),
+    }
+
+
+def _build_timing_summary(
+    result_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    drawdown_df: pd.DataFrame,
+    fund: RotationInput,
+    ma_period: int,
+    threshold_pct: float,
+    initial_capital: float,
+    total_buy_cost: float,
+    total_sell_cost: float,
+) -> dict[str, object]:
+    start_date = pd.Timestamp(result_df["日期"].iloc[0])
+    end_date = pd.Timestamp(result_df["日期"].iloc[-1])
+    final_value = float(result_df["账户净值"].iloc[-1])
+    benchmark_final = float(result_df["单独持有净值"].iloc[-1])
+    total_return = final_value / initial_capital - 1
+    benchmark_return = benchmark_final / initial_capital - 1
+    days = (end_date - start_date).days
+    annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
+    benchmark_annual_return = (
+        (1 + benchmark_return) ** (365 / days) - 1 if days > 0 and benchmark_return > -1 else 0
+    )
+    daily_returns = result_df["账户净值"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
+    sharpe = float(annual_return / annual_vol) if annual_vol > 0 else 0.0
+    latest = result_df.iloc[-1]
+    trade_count = len(trades_df)
+    buy_count = int((trades_df["操作"] == "买入").sum()) if not trades_df.empty else 0
+    sell_count = int((trades_df["操作"] == "卖出").sum()) if not trades_df.empty else 0
+    holding_days = int((result_df["持仓份额"] > 0).sum())
+    holding_ratio = holding_days / len(result_df) if len(result_df) else 0
+
+    return {
+        "标的": fund.name,
+        "代码": fund.symbol,
+        "策略": (
+            f"收盘价 > MA{ma_period} 上方 {threshold_pct:.2f}% 买入，"
+            f"收盘价 < MA{ma_period} 下方 {threshold_pct:.2f}% 卖出"
+        ),
+        "触发阈值(%)": round(float(threshold_pct), 2),
+        "开始日期": start_date.strftime("%Y-%m-%d"),
+        "结束日期": end_date.strftime("%Y-%m-%d"),
+        "期末资金": round(final_value, 2),
+        "总收益率(%)": round(total_return * 100, 2),
+        "年化收益率(%)": round(annual_return * 100, 2),
+        "单独持有收益率(%)": round(benchmark_return * 100, 2),
+        "单独持有年化(%)": round(benchmark_annual_return * 100, 2),
+        "超额收益(%)": round((total_return - benchmark_return) * 100, 2),
+        "最大回撤(%)": round(float(drawdown_df["回撤(%)"].min()), 2) if not drawdown_df.empty else 0,
+        "年化波动率(%)": round(annual_vol * 100, 2),
+        "夏普比率": round(sharpe, 2),
+        "交易次数": trade_count,
+        "买入次数": buy_count,
+        "卖出次数": sell_count,
+        "持仓天数": holding_days,
+        "持仓占比(%)": round(holding_ratio * 100, 2),
+        "最新信号": latest["信号"],
+        "最新收盘价": round(float(latest["收盘价"]), 4),
+        f"最新MA{ma_period}": round(float(latest[f"MA{ma_period}"]), 4),
+        "最新买入线": round(float(latest["买入线"]), 4),
+        "最新卖出线": round(float(latest["卖出线"]), 4),
         "累计买入手续费": round(total_buy_cost, 2),
         "累计卖出手续费": round(total_sell_cost, 2),
         "累计总成本": round(total_buy_cost + total_sell_cost, 2),
