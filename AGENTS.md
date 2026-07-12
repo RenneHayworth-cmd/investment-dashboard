@@ -55,6 +55,11 @@ before a larger handoff or commit.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
   a data source becomes unstable.
+- Index freshness uses `services/market_calendar.py`. Its
+  `STATIC_MARKET_HOLIDAYS` table contains the published 2026 cash-market
+  closures for mainland China, Hong Kong, Japan, and Korea; update that table
+  when exchanges publish a new annual schedule. The US fallback is generated
+  by holiday rules and also handles cross-year observed New Year's Day.
 - The `指数监控` latest summary uses dashboard-style index cards: four columns
   on desktop, fixed-height cards, index name and code on separate lines,
   A-share color convention for deltas (red up, green down), click-through
@@ -137,27 +142,64 @@ For futures:
 
 For fund rotation:
 
-- The app now has a dedicated `基金轮动` page after `A股分析`.
+- The app now has a dedicated `策略回测` page after `A股分析`.
 - Data sources include uploaded files, TickFlow exchange-traded funds/ETFs, and
   EastMoney off-exchange mutual funds.
-- TickFlow fund rotation data is cached with `core.cache`; default behavior is
-  to reuse local cache and fetch fresh data only when the page's refresh option
-  is enabled.
-- Single-asset MA20 timing on the `基金轮动` page uses the same day's close for
+- TickFlow data is cached with `core.cache`. Single-asset MA timing fetches
+  fresh data whenever the user runs it and falls back to local cache only when
+  that fetch fails. Multi-fund rotation reuses local cache by default and
+  fetches fresh data only when its refresh option is enabled.
+- Strategy backtests use a user-selected start and end date rather than a
+  user-selected daily-bar count. TickFlow requests up to 10,000 bars in the
+  background and reuses legacy 5,000/10,000-bar caches when available. MA and
+  momentum warm-up data before the selected start date must remain available.
+- Both MA20 timing and fund rotation show separate results for 近一年、今年来、
+  近三年、近五年、成立来, anchored to the selected interval's actual final
+  trading date. Show each period's actual start/end so shorter-lived assets are
+  not presented as having a full five-year history.
+- Backtest summaries and period tables include transaction win rate. Count only
+  closed positions: net sell proceeds after the sell fee versus original buy
+  amount plus the buy fee. Open positions are excluded. Sell rows in the trade
+  detail include realized P&L amount and percentage; rotation rows aggregate all
+  positions sold in that rebalance and also show per-symbol P&L in sell details.
+- Single-asset MA20 timing on the `策略回测` page uses the same day's close for
   both signal and execution. Its configurable trigger threshold defaults to 1%:
   close above MA20 by the threshold buys, close below MA20 by the threshold
   sells, with 100-share lot-size rounding by default.
-- Rotation signals use the previous trading day's close/NAV and require a full
-  lookback window before the first rebalance date.
-- Exchange-traded ETFs are modeled with rebalance execution at the trading day's
-  open, buy slippage `+0.05%`, sell slippage `-0.05%`, and 100-share lot-size
-  rounding with residual cash retained.
+- The MA timing benchmark is labeled `一直持有收益` and always uses the first
+  and last actual trading dates in the selected interval. Its start date must
+  not shift with the configured MA period; before the MA is available, the
+  strategy remains in cash while the benchmark still runs from interval start.
+  Backtest metrics label strategy drawdown as `策略最大回撤`; MA timing also
+  reports `一直持有最大回撤` over that same selected interval.
+- Strategy drawdown, daily volatility, and Sharpe calculations must seed the
+  series with initial capital so first-day transaction costs and slippage are
+  included instead of treating the first post-trade NAV as the starting peak.
+- Rotation defaults to `after_close`: use the scheduled rebalance day's close
+  to calculate momentum after the close, then model the trade at that same
+  close through the post-close fixed-price session. Do not apply exchange
+  slippage in this mode, but keep transaction fees and clearly state that the
+  backtest assumes full execution despite time-priority matching. The current
+  post-close mechanism expanded to all A-shares and ETFs on 2026-07-06, so
+  earlier history under this mode is a current-rule simulation rather than a
+  claim that the execution method was historically available.
+- Keep `next_open` as a comparison mode: use the previous trading day's
+  close/NAV signal and execute at the next eligible open.
+- For multi-position rotation, retain symbols that remain in the selected set;
+  sell only exiting symbols and use the released cash to buy only entering
+  symbols. Do not rebalance weights when the selected set is unchanged. A
+  missing open price should delay execution only when that symbol must actually
+  be bought or sold, not merely because it is present in the candidate universe.
+- In `next_open` mode, exchange-traded ETFs use buy slippage `+0.05%`, sell
+  slippage `-0.05%`, and 100-share lot-size rounding with residual cash retained.
 - Off-exchange mutual funds are modeled with cumulative NAV as the execution
-  proxy and do not use 100-share lot rounding.
+  proxy and do not use exchange slippage or 100-share lot rounding. Uploaded or
+  fetched data without an open-price column uses close as the execution proxy
+  and also does not apply exchange slippage.
 
 For correlation analysis:
 
-- The `相关性分析` page sits after `基金轮动`.
+- The `相关性分析` page sits after `策略回测`.
 - It computes Pearson correlation coefficients `r` on close prices or daily
   returns after inner joining all selected symbols by common dates.
 - It does not expose manual date-window choices; inputs are inner-joined by

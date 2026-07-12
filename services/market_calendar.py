@@ -3,6 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
+from functools import lru_cache
+
+import pandas as pd
+
+try:
+    import exchange_calendars as xcals
+except ImportError:  # Optional enhancement when the package is available locally.
+    xcals = None
 
 
 @dataclass(frozen=True)
@@ -10,6 +18,7 @@ class MarketWindow:
     name: str
     timezone: str
     sessions: tuple[tuple[datetime_time, datetime_time], ...]
+    calendar_name: str | None = None
 
 
 MARKET_WINDOWS = (
@@ -20,6 +29,7 @@ MARKET_WINDOWS = (
             (datetime_time(9, 30), datetime_time(11, 30)),
             (datetime_time(13, 0), datetime_time(15, 0)),
         ),
+        calendar_name="XSHG",
     ),
     MarketWindow(
         name="港股",
@@ -28,6 +38,7 @@ MARKET_WINDOWS = (
             (datetime_time(9, 30), datetime_time(12, 0)),
             (datetime_time(13, 0), datetime_time(16, 0)),
         ),
+        calendar_name="XHKG",
     ),
     MarketWindow(
         name="日本",
@@ -36,18 +47,73 @@ MARKET_WINDOWS = (
             (datetime_time(9, 0), datetime_time(11, 30)),
             (datetime_time(12, 30), datetime_time(15, 30)),
         ),
+        calendar_name="XTKS",
     ),
     MarketWindow(
         name="韩国",
         timezone="Asia/Seoul",
         sessions=((datetime_time(9, 0), datetime_time(15, 30)),),
+        calendar_name="XKRX",
     ),
     MarketWindow(
         name="美股",
         timezone="America/New_York",
         sessions=((datetime_time(9, 30), datetime_time(16, 0)),),
+        calendar_name="XNYS",
     ),
 )
+
+
+def _date_set(*values: str) -> set[date]:
+    return {date.fromisoformat(value) for value in values}
+
+
+# Published 2026 cash-market closures. Weekends are handled separately.
+STATIC_MARKET_HOLIDAYS = {
+    "A股": _date_set(
+        "2026-01-01", "2026-01-02",
+        "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-23",
+        "2026-04-06",
+        "2026-05-01", "2026-05-04", "2026-05-05",
+        "2026-06-19",
+        "2026-09-25",
+        "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07",
+    ),
+    "港股": _date_set(
+        "2026-01-01",
+        "2026-02-17", "2026-02-18", "2026-02-19",
+        "2026-04-03", "2026-04-06", "2026-04-07",
+        "2026-05-01", "2026-05-25",
+        "2026-06-19",
+        "2026-07-01",
+        "2026-10-01", "2026-10-19",
+        "2026-12-25",
+    ),
+    "日本": _date_set(
+        "2026-01-01", "2026-01-02", "2026-01-12",
+        "2026-02-11", "2026-02-23",
+        "2026-03-20",
+        "2026-04-29",
+        "2026-05-04", "2026-05-05", "2026-05-06",
+        "2026-07-20",
+        "2026-08-11",
+        "2026-09-21", "2026-09-22", "2026-09-23",
+        "2026-10-12",
+        "2026-11-03", "2026-11-23",
+        "2026-12-31",
+    ),
+    "韩国": _date_set(
+        "2026-01-01",
+        "2026-02-16", "2026-02-17", "2026-02-18",
+        "2026-03-02",
+        "2026-05-01", "2026-05-05", "2026-05-25",
+        "2026-06-03",
+        "2026-08-17",
+        "2026-09-24", "2026-09-25", "2026-09-28",
+        "2026-10-05", "2026-10-09",
+        "2026-12-25", "2026-12-31",
+    ),
+}
 
 
 def _observed_date(day: date) -> date:
@@ -108,9 +174,33 @@ def us_market_holidays(year: int) -> set[date]:
     }
 
 
+@lru_cache(maxsize=None)
+def _get_exchange_calendar(calendar_name: str):
+    if xcals is None:
+        return None
+    try:
+        return xcals.get_calendar(calendar_name)
+    except Exception:
+        return None
+
+
+def get_market_window(name: str) -> MarketWindow | None:
+    return next((market for market in MARKET_WINDOWS if market.name == name), None)
+
+
 def is_market_holiday(market: MarketWindow, day: date) -> bool:
+    if market.calendar_name:
+        calendar = _get_exchange_calendar(market.calendar_name)
+        if calendar is not None:
+            try:
+                return not bool(calendar.is_session(pd.Timestamp(day)))
+            except Exception:
+                pass
+    if day in STATIC_MARKET_HOLIDAYS.get(market.name, set()):
+        return True
     if market.name == "美股":
-        return day in us_market_holidays(day.year)
+        holidays = set().union(*(us_market_holidays(year) for year in (day.year - 1, day.year, day.year + 1)))
+        return day in holidays
     return False
 
 

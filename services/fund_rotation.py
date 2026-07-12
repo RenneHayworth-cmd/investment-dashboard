@@ -13,6 +13,10 @@ OPEN_COLUMNS = ("open", "开盘价", "开盘")
 BUY_SLIPPAGE = 0.0005
 SELL_SLIPPAGE = 0.0005
 LOT_SIZE = 100
+STANDARD_BACKTEST_PERIODS = ("近一年", "今年来", "近三年", "近五年", "成立来")
+EXECUTION_AFTER_CLOSE = "after_close"
+EXECUTION_NEXT_OPEN = "next_open"
+EXECUTION_MODES = (EXECUTION_AFTER_CLOSE, EXECUTION_NEXT_OPEN)
 
 
 @dataclass
@@ -21,6 +25,7 @@ class RotationInput:
     name: str
     dataframe: pd.DataFrame
     trade_lot_size: int = 100
+    apply_slippage: bool = True
 
 
 @dataclass
@@ -78,7 +83,39 @@ def normalize_rotation_dataframe(df: pd.DataFrame, fallback_name: str) -> Rotati
     if normalized.empty:
         raise ValueError("日期和价格列解析后没有有效数据。")
 
-    return RotationInput(symbol=str(symbol), name=str(name), dataframe=normalized)
+    return RotationInput(
+        symbol=str(symbol),
+        name=str(name),
+        dataframe=normalized,
+        apply_slippage=open_col is not None,
+    )
+
+
+def _normalize_date_range(
+    start_date: str | pd.Timestamp | None,
+    end_date: str | pd.Timestamp | None,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    start = pd.Timestamp(start_date).normalize() if start_date is not None else None
+    end = pd.Timestamp(end_date).normalize() if end_date is not None else None
+    if start is not None and pd.isna(start):
+        raise ValueError("开始日期无效。")
+    if end is not None and pd.isna(end):
+        raise ValueError("结束日期无效。")
+    if start is not None and end is not None and start > end:
+        raise ValueError("开始日期不能晚于结束日期。")
+    return start, end
+
+
+def build_standard_backtest_periods(end_date: str | pd.Timestamp) -> list[tuple[str, pd.Timestamp | None]]:
+    end = pd.Timestamp(end_date).normalize()
+    starts = {
+        "近一年": end - pd.DateOffset(years=1),
+        "今年来": pd.Timestamp(end.year, 1, 1),
+        "近三年": end - pd.DateOffset(years=3),
+        "近五年": end - pd.DateOffset(years=5),
+        "成立来": None,
+    }
+    return [(label, starts[label]) for label in STANDARD_BACKTEST_PERIODS]
 
 
 def run_ma20_timing_backtest(
@@ -88,6 +125,8 @@ def run_ma20_timing_backtest(
     initial_capital: float = 100000.0,
     transaction_cost: float = 0.00006,
     lot_size: int = 100,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
 ) -> TimingBacktestResult:
     if ma_period < 1:
         raise ValueError("均线周期必须大于 0。")
@@ -100,19 +139,28 @@ def run_ma20_timing_backtest(
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce")
     data["close"] = pd.to_numeric(data["close"], errors="coerce")
     data = data.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
-    if len(data) <= ma_period:
+    if len(data) < ma_period:
         raise ValueError("数据长度不足，无法计算 MA20 策略。")
 
     ma_col = f"MA{ma_period}"
     data[ma_col] = data["close"].rolling(window=ma_period).mean()
-    data = data.dropna(subset=[ma_col]).reset_index(drop=True)
+    requested_start, requested_end = _normalize_date_range(start_date, end_date)
+    if requested_end is not None:
+        data = data[data["trade_date"] <= requested_end]
+    if requested_start is not None:
+        data = data[data["trade_date"] >= requested_start]
+    data = data.reset_index(drop=True)
     if data.empty:
-        raise ValueError("没有生成有效均线数据。")
+        raise ValueError("所选时间区间内没有可回测的数据。")
+    if not data[ma_col].notna().any():
+        raise ValueError("所选时间区间内均线尚未形成，请扩大区间或缩短均线周期。")
 
     cash = float(initial_capital)
     shares = 0.0
+    position_cost_basis = 0.0
     total_buy_cost = 0.0
     total_sell_cost = 0.0
+    realized_trade_pnls: list[float] = []
     rows: list[dict[str, object]] = []
     trades: list[dict[str, object]] = []
     benchmark_first_close = float(data["close"].iloc[0])
@@ -120,12 +168,28 @@ def run_ma20_timing_backtest(
     for _, row in data.iterrows():
         trade_date = pd.Timestamp(row["trade_date"])
         close_price = float(row["close"])
-        ma_value = float(row[ma_col])
-        threshold = float(threshold_pct) / 100
-        buy_line = ma_value * (1 + threshold)
-        sell_line = ma_value * (1 - threshold)
-        desired_position = 1 if close_price > buy_line else 0 if close_price < sell_line else int(shares > 0)
-        action = "持有"
+        ma_raw = pd.to_numeric(row[ma_col], errors="coerce")
+        if pd.isna(ma_raw):
+            ma_value = np.nan
+            buy_line = np.nan
+            sell_line = np.nan
+            desired_position = int(shares > 0)
+            signal = "等待均线"
+            action = "等待"
+        else:
+            ma_value = float(ma_raw)
+            threshold = float(threshold_pct) / 100
+            buy_line = ma_value * (1 + threshold)
+            sell_line = ma_value * (1 - threshold)
+            desired_position = (
+                1
+                if close_price > buy_line
+                else 0
+                if close_price < sell_line
+                else int(shares > 0)
+            )
+            signal = "持仓" if desired_position == 1 else "空仓"
+            action = "持有"
 
         if desired_position == 1 and shares <= 0:
             affordable_shares = cash / (close_price * (1 + transaction_cost)) if close_price > 0 else 0.0
@@ -135,6 +199,7 @@ def run_ma20_timing_backtest(
                 cost = gross_value * transaction_cost
                 cash -= gross_value + cost
                 shares = buy_shares
+                position_cost_basis = gross_value + cost
                 total_buy_cost += cost
                 action = "买入"
                 trades.append(
@@ -145,6 +210,8 @@ def run_ma20_timing_backtest(
                         "份额": round(buy_shares, 2),
                         "成交金额": round(gross_value, 2),
                         "手续费": round(cost, 2),
+                        "本次交易盈亏金额": None,
+                        "本次交易盈亏率(%)": None,
                         "现金余额": round(cash, 2),
                         "原因": f"收盘价 {close_price:.4f} > 买入线 {buy_line:.4f}",
                     }
@@ -152,8 +219,12 @@ def run_ma20_timing_backtest(
         elif desired_position == 0 and shares > 0:
             gross_value = shares * close_price
             cost = gross_value * transaction_cost
-            cash += gross_value - cost
+            net_value = gross_value - cost
+            realized_pnl = net_value - position_cost_basis
+            realized_return = realized_pnl / position_cost_basis * 100 if position_cost_basis > 0 else 0.0
+            cash += net_value
             total_sell_cost += cost
+            realized_trade_pnls.append(realized_pnl)
             action = "卖出"
             trades.append(
                 {
@@ -163,11 +234,14 @@ def run_ma20_timing_backtest(
                     "份额": round(shares, 2),
                     "成交金额": round(gross_value, 2),
                     "手续费": round(cost, 2),
+                    "本次交易盈亏金额": round(realized_pnl, 2),
+                    "本次交易盈亏率(%)": round(realized_return, 2),
                     "现金余额": round(cash, 2),
                     "原因": f"收盘价 {close_price:.4f} < 卖出线 {sell_line:.4f}",
                 }
             )
             shares = 0.0
+            position_cost_basis = 0.0
 
         account_value = cash + shares * close_price
         benchmark_value = close_price / benchmark_first_close * initial_capital if benchmark_first_close > 0 else initial_capital
@@ -178,21 +252,21 @@ def run_ma20_timing_backtest(
                 ma_col: round(ma_value, 4),
                 "买入线": round(buy_line, 4),
                 "卖出线": round(sell_line, 4),
-                "信号": "持仓" if desired_position == 1 else "空仓",
+                "信号": signal,
                 "操作": action,
                 "持仓份额": round(shares, 2),
                 "现金余额": round(cash, 2),
                 "账户净值": round(account_value, 2),
                 "策略累计收益率(%)": round((account_value / initial_capital - 1) * 100, 2),
-                "单独持有净值": round(benchmark_value, 2),
-                "单独持有收益率(%)": round((benchmark_value / initial_capital - 1) * 100, 2),
+                "一直持有净值": round(benchmark_value, 2),
+                "一直持有收益率(%)": round((benchmark_value / initial_capital - 1) * 100, 2),
             }
         )
 
     result_df = pd.DataFrame(rows)
     trades_df = pd.DataFrame(trades)
-    drawdown_df = _calculate_drawdown(result_df)
-    yearly_stats = _calculate_yearly_stats(result_df)
+    drawdown_df = _calculate_drawdown(result_df, initial_capital=initial_capital)
+    yearly_stats = _calculate_yearly_stats(result_df, initial_capital=initial_capital)
     summary = _build_timing_summary(
         result_df=result_df,
         trades_df=trades_df,
@@ -203,6 +277,7 @@ def run_ma20_timing_backtest(
         initial_capital=initial_capital,
         total_buy_cost=total_buy_cost,
         total_sell_cost=total_sell_cost,
+        realized_trade_pnls=realized_trade_pnls,
     )
     return TimingBacktestResult(
         start_date=pd.Timestamp(result_df["日期"].iloc[0]),
@@ -222,6 +297,9 @@ def run_fund_rotation_backtest(
     num_positions: int = 1,
     initial_capital: float = 100000.0,
     transaction_cost: float = 0.00006,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    execution_mode: str = EXECUTION_AFTER_CLOSE,
 ) -> RotationResult:
     if len(funds) < 2:
         raise ValueError("至少需要导入 2 只基金进行轮动回测。")
@@ -231,36 +309,85 @@ def run_fund_rotation_backtest(
         raise ValueError("初始资金必须大于 0。")
     if lookback_period < 1:
         raise ValueError("动量周期必须大于 0。")
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"不支持的轮动成交方式：{execution_mode}")
 
     symbol_names = {fund.symbol: fund.name for fund in funds}
     source_data = {fund.symbol: fund.dataframe.copy() for fund in funds}
     merged = _prepare_merged_data(source_data)
-    end_date = pd.Timestamp(merged["trade_date"].max())
-    start_date = _get_start_date(source_data, lookback_period)
-    start_date = _align_rebalance_start(start_date, frequency, end_date, merged)
-    backtest_df = merged[merged["trade_date"] >= start_date].reset_index(drop=True)
-    if len(backtest_df) <= lookback_period:
-        raise ValueError("回测区间数据不足，请缩短动量周期或导入更长历史数据。")
-
-    all_dates = list(pd.to_datetime(merged["trade_date"]).dropna().sort_values().unique())
-    rebalance_dates = _build_rebalance_dates(start_date, end_date, frequency, all_dates, backtest_df)
-    momentum_cache = _calculate_momentum(merged, list(source_data.keys()), lookback_period)
+    requested_start, requested_end = _normalize_date_range(start_date, end_date)
+    if requested_end is not None:
+        merged_until_end = merged[merged["trade_date"] <= requested_end]
+        if merged_until_end.empty:
+            raise ValueError("所选结束日期早于可用行情。")
+        actual_end_date = pd.Timestamp(merged_until_end["trade_date"].max())
+    else:
+        actual_end_date = pd.Timestamp(merged["trade_date"].max())
+    signal_lag = 0 if execution_mode == EXECUTION_AFTER_CLOSE else 1
+    earliest_start_date = _get_start_date(source_data, lookback_period, signal_lag=signal_lag)
+    desired_start_date = (
+        max(earliest_start_date, requested_start)
+        if requested_start is not None
+        else earliest_start_date
+    )
+    if desired_start_date > actual_end_date:
+        raise ValueError("所选时间区间不足以完成动量预热和首次调仓。")
+    market_data = merged[merged["trade_date"] <= actual_end_date].reset_index(drop=True)
+    scheduled_start_date = _align_rebalance_start(
+        desired_start_date,
+        frequency,
+        actual_end_date,
+        market_data,
+    )
+    calendar_backtest_df = market_data[
+        market_data["trade_date"] >= scheduled_start_date
+    ].reset_index(drop=True)
+    all_dates = list(pd.to_datetime(market_data["trade_date"]).dropna().sort_values().unique())
+    scheduled_dates = _build_rebalance_dates(
+        scheduled_start_date,
+        actual_end_date,
+        frequency,
+        all_dates,
+        calendar_backtest_df,
+    )
+    momentum_cache = _calculate_momentum(
+        merged,
+        list(source_data.keys()),
+        lookback_period,
+        signal_lag=signal_lag,
+    )
+    rotation_plan = _build_rotation_plan(
+        scheduled_dates,
+        market_data,
+        momentum_cache,
+        num_positions,
+        actual_end_date,
+        execution_mode,
+    )
+    if not rotation_plan:
+        raise ValueError("所选时间区间内没有生成可执行的调仓计划。")
+    actual_start_date = rotation_plan[0][0]
+    backtest_df = merged[
+        (merged["trade_date"] >= actual_start_date)
+        & (merged["trade_date"] <= actual_end_date)
+    ].reset_index(drop=True)
+    if backtest_df.empty:
+        raise ValueError("所选时间区间内没有可回测行情。")
 
     current_shares: dict[str, float] = {}
+    current_cost_basis: dict[str, float] = {}
     cash_value = float(initial_capital)
     total_buy_cost = 0.0
     total_sell_cost = 0.0
+    realized_trade_pnls: list[float] = []
     nav_rows: list[dict[str, object]] = []
     trade_rows: list[dict[str, object]] = []
 
-    for index, rebal_date in enumerate(rebalance_dates):
+    for index, (rebal_date, selected, momentum) in enumerate(rotation_plan):
         date_rows = backtest_df[backtest_df["trade_date"] == rebal_date]
         if date_rows.empty:
             continue
         row = date_rows.iloc[0]
-        momentum = momentum_cache.loc[rebal_date].to_dict() if rebal_date in momentum_cache.index else {}
-        momentum = {key: 0.0 if pd.isna(value) or np.isinf(value) else float(value) for key, value in momentum.items()}
-        selected = _select_top_symbols(momentum, num_positions) or list(source_data.keys())[:num_positions]
         holdings_changed = set(selected) != set(current_shares.keys())
 
         value_before = _portfolio_value(current_shares, row) + cash_value
@@ -269,52 +396,74 @@ def run_fund_rotation_backtest(
 
         sell_cost = 0.0
         buy_cost = 0.0
+        sold_cost_basis = 0.0
+        realized_pnl_total = 0.0
         sell_details: list[str] = []
         buy_details: list[str] = []
-        new_shares: dict[str, float] = {}
-        execution_prices: dict[str, float] = {}
+        retained_symbols = [symbol for symbol in selected if symbol in current_shares]
+        exiting_symbols = [symbol for symbol in current_shares if symbol not in selected]
+        entering_symbols = [symbol for symbol in selected if symbol not in current_shares]
+        new_shares = {symbol: current_shares[symbol] for symbol in retained_symbols}
+        new_cost_basis = {symbol: current_cost_basis.get(symbol, 0.0) for symbol in retained_symbols}
+        execution_prices = {symbol: _row_price(row, symbol) for symbol in retained_symbols}
 
-        if holdings_changed and current_shares:
-            for symbol, shares in current_shares.items():
-                price = _trade_price(row, symbol, side="sell")
+        if holdings_changed:
+            for symbol in exiting_symbols:
+                shares = current_shares[symbol]
+                price = _trade_price(
+                    row,
+                    symbol,
+                    side="sell",
+                    apply_slippage=_trade_uses_slippage(funds, symbol),
+                    execution_mode=execution_mode,
+                )
                 gross_value = shares * price
                 cost = gross_value * transaction_cost
                 net_value = gross_value - cost
+                cost_basis = current_cost_basis.get(symbol, gross_value)
+                realized_pnl = net_value - cost_basis
+                realized_return = realized_pnl / cost_basis * 100 if cost_basis > 0 else 0.0
                 cash_value += net_value
                 sell_cost += cost
+                sold_cost_basis += cost_basis
+                realized_pnl_total += realized_pnl
+                if shares > 0 and cost_basis > 0:
+                    realized_trade_pnls.append(realized_pnl)
                 sell_details.append(
                     f"{symbol_names.get(symbol, symbol)} 卖出份额:{shares:.2f} 卖出价:{price:.4f} "
-                    f"卖出金额:{gross_value:.2f} 手续费:{cost:.2f} 到账:{net_value:.2f}"
+                    f"卖出金额:{gross_value:.2f} 手续费:{cost:.2f} 到账:{net_value:.2f} "
+                    f"盈亏:{realized_pnl:.2f} 盈亏率:{realized_return:.2f}%"
                 )
-        elif current_shares:
-            cash_value = cash_value
-
-        allocation = cash_value / len(selected)
-        for symbol in selected:
-            price = _trade_price(row, symbol, side="buy")
-            if holdings_changed or symbol not in current_shares:
-                cost = allocation * transaction_cost
-                net_allocation = allocation - cost
-                shares = _round_lot_shares(
-                    net_allocation / price if price > 0 else 0.0,
-                    lot_size=_trade_lot_size(funds, symbol),
-                )
-                actual_buy_value = shares * price
-                cost = actual_buy_value * transaction_cost
-                cash_value -= actual_buy_value + cost
-                buy_cost += cost
-                buy_details.append(
-                    f"{symbol_names.get(symbol, symbol)} 计划金额:{allocation:.2f} 买入价:{price:.4f} "
-                    f"买入金额:{actual_buy_value:.2f} "
-                    f"买入份额:{shares:.2f} 手续费:{cost:.2f}"
-                )
-                new_shares[symbol] = shares
-                execution_prices[symbol] = price
-            else:
-                new_shares[symbol] = current_shares.get(symbol, 0.0)
-                execution_prices[symbol] = _row_price(row, symbol)
+        allocation = cash_value / len(entering_symbols) if entering_symbols else 0.0
+        for symbol in entering_symbols:
+            price = _trade_price(
+                row,
+                symbol,
+                side="buy",
+                apply_slippage=_trade_uses_slippage(funds, symbol),
+                execution_mode=execution_mode,
+            )
+            cost = allocation * transaction_cost
+            net_allocation = allocation - cost
+            shares = _round_lot_shares(
+                net_allocation / price if price > 0 else 0.0,
+                lot_size=_trade_lot_size(funds, symbol),
+            )
+            actual_buy_value = shares * price
+            cost = actual_buy_value * transaction_cost
+            cash_value -= actual_buy_value + cost
+            buy_cost += cost
+            buy_details.append(
+                f"{symbol_names.get(symbol, symbol)} 计划金额:{allocation:.2f} 买入价:{price:.4f} "
+                f"买入金额:{actual_buy_value:.2f} "
+                f"买入份额:{shares:.2f} 手续费:{cost:.2f}"
+            )
+            new_shares[symbol] = shares
+            new_cost_basis[symbol] = actual_buy_value + cost
+            execution_prices[symbol] = price
 
         current_shares = new_shares
+        current_cost_basis = new_cost_basis
         execution_value_after = float(
             sum(shares * execution_prices.get(symbol, _row_price(row, symbol)) for symbol, shares in current_shares.items())
         ) + cash_value
@@ -326,6 +475,7 @@ def run_fund_rotation_backtest(
             {
                 "日期": rebal_date,
                 "操作": "调仓" if holdings_changed else "持有",
+                "成交方式": _execution_mode_label(execution_mode),
                 "选中标的": "; ".join(symbol_names.get(symbol, symbol) for symbol in selected),
                 "标的代码": "; ".join(selected),
                 "动量": "; ".join(
@@ -338,6 +488,12 @@ def run_fund_rotation_backtest(
                 "买入手续费": round(buy_cost, 2),
                 "卖出手续费": round(sell_cost, 2),
                 "本次总成本": round(buy_cost + sell_cost, 2),
+                "本次交易盈亏金额": round(realized_pnl_total, 2) if sold_cost_basis > 0 else None,
+                "本次交易盈亏率(%)": (
+                    round(realized_pnl_total / sold_cost_basis * 100, 2)
+                    if sold_cost_basis > 0
+                    else None
+                ),
                 "现金余额": round(cash_value, 2),
                 "卖出明细": " | ".join(sell_details),
                 "买入明细": " | ".join(buy_details),
@@ -345,7 +501,11 @@ def run_fund_rotation_backtest(
             }
         )
 
-        next_date = rebalance_dates[index + 1] if index + 1 < len(rebalance_dates) else end_date + timedelta(days=1)
+        next_date = (
+            rotation_plan[index + 1][0]
+            if index + 1 < len(rotation_plan)
+            else actual_end_date + timedelta(days=1)
+        )
         period_data = backtest_df[(backtest_df["trade_date"] >= rebal_date) & (backtest_df["trade_date"] < next_date)]
         for _, period_row in period_data.iterrows():
             total_value = _portfolio_value(current_shares, period_row) + cash_value
@@ -365,24 +525,38 @@ def run_fund_rotation_backtest(
     if nav_df.empty:
         raise ValueError("没有生成有效回测净值。")
 
-    drawdown_df = _calculate_drawdown(nav_df)
-    individual_df = _calculate_individual_results(source_data, symbol_names, start_date, initial_capital)
-    individual_nav_df = _calculate_individual_nav_data(source_data, symbol_names, start_date, initial_capital)
-    yearly_stats = _calculate_yearly_stats(nav_df)
+    drawdown_df = _calculate_drawdown(nav_df, initial_capital=initial_capital)
+    individual_df = _calculate_individual_results(
+        source_data,
+        symbol_names,
+        actual_start_date,
+        actual_end_date,
+        initial_capital,
+    )
+    individual_nav_df = _calculate_individual_nav_data(
+        source_data,
+        symbol_names,
+        actual_start_date,
+        actual_end_date,
+        initial_capital,
+    )
+    yearly_stats = _calculate_yearly_stats(nav_df, initial_capital=initial_capital)
     summary = _build_summary(
         nav_df=nav_df,
         trades_df=trades_df,
         drawdown_df=drawdown_df,
-        start_date=start_date,
-        end_date=end_date,
+        start_date=actual_start_date,
+        end_date=actual_end_date,
         initial_capital=initial_capital,
         total_buy_cost=total_buy_cost,
         total_sell_cost=total_sell_cost,
+        realized_trade_pnls=realized_trade_pnls,
+        execution_mode=execution_mode,
     )
 
     return RotationResult(
-        start_date=start_date,
-        end_date=end_date,
+        start_date=actual_start_date,
+        end_date=actual_end_date,
         nav_data=nav_df,
         trades=trades_df,
         summary=summary,
@@ -417,23 +591,30 @@ def _prepare_merged_data(source_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
     for symbol, df in source_data.items():
         current = df[["trade_date", "open", "close"]].copy()
         current.columns = ["trade_date", f"{symbol}__open", symbol]
+        current[f"{symbol}__raw_close"] = current[symbol]
         merged = current if merged is None else pd.merge(merged, current, on="trade_date", how="outer")
     if merged is None or merged.empty:
         raise ValueError("没有可合并的基金数据。")
     merged = merged.sort_values("trade_date").reset_index(drop=True)
     for symbol in source_data:
+        merged[f"{symbol}__raw_close"] = pd.to_numeric(merged[f"{symbol}__raw_close"], errors="coerce")
         merged[symbol] = pd.to_numeric(merged[symbol], errors="coerce").ffill()
-        merged[f"{symbol}__open"] = pd.to_numeric(merged[f"{symbol}__open"], errors="coerce").ffill()
+        merged[f"{symbol}__open"] = pd.to_numeric(merged[f"{symbol}__open"], errors="coerce")
     return merged
 
 
-def _get_start_date(source_data: dict[str, pd.DataFrame], lookback_period: int) -> pd.Timestamp:
+def _get_start_date(
+    source_data: dict[str, pd.DataFrame],
+    lookback_period: int,
+    signal_lag: int = 1,
+) -> pd.Timestamp:
     eligible_dates = []
     for df in source_data.values():
         data = df.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
-        if len(data) <= lookback_period:
+        first_trade_position = lookback_period + signal_lag
+        if len(data) <= first_trade_position:
             raise ValueError("有基金数据长度不足，无法计算完整动量窗口。")
-        eligible_dates.append(pd.Timestamp(data.loc[lookback_period, "trade_date"]))
+        eligible_dates.append(pd.Timestamp(data.loc[first_trade_position, "trade_date"]))
     return max(eligible_dates)
 
 
@@ -499,27 +680,89 @@ def _build_rebalance_dates(
     return dates
 
 
-def _calculate_momentum(merged: pd.DataFrame, symbols: list[str], lookback_period: int) -> pd.DataFrame:
+def _build_rotation_plan(
+    scheduled_dates: list[pd.Timestamp],
+    market_data: pd.DataFrame,
+    momentum_cache: pd.DataFrame,
+    num_positions: int,
+    end_date: pd.Timestamp,
+    execution_mode: str,
+) -> list[tuple[pd.Timestamp, list[str], dict[str, float]]]:
+    plan: list[tuple[pd.Timestamp, list[str], dict[str, float]]] = []
+    current_symbols: set[str] = set()
+    for index, scheduled_date in enumerate(scheduled_dates):
+        momentum = momentum_cache.loc[scheduled_date].to_dict() if scheduled_date in momentum_cache.index else {}
+        momentum = {
+            key: float(value)
+            for key, value in momentum.items()
+            if not pd.isna(value) and not np.isinf(value)
+        }
+        selected = _select_top_symbols(momentum, num_positions)
+        if len(selected) < num_positions:
+            continue
+
+        selected_symbols = set(selected)
+        holdings_changed = selected_symbols != current_symbols
+        if holdings_changed:
+            symbols_to_trade = current_symbols.symmetric_difference(selected_symbols)
+            next_scheduled_date = (
+                scheduled_dates[index + 1]
+                if index + 1 < len(scheduled_dates)
+                else pd.Timestamp(end_date) + timedelta(days=1)
+            )
+            execution_date = _find_tradeable_date(
+                market_data,
+                scheduled_date,
+                next_scheduled_date,
+                symbols_to_trade,
+                execution_mode,
+            )
+            if execution_date is None:
+                continue
+        else:
+            execution_date = pd.Timestamp(scheduled_date)
+
+        plan.append((execution_date, selected, momentum))
+        current_symbols = selected_symbols
+    return plan
+
+
+def _find_tradeable_date(
+    market_data: pd.DataFrame,
+    start_date: pd.Timestamp,
+    end_date_exclusive: pd.Timestamp,
+    symbols: set[str],
+    execution_mode: str,
+) -> pd.Timestamp | None:
+    candidates = market_data[
+        (market_data["trade_date"] >= pd.Timestamp(start_date))
+        & (market_data["trade_date"] < pd.Timestamp(end_date_exclusive))
+    ]
+    for _, row in candidates.iterrows():
+        if all(
+            _has_execution_price(row, symbol, execution_mode)
+            for symbol in symbols
+        ):
+            return pd.Timestamp(row["trade_date"])
+    return None
+
+
+def _calculate_momentum(
+    merged: pd.DataFrame,
+    symbols: list[str],
+    lookback_period: int,
+    signal_lag: int = 1,
+) -> pd.DataFrame:
     momentum = {}
     indexed = merged.set_index("trade_date")
     for symbol in symbols:
-        prices = pd.to_numeric(indexed[symbol], errors="coerce")
-        previous_close = prices.shift(1)
-        rows = []
-        for position in range(len(previous_close)):
-            end_price = previous_close.iloc[position]
-            if pd.isna(end_price) or end_price <= 0:
-                rows.append(0.0)
-                continue
-            valid_history = prices.iloc[:position].dropna()
-            if valid_history.empty:
-                rows.append(0.0)
-                continue
-            start_position = max(0, len(valid_history) - lookback_period)
-            start_price = valid_history.iloc[start_position]
-            rows.append(float(end_price / start_price - 1) if start_price > 0 else 0.0)
-        momentum[symbol] = rows
-    return pd.DataFrame(momentum, index=indexed.index).fillna(0)
+        raw_column = f"{symbol}__raw_close"
+        prices = pd.to_numeric(indexed[raw_column] if raw_column in indexed.columns else indexed[symbol], errors="coerce")
+        actual_prices = prices.dropna()
+        actual_momentum = actual_prices.pct_change(periods=lookback_period, fill_method=None)
+        aligned_momentum = actual_momentum.reindex(indexed.index).ffill()
+        momentum[symbol] = aligned_momentum.shift(signal_lag) if signal_lag else aligned_momentum
+    return pd.DataFrame(momentum, index=indexed.index)
 
 
 def _select_top_symbols(momentum: dict[str, float], num_positions: int) -> list[str]:
@@ -531,9 +774,23 @@ def _row_price(row: pd.Series, symbol: str) -> float:
     return 0.0 if pd.isna(value) else float(value)
 
 
-def _trade_price(row: pd.Series, symbol: str, side: str) -> float:
-    open_value = pd.to_numeric(row.get(f"{symbol}__open"), errors="coerce")
-    base_price = _row_price(row, symbol) if pd.isna(open_value) else float(open_value)
+def _trade_price(
+    row: pd.Series,
+    symbol: str,
+    side: str,
+    apply_slippage: bool = True,
+    execution_mode: str = EXECUTION_NEXT_OPEN,
+) -> float:
+    price_column = f"{symbol}__raw_close" if execution_mode == EXECUTION_AFTER_CLOSE else f"{symbol}__open"
+    price_value = pd.to_numeric(row.get(price_column), errors="coerce")
+    if pd.isna(price_value) or float(price_value) <= 0:
+        price_name = "收盘价" if execution_mode == EXECUTION_AFTER_CLOSE else "开盘价"
+        raise ValueError(f"{symbol} 在调仓日没有有效{price_name}，无法成交。")
+    base_price = float(price_value)
+    if execution_mode == EXECUTION_AFTER_CLOSE:
+        return base_price
+    if not apply_slippage:
+        return base_price
     if side == "buy":
         return base_price * (1 + BUY_SLIPPAGE)
     if side == "sell":
@@ -541,11 +798,30 @@ def _trade_price(row: pd.Series, symbol: str, side: str) -> float:
     return base_price
 
 
+def _has_execution_price(row: pd.Series, symbol: str, execution_mode: str) -> bool:
+    price_column = f"{symbol}__raw_close" if execution_mode == EXECUTION_AFTER_CLOSE else f"{symbol}__open"
+    value = pd.to_numeric(row.get(price_column), errors="coerce")
+    return not pd.isna(value) and float(value) > 0
+
+
+def _execution_mode_label(execution_mode: str) -> str:
+    if execution_mode == EXECUTION_AFTER_CLOSE:
+        return "盘后固定价（当日收盘信号/收盘成交）"
+    return "次日开盘（前收盘信号/开盘成交）"
+
+
 def _trade_lot_size(funds: list[RotationInput], symbol: str) -> int:
     for fund in funds:
         if fund.symbol == symbol:
             return int(fund.trade_lot_size)
     return LOT_SIZE
+
+
+def _trade_uses_slippage(funds: list[RotationInput], symbol: str) -> bool:
+    for fund in funds:
+        if fund.symbol == symbol:
+            return bool(fund.apply_slippage)
+    return True
 
 
 def _round_lot_shares(shares: float, lot_size: int = LOT_SIZE) -> float:
@@ -568,9 +844,16 @@ def _holding_amount_detail(shares: dict[str, float], row: pd.Series, names: dict
     return " | ".join(parts)
 
 
-def _calculate_drawdown(nav_df: pd.DataFrame) -> pd.DataFrame:
+def _calculate_drawdown(
+    nav_df: pd.DataFrame,
+    initial_capital: float | None = None,
+) -> pd.DataFrame:
     result = nav_df[["日期", "账户净值"]].copy()
-    result["running_peak"] = result["账户净值"].cummax()
+    account_values = pd.to_numeric(result["账户净值"], errors="coerce")
+    running_peak = account_values.cummax()
+    if initial_capital is not None:
+        running_peak = running_peak.clip(lower=float(initial_capital))
+    result["running_peak"] = running_peak
     result["回撤(%)"] = (result["账户净值"] / result["running_peak"] - 1) * 100
     return result.round({"回撤(%)": 2})
 
@@ -579,11 +862,14 @@ def _calculate_individual_results(
     source_data: dict[str, pd.DataFrame],
     names: dict[str, str],
     start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
     initial_capital: float,
 ) -> pd.DataFrame:
     rows = []
     for symbol, df in source_data.items():
-        data = df[df["trade_date"] >= start_date].copy()
+        data = df[
+            (df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)
+        ].copy()
         if len(data) < 2:
             continue
         first = float(data["close"].iloc[0])
@@ -599,7 +885,7 @@ def _calculate_individual_results(
                 "代码": symbol,
                 "总收益率(%)": round(total_return * 100, 2),
                 "年化收益率(%)": round(annual_return * 100, 2),
-                "最大回撤(%)": round(float(drawdown.min() * 100), 2) if not drawdown.empty else 0,
+                "一直持有最大回撤(%)": round(float(drawdown.min() * 100), 2) if not drawdown.empty else 0,
                 "期末资金": round(initial_capital * (1 + total_return), 2),
             }
         )
@@ -610,11 +896,14 @@ def _calculate_individual_nav_data(
     source_data: dict[str, pd.DataFrame],
     names: dict[str, str],
     start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
     initial_capital: float,
 ) -> pd.DataFrame:
     rows = []
     for symbol, df in source_data.items():
-        data = df[df["trade_date"] >= start_date].copy()
+        data = df[
+            (df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)
+        ].copy()
         if data.empty:
             continue
         first = pd.to_numeric(data["close"].iloc[0], errors="coerce")
@@ -629,21 +918,32 @@ def _calculate_individual_nav_data(
                     "日期": row["trade_date"],
                     "标的": names.get(symbol, symbol),
                     "代码": symbol,
-                    "单独持有净值": round(value, 2),
+                    "一直持有净值": round(value, 2),
                     "累计收益率(%)": round((value / initial_capital - 1) * 100, 2),
                 }
             )
     return pd.DataFrame(rows)
 
 
-def _calculate_yearly_stats(nav_df: pd.DataFrame) -> pd.DataFrame:
+def _calculate_yearly_stats(
+    nav_df: pd.DataFrame,
+    initial_capital: float | None = None,
+) -> pd.DataFrame:
     data = nav_df[["日期", "账户净值"]].copy()
+    data = data.sort_values("日期").reset_index(drop=True)
     data["year"] = pd.to_datetime(data["日期"]).dt.year
     rows = []
+    previous_year_end = float(initial_capital) if initial_capital is not None else None
     for year, group in data.groupby("year"):
         group = group.sort_values("日期")
-        year_return = group["账户净值"].iloc[-1] / group["账户净值"].iloc[0] - 1
-        drawdown = group["账户净值"] / group["账户净值"].cummax() - 1
+        values = pd.to_numeric(group["账户净值"], errors="coerce").dropna().reset_index(drop=True)
+        if values.empty:
+            continue
+        baseline = previous_year_end if previous_year_end is not None else float(values.iloc[0])
+        year_return = float(values.iloc[-1]) / baseline - 1 if baseline > 0 else 0.0
+        seeded_values = pd.concat([pd.Series([baseline]), values], ignore_index=True)
+        running_peak = seeded_values.cummax().iloc[1:].reset_index(drop=True)
+        drawdown = values / running_peak - 1
         rows.append(
             {
                 "年份": int(year),
@@ -651,7 +951,36 @@ def _calculate_yearly_stats(nav_df: pd.DataFrame) -> pd.DataFrame:
                 "年最大回撤(%)": round(float(drawdown.min() * 100), 2),
             }
         )
+        previous_year_end = float(values.iloc[-1])
     return pd.DataFrame(rows)
+
+
+def _calculate_sharpe_ratio(daily_returns: pd.Series) -> float:
+    clean_returns = pd.to_numeric(daily_returns, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if len(clean_returns) < 2:
+        return 0.0
+    daily_volatility = float(clean_returns.std())
+    if daily_volatility <= 0:
+        return 0.0
+    return float(clean_returns.mean() / daily_volatility * np.sqrt(252))
+
+
+def _calculate_nav_returns(nav_df: pd.DataFrame, initial_capital: float) -> pd.Series:
+    account_values = pd.to_numeric(nav_df["账户净值"], errors="coerce").dropna().reset_index(drop=True)
+    if account_values.empty:
+        return pd.Series(dtype=float)
+    seeded_values = pd.concat(
+        [pd.Series([float(initial_capital)]), account_values],
+        ignore_index=True,
+    )
+    return seeded_values.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def _calculate_trade_win_stats(realized_trade_pnls: list[float]) -> tuple[int, int, float]:
+    closed_count = len(realized_trade_pnls)
+    winning_count = sum(1 for pnl in realized_trade_pnls if pnl > 0)
+    win_rate = winning_count / closed_count * 100 if closed_count else 0.0
+    return closed_count, winning_count, win_rate
 
 
 def _build_summary(
@@ -663,26 +992,38 @@ def _build_summary(
     initial_capital: float,
     total_buy_cost: float,
     total_sell_cost: float,
+    realized_trade_pnls: list[float],
+    execution_mode: str,
 ) -> dict[str, object]:
     final_value = float(nav_df["账户净值"].iloc[-1])
     total_return = final_value / initial_capital - 1
     days = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days
     annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
-    daily_returns = nav_df["账户净值"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    daily_returns = _calculate_nav_returns(nav_df, initial_capital)
     annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
-    sharpe = float(annual_return / annual_vol) if annual_vol > 0 else 0.0
+    sharpe = _calculate_sharpe_ratio(daily_returns)
     max_drawdown = float(drawdown_df["回撤(%)"].min()) if not drawdown_df.empty else 0
     switch_count = int((trades_df["操作"] == "调仓").sum()) if not trades_df.empty else 0
+    closed_trade_count, winning_trade_count, trade_win_rate = _calculate_trade_win_stats(realized_trade_pnls)
     return {
         "开始日期": pd.Timestamp(start_date).strftime("%Y-%m-%d"),
         "结束日期": pd.Timestamp(end_date).strftime("%Y-%m-%d"),
+        "成交方式": _execution_mode_label(execution_mode),
+        "成交假设": (
+            "按收盘价全部成交，未模拟盘后排队未成交"
+            if execution_mode == EXECUTION_AFTER_CLOSE
+            else "按开盘价成交，场内标的计入双边滑点"
+        ),
         "期末资金": round(final_value, 2),
         "总收益率(%)": round(total_return * 100, 2),
         "年化收益率(%)": round(annual_return * 100, 2),
-        "最大回撤(%)": round(max_drawdown, 2),
+        "策略最大回撤(%)": round(max_drawdown, 2),
         "年化波动率(%)": round(annual_vol * 100, 2),
         "夏普比率": round(sharpe, 2),
         "调仓次数": switch_count,
+        "已平仓交易次数": closed_trade_count,
+        "盈利交易次数": winning_trade_count,
+        "交易胜率(%)": round(trade_win_rate, 2),
         "累计买入手续费": round(total_buy_cost, 2),
         "累计卖出手续费": round(total_sell_cost, 2),
         "累计总成本": round(total_buy_cost + total_sell_cost, 2),
@@ -699,27 +1040,32 @@ def _build_timing_summary(
     initial_capital: float,
     total_buy_cost: float,
     total_sell_cost: float,
+    realized_trade_pnls: list[float],
 ) -> dict[str, object]:
     start_date = pd.Timestamp(result_df["日期"].iloc[0])
     end_date = pd.Timestamp(result_df["日期"].iloc[-1])
     final_value = float(result_df["账户净值"].iloc[-1])
-    benchmark_final = float(result_df["单独持有净值"].iloc[-1])
+    benchmark_final = float(result_df["一直持有净值"].iloc[-1])
     total_return = final_value / initial_capital - 1
     benchmark_return = benchmark_final / initial_capital - 1
+    benchmark_values = pd.to_numeric(result_df["一直持有净值"], errors="coerce").dropna()
+    benchmark_drawdown = benchmark_values / benchmark_values.cummax() - 1
+    benchmark_max_drawdown = float(benchmark_drawdown.min() * 100) if not benchmark_drawdown.empty else 0.0
     days = (end_date - start_date).days
     annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
     benchmark_annual_return = (
         (1 + benchmark_return) ** (365 / days) - 1 if days > 0 and benchmark_return > -1 else 0
     )
-    daily_returns = result_df["账户净值"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    daily_returns = _calculate_nav_returns(result_df, initial_capital)
     annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
-    sharpe = float(annual_return / annual_vol) if annual_vol > 0 else 0.0
+    sharpe = _calculate_sharpe_ratio(daily_returns)
     latest = result_df.iloc[-1]
     trade_count = len(trades_df)
     buy_count = int((trades_df["操作"] == "买入").sum()) if not trades_df.empty else 0
     sell_count = int((trades_df["操作"] == "卖出").sum()) if not trades_df.empty else 0
     holding_days = int((result_df["持仓份额"] > 0).sum())
     holding_ratio = holding_days / len(result_df) if len(result_df) else 0
+    closed_trade_count, winning_trade_count, trade_win_rate = _calculate_trade_win_stats(realized_trade_pnls)
 
     return {
         "标的": fund.name,
@@ -734,15 +1080,19 @@ def _build_timing_summary(
         "期末资金": round(final_value, 2),
         "总收益率(%)": round(total_return * 100, 2),
         "年化收益率(%)": round(annual_return * 100, 2),
-        "单独持有收益率(%)": round(benchmark_return * 100, 2),
-        "单独持有年化(%)": round(benchmark_annual_return * 100, 2),
+        "一直持有收益率(%)": round(benchmark_return * 100, 2),
+        "一直持有年化(%)": round(benchmark_annual_return * 100, 2),
         "超额收益(%)": round((total_return - benchmark_return) * 100, 2),
-        "最大回撤(%)": round(float(drawdown_df["回撤(%)"].min()), 2) if not drawdown_df.empty else 0,
+        "策略最大回撤(%)": round(float(drawdown_df["回撤(%)"].min()), 2) if not drawdown_df.empty else 0,
+        "一直持有最大回撤(%)": round(benchmark_max_drawdown, 2),
         "年化波动率(%)": round(annual_vol * 100, 2),
         "夏普比率": round(sharpe, 2),
         "交易次数": trade_count,
         "买入次数": buy_count,
         "卖出次数": sell_count,
+        "已平仓交易次数": closed_trade_count,
+        "盈利交易次数": winning_trade_count,
+        "交易胜率(%)": round(trade_win_rate, 2),
         "持仓天数": holding_days,
         "持仓占比(%)": round(holding_ratio * 100, 2),
         "最新信号": latest["信号"],

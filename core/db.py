@@ -7,7 +7,7 @@ from core.paths import DB_PATH, ensure_dirs
 
 
 def get_conn() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 
 def init_db() -> None:

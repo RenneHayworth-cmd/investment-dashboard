@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from services.market_calendar import expected_latest_trade_date, get_market_window, is_market_holiday, is_market_trading_day
+
 
 INDEX_CONFIG = {
     "创业板指": {
@@ -366,6 +368,120 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: b
         return normalized
 
 
+def fetch_eastmoney_clist_latest_index_row(
+    *,
+    board_symbol: str | None = None,
+    hk_em_symbol: str | None = None,
+) -> pd.DataFrame | None:
+    """Fetch a latest EastMoney list quote when stock/get or kline hosts fail."""
+    target_symbol = (board_symbol or hk_em_symbol or "").strip().upper()
+    if not target_symbol:
+        return None
+
+    if board_symbol:
+        fs = "m:90 t:3 f:!50"
+        market_timezone = "Asia/Shanghai"
+        market_name = "A股"
+    elif hk_em_symbol:
+        fs = "m:124,m:125,m:305"
+        market_timezone = "Asia/Hong_Kong"
+        market_name = "港股"
+    else:
+        return None
+
+    try:
+        import requests
+
+        headers = {
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://quote.eastmoney.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        hosts = (
+            "push2delay.eastmoney.com",
+            "push2.eastmoney.com",
+            "36.push2.eastmoney.com",
+            "48.push2.eastmoney.com",
+        )
+        fields = "f12,f13,f14,f2,f3,f4,f5,f6,f20,f21,f124,f152"
+        for trust_env in (False, True):
+            session = requests.Session()
+            session.trust_env = trust_env
+            for host in hosts:
+                for page in range(1, 10):
+                    params = {
+                        "pn": page,
+                        "pz": 100,
+                        "po": 1,
+                        "np": 1,
+                        "fltt": 2,
+                        "invt": 2,
+                        "fid": "f3",
+                        "fs": fs,
+                        "fields": fields,
+                    }
+                    try:
+                        response = session.get(
+                            f"https://{host}/api/qt/clist/get",
+                            params=params,
+                            headers=headers,
+                            timeout=8,
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                    except Exception:
+                        break
+
+                    rows = (payload.get("data") or {}).get("diff") or []
+                    if not rows:
+                        break
+                    for row in rows:
+                        if str(row.get("f12", "")).strip().upper() != target_symbol:
+                            continue
+                        latest_price = pd.to_numeric(row.get("f2"), errors="coerce")
+                        if pd.isna(latest_price):
+                            return None
+                        quote_timestamp = pd.to_numeric(row.get("f124"), errors="coerce")
+                        if pd.isna(quote_timestamp):
+                            return None
+                        timestamp_value = float(quote_timestamp)
+                        if timestamp_value > 10_000_000_000:
+                            timestamp_value = timestamp_value / 1000
+                        quote_date = datetime.fromtimestamp(
+                            timestamp_value,
+                            tz=ZoneInfo(market_timezone),
+                        ).date()
+                        market = get_market_window(market_name)
+                        quote_noon = datetime.combine(
+                            quote_date,
+                            time(12, 0),
+                            tzinfo=ZoneInfo(market_timezone),
+                        )
+                        if market is not None and not is_market_trading_day(market, quote_noon):
+                            return None
+                        return pd.DataFrame(
+                            [{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}]
+                        )
+        return None
+    except Exception:
+        return None
+
+
+def append_eastmoney_clist_latest_index_row(
+    df: pd.DataFrame,
+    *,
+    board_symbol: str | None = None,
+    hk_em_symbol: str | None = None,
+) -> pd.DataFrame:
+    latest_row = fetch_eastmoney_clist_latest_index_row(
+        board_symbol=board_symbol,
+        hk_em_symbol=hk_em_symbol,
+    )
+    if latest_row is None or latest_row.empty:
+        return df
+    return merge_raw_index_data(df, latest_row)
+
+
 def append_eastmoney_latest_index_row(
     ak,
     df: pd.DataFrame,
@@ -374,37 +490,60 @@ def append_eastmoney_latest_index_row(
     hk_em_symbol: str | None = None,
 ) -> pd.DataFrame:
     """Append a same-day EastMoney spot quote when daily history is delayed."""
+    market_name = "港股" if hk_em_symbol else "A股"
+    market = get_market_window(market_name)
+    market_timezone = market.timezone if market is not None else ("Asia/Hong_Kong" if hk_em_symbol else "Asia/Shanghai")
+    market_now = datetime.now(ZoneInfo(market_timezone))
+    expected_date = expected_latest_trade_date(market, market_now) if market is not None else market_now.date()
+
     normalized = append_eastmoney_quote_row(df, secid)
     if normalized is None or normalized.empty:
         return normalized
+    normalized["trade_date"] = pd.to_datetime(normalized["trade_date"], errors="coerce")
+    valid_market_date = normalized["trade_date"].dt.date.map(
+        lambda day: market is None or (day.weekday() < 5 and not is_market_holiday(market, day))
+    )
+    normalized = normalized[
+        normalized["trade_date"].notna()
+        & (normalized["trade_date"].dt.date <= expected_date)
+        & valid_market_date
+    ].reset_index(drop=True)
+    if normalized.empty:
+        return normalized
 
-    market_timezone = "Asia/Hong_Kong" if hk_em_symbol else "Asia/Shanghai"
-    today = datetime.now(ZoneInfo(market_timezone)).date()
     latest_history_date = pd.to_datetime(normalized["trade_date"], errors="coerce").max().date()
-    if latest_history_date >= today:
+    if latest_history_date >= expected_date:
+        return normalized
+
+    normalized = append_eastmoney_clist_latest_index_row(
+        normalized,
+        board_symbol=board_symbol,
+        hk_em_symbol=hk_em_symbol,
+    )
+    latest_history_date = pd.to_datetime(normalized["trade_date"], errors="coerce").max().date()
+    if latest_history_date >= expected_date or ak is None:
         return normalized
 
     latest_price = None
     try:
         if board_symbol:
             spot_df = ak.stock_board_concept_spot_em(symbol=board_symbol)
-            matched = spot_df[spot_df["item"].astype(str) == "最新"]
+            matched = spot_df[spot_df["item"].astype(str) == "\u6700\u65b0"]
             if not matched.empty:
                 latest_price = matched.iloc[0].get("value")
         elif hk_em_symbol:
             spot_df = ak.stock_hk_index_spot_em()
-            matched = spot_df[spot_df["代码"].astype(str).str.upper() == hk_em_symbol.upper()]
+            matched = spot_df[spot_df["\u4ee3\u7801"].astype(str).str.upper() == hk_em_symbol.upper()]
             if not matched.empty:
-                latest_price = matched.iloc[0].get("最新价")
+                latest_price = matched.iloc[0].get("\u6700\u65b0\u4ef7")
     except Exception:
         return normalized
 
     latest_price = pd.to_numeric(latest_price, errors="coerce")
     if pd.isna(latest_price):
         return normalized
-    supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+    supplement = pd.DataFrame([{"trade_date": pd.Timestamp(expected_date), "close": float(latest_price)}])
     return pd.concat([normalized, supplement], ignore_index=True)
-
 
 def append_hk_index_spot_row(
     ak,

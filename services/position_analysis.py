@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -29,6 +31,7 @@ from services.futures_spread import (
     parse_contracts,
     spread_respects_contract_cutoffs,
 )
+from services.market_calendar import expected_latest_trade_date, get_market_window
 
 
 DEFAULT_ETF_CODES = ["512890", "159201", "159545", "513260", "159655", "159501", "518850"]
@@ -94,14 +97,20 @@ def _current_cache_time_text() -> str:
     return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _cache_has_today(df: pd.DataFrame | None, date_column: str = "date") -> bool:
+def _cache_has_expected_trade_date(
+    df: pd.DataFrame | None,
+    date_column: str = "date",
+    market_now: datetime | None = None,
+) -> bool:
     if df is None or df.empty or date_column not in df.columns:
         return False
     dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
     if dates.empty:
         return False
-    today = pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
-    return dates.max().normalize() >= today
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    expected_date = expected_latest_trade_date(market, market_now) if market is not None else market_now.date()
+    return dates.max().date() >= expected_date
 
 
 def _futures_option_cache_key(symbol: str, data_type: str, period: str, count: int) -> str:
@@ -282,7 +291,7 @@ def load_or_fetch_spread(
     cache_symbol = f"futures_spread_{base_contract}"
     cached_df, cache_meta = _load_dataset_if_ready(cache_symbol, "akshare", "futures_spread")
     cache_ready = _spread_cache_matches_contracts(cached_df, contracts, base_contract)
-    refresh_stale_cache = allow_fetch and cache_ready and not _cache_has_today(cached_df, "date")
+    refresh_stale_cache = allow_fetch and cache_ready and not _cache_has_expected_trade_date(cached_df, "date")
     source = "本地缓存"
     status = "缓存"
     error = ""
@@ -388,7 +397,7 @@ def load_or_fetch_option(
             cached_df, cache_meta = candidate_df, candidate_meta
             break
 
-    refresh_stale_cache = allow_fetch and cached_df is not None and not _cache_has_today(cached_df, "date")
+    refresh_stale_cache = allow_fetch and cached_df is not None and not _cache_has_expected_trade_date(cached_df, "date")
 
     if cached_df is not None and not force_refresh and not refresh_stale_cache:
         result_df = cached_df.copy()

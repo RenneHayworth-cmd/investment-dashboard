@@ -14,6 +14,8 @@ from core.db import finish_job, start_job
 from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date
 from services.index_ma20 import (
     INDEX_CONFIG,
+    append_eastmoney_latest_index_row,
+    extract_raw_from_export_df,
     build_export_df,
     fetch_index_from_source,
     fetch_one_index,
@@ -132,14 +134,25 @@ def run_index_ma20_update(
                 except Exception as exc:
                     cached_index_df = extract_cached_index_report(cached_df, index_name)
                     if cached_index_df is not None and not cached_index_df.empty:
+                        cached_index_df = refresh_cached_eastmoney_index_report(
+                            cached_index_df,
+                            index_name,
+                            index_config,
+                            days,
+                        )
+                        current_enough = has_current_index_quote(cached_index_df, index_name, index_config)
+                        status = "success" if current_enough else "cached"
+                        message = (
+                            "\u4e1c\u65b9\u8d22\u5bccK\u7ebf\u63a5\u53e3\u5931\u8d25\uff0c\u5df2\u4f7f\u7528\u672c\u5730\u5386\u53f2\u5e8f\u5217 + \u4e1c\u65b9\u8d22\u5bcc\u5217\u8868\u6700\u65b0\u4ef7\u8865\u9f50\u5f53\u5929\u6570\u636e"
+                            if current_enough
+                            else str(exc)
+                        )
                         all_data.append(cached_index_df)
-                        timings.append(build_timing_row(index_name, index_config, "cached", elapsed_seconds, str(exc)))
-                        if index_config.get("require_current_quote") and not has_current_index_quote(
-                            cached_index_df, index_name, index_config
-                        ):
-                            errors.append(build_stale_quote_message(index_name, index_config, cached_index_df, "已沿用本地缓存"))
+                        timings.append(build_timing_row(index_name, index_config, status, elapsed_seconds, message))
+                        if index_config.get("require_current_quote") and not current_enough:
+                            errors.append(build_stale_quote_message(index_name, index_config, cached_index_df, "\u5df2\u6cbf\u7528\u672c\u5730\u7f13\u5b58"))
                         if progress_callback:
-                            progress_callback(index_name, completed, total, "cached", elapsed_seconds)
+                            progress_callback(index_name, completed, total, status, elapsed_seconds)
                     elif index_config.get("optional"):
                         timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds, str(exc)))
                         if progress_callback:
@@ -258,6 +271,37 @@ def extract_cached_index_report(cached_df: pd.DataFrame | None, index_name: str)
     if result.empty:
         return None
     return result
+
+
+def refresh_cached_eastmoney_index_report(
+    cached_index_df: pd.DataFrame,
+    index_name: str,
+    index_config: dict,
+    days: int,
+) -> pd.DataFrame:
+    if index_config.get("source") != "eastmoney_kline":
+        return cached_index_df
+
+    raw_df = extract_raw_from_export_df(cached_index_df, index_name)
+    if raw_df is None or raw_df.empty:
+        return cached_index_df
+
+    refreshed_raw = append_eastmoney_latest_index_row(
+        None,
+        raw_df,
+        str(index_config.get("code") or ""),
+        board_symbol=index_config.get("akshare_board_symbol"),
+        hk_em_symbol=index_config.get("akshare_hk_em_symbol"),
+    )
+    refreshed_df = build_export_df(refreshed_raw, index_name, days=days)
+    if refreshed_df is None or refreshed_df.empty:
+        return cached_index_df
+
+    cached_latest = latest_index_trade_date(cached_index_df, index_name)
+    refreshed_latest = latest_index_trade_date(refreshed_df, index_name)
+    if cached_latest is None or refreshed_latest is None or refreshed_latest >= cached_latest:
+        return refreshed_df
+    return cached_index_df
 
 
 def latest_index_trade_date(df: pd.DataFrame | None, index_name: str) -> pd.Timestamp | None:

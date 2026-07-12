@@ -7,6 +7,18 @@ from core.db import get_conn
 from core.paths import RAW_DIR
 
 
+def latest_trade_date_text(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    for date_column in ("trade_date", "日期", "date", "datetime"):
+        if date_column not in df.columns:
+            continue
+        dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
+        if not dates.empty:
+            return str(dates.max().date())
+    return ""
+
+
 def save_dataset(
     symbol: str,
     name: str,
@@ -22,11 +34,7 @@ def save_dataset(
     file_path = source_dir / f"{safe_symbol}_{period}.csv"
     df.to_csv(file_path, index=False, encoding="utf-8-sig")
 
-    last_trade_date = ""
-    for date_column in ("trade_date", "日期"):
-        if date_column in df.columns and not df.empty:
-            last_trade_date = str(pd.to_datetime(df[date_column]).max().date())
-            break
+    last_trade_date = latest_trade_date_text(df)
 
     conn = get_conn()
     conn.execute(

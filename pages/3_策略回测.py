@@ -12,7 +12,19 @@ from services.fund_analysis import (
     infer_tickflow_symbol,
     read_uploaded_table,
 )
-from services.fund_rotation import normalize_rotation_dataframe, run_fund_rotation_backtest, run_ma20_timing_backtest
+from services.fund_rotation import (
+    EXECUTION_AFTER_CLOSE,
+    EXECUTION_NEXT_OPEN,
+    build_standard_backtest_periods,
+    normalize_rotation_dataframe,
+    run_fund_rotation_backtest,
+    run_ma20_timing_backtest,
+)
+
+
+FULL_HISTORY_COUNT = 10000
+FULL_HISTORY_CACHE_PERIOD = "full_1d"
+LEGACY_CACHE_PERIODS = ("10000_1d", "5000_1d")
 
 
 def format_value(value, suffix: str = "") -> str:
@@ -36,6 +48,116 @@ def format_cache_time(value: str | None) -> str:
         return str(value).replace("T", " ")
 
 
+def default_backtest_dates() -> tuple[object, object]:
+    end_date = pd.Timestamp.today().normalize()
+    start_date = end_date - pd.DateOffset(years=5)
+    return start_date.date(), end_date.date()
+
+
+def load_rotation_cache(cache_symbol: str):
+    for period in (FULL_HISTORY_CACHE_PERIOD, *LEGACY_CACHE_PERIODS):
+        cached_df, cache_meta = load_dataset(
+            cache_symbol,
+            "tickflow_fund_rotation",
+            "fund_rotation_raw",
+            period=period,
+        )
+        if cached_df is not None:
+            return cached_df, cache_meta, period
+    return None, None, FULL_HISTORY_CACHE_PERIOD
+
+
+def build_timing_period_table(
+    fund,
+    end_date,
+    *,
+    ma_period: int,
+    threshold_pct: float,
+    initial_capital: float,
+    transaction_cost: float,
+    lot_size: int,
+) -> pd.DataFrame:
+    rows = []
+    for label, period_start in build_standard_backtest_periods(end_date):
+        try:
+            period_result = run_ma20_timing_backtest(
+                fund=fund,
+                ma_period=ma_period,
+                threshold_pct=threshold_pct,
+                initial_capital=initial_capital,
+                transaction_cost=transaction_cost,
+                lot_size=lot_size,
+                start_date=period_start,
+                end_date=end_date,
+            )
+            summary = period_result.summary
+            rows.append(
+                {
+                    "区间": label,
+                    "实际开始": summary.get("开始日期"),
+                    "实际结束": summary.get("结束日期"),
+                    "总收益率(%)": summary.get("总收益率(%)"),
+                    "年化收益率(%)": summary.get("年化收益率(%)"),
+                    "策略最大回撤(%)": summary.get("策略最大回撤(%)"),
+                    "一直持有最大回撤(%)": summary.get("一直持有最大回撤(%)"),
+                    "夏普比率": summary.get("夏普比率"),
+                    "交易胜率(%)": summary.get("交易胜率(%)"),
+                    "交易次数": summary.get("交易次数"),
+                    "一直持有收益率(%)": summary.get("一直持有收益率(%)"),
+                    "超额收益(%)": summary.get("超额收益(%)"),
+                }
+            )
+        except Exception as exc:
+            rows.append({"区间": label, "说明": str(exc)})
+    return pd.DataFrame(rows)
+
+
+def build_rotation_period_table(
+    funds,
+    end_date,
+    *,
+    frequency: str,
+    lookback_period: int,
+    num_positions: int,
+    initial_capital: float,
+    transaction_cost: float,
+    execution_mode: str,
+) -> pd.DataFrame:
+    rows = []
+    for label, period_start in build_standard_backtest_periods(end_date):
+        try:
+            period_result = run_fund_rotation_backtest(
+                funds=funds,
+                frequency=frequency,
+                lookback_period=lookback_period,
+                num_positions=num_positions,
+                initial_capital=initial_capital,
+                transaction_cost=transaction_cost,
+                start_date=period_start,
+                end_date=end_date,
+                execution_mode=execution_mode,
+            )
+            summary = period_result.summary
+            rows.append(
+                {
+                    "区间": label,
+                    "实际开始": summary.get("开始日期"),
+                    "实际结束": summary.get("结束日期"),
+                    "成交方式": summary.get("成交方式"),
+                    "总收益率(%)": summary.get("总收益率(%)"),
+                    "年化收益率(%)": summary.get("年化收益率(%)"),
+                    "策略最大回撤(%)": summary.get("策略最大回撤(%)"),
+                    "夏普比率": summary.get("夏普比率"),
+                    "交易胜率(%)": summary.get("交易胜率(%)"),
+                    "调仓次数": summary.get("调仓次数"),
+                    "期末资金": summary.get("期末资金"),
+                }
+            )
+        except Exception as exc:
+            rows.append({"区间": label, "说明": str(exc)})
+    return pd.DataFrame(rows)
+
+
 def render_nav_chart(nav_df: pd.DataFrame, individual_df: pd.DataFrame | None = None) -> None:
     fig = go.Figure()
     fig.add_trace(
@@ -54,9 +176,9 @@ def render_nav_chart(nav_df: pd.DataFrame, individual_df: pd.DataFrame | None = 
             fig.add_trace(
                 go.Scatter(
                     x=group["日期"],
-                    y=group["单独持有净值"],
+                    y=group["一直持有净值"],
                     mode="lines",
-                    name=f"单独持有：{label}",
+                    name=f"一直持有：{label}",
                     hovertemplate="%{x|%Y-%m-%d}<br>净值=%{y:.2f}<extra></extra>",
                     line=dict(width=1.6, dash="dot"),
                 )
@@ -110,9 +232,9 @@ def render_timing_nav_chart(result_df: pd.DataFrame) -> None:
     fig.add_trace(
         go.Scatter(
             x=result_df["日期"],
-            y=result_df["单独持有净值"],
+            y=result_df["一直持有净值"],
             mode="lines",
-            name="单独持有",
+            name="一直持有",
             hovertemplate="%{x|%Y-%m-%d}<br>账户净值=%{y:.2f}<extra></extra>",
             line=dict(width=1.8, color="#4b5563", dash="dot"),
         )
@@ -203,6 +325,7 @@ def render_timing_signal_chart(result_df: pd.DataFrame, trades_df: pd.DataFrame,
 
 
 def render_ma20_timing_mode() -> None:
+    default_start_date, default_end_date = default_backtest_dates()
     with st.sidebar:
         st.subheader("MA20择时参数")
         ma_period = st.number_input("均线周期", min_value=2, max_value=250, value=20, step=1)
@@ -223,17 +346,29 @@ def render_ma20_timing_mode() -> None:
             key="ma20_timing_transaction_cost_bp",
         )
         timing_lot_size = st.number_input("交易单位", min_value=1, max_value=10000, value=100, step=100)
+        st.subheader("回测区间")
+        timing_start_date = st.date_input(
+            "开始日期",
+            value=default_start_date,
+            key="ma20_timing_start_date",
+        )
+        timing_end_date = st.date_input(
+            "结束日期",
+            value=default_end_date,
+            key="ma20_timing_end_date",
+        )
 
     with st.form("ma20_timing_form"):
         code = st.text_input("场内基金/ETF代码", value="512890", placeholder="例如 512890、159915 或 512890.SH")
-        count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0)
         api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
-        force_refresh = st.checkbox("联网更新数据", value=False)
         run_clicked = st.form_submit_button("运行MA20择时回测", type="primary")
 
     if not run_clicked:
         st.info("默认用 512890 跑 MA20 择时；信号按当日收盘价和 MA20 缓冲带比较，成交价也使用当日收盘价。")
+        return
+    if pd.Timestamp(timing_start_date) > pd.Timestamp(timing_end_date):
+        st.error("开始日期不能晚于结束日期。")
         return
 
     try:
@@ -241,25 +376,13 @@ def render_ma20_timing_mode() -> None:
         adjust_map = {"前复权": "forward", "后复权": "backward"}
         adjust_value = adjust_map[adjust_option]
         cache_symbol = f"fund_rotation_{symbol}_{adjust_value}"
-        cache_period = f"{int(count)}_1d"
-        cached_df, cache_meta = load_dataset(
-            cache_symbol,
-            "tickflow_fund_rotation",
-            "fund_rotation_raw",
-            period=cache_period,
-        )
-        if cached_df is not None and not force_refresh:
-            raw_df = cached_df
-            st.info(
-                f"{symbol} 已使用本地缓存，缓存时间："
-                f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
-            )
-        else:
+        cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
+        try:
             with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."):
                 raw_df = fetch_tickflow_fund_close(
                     symbol=symbol,
                     api_key=api_key,
-                    count=int(count),
+                    count=FULL_HISTORY_COUNT,
                     adjust=adjust_value,
                 )
             save_dataset(
@@ -268,9 +391,18 @@ def render_ma20_timing_mode() -> None:
                 "tickflow_fund_rotation",
                 "fund_rotation_raw",
                 raw_df,
-                period=cache_period,
+                period=FULL_HISTORY_CACHE_PERIOD,
             )
             st.success(f"{symbol} 已更新并保存到本地缓存。")
+        except Exception as fetch_exc:
+            if cached_df is None:
+                raise
+            raw_df = cached_df
+            st.warning(
+                f"{symbol} 联网更新失败，已改用本地缓存（缓存时间："
+                f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}）。"
+                f"原因：{fetch_exc}"
+            )
 
         fund = normalize_rotation_dataframe(raw_df, fallback_name=f"{symbol} {adjust_option}")
         result = run_ma20_timing_backtest(
@@ -280,24 +412,46 @@ def render_ma20_timing_mode() -> None:
             initial_capital=float(timing_initial_capital),
             transaction_cost=float(timing_transaction_cost_bp) / 10000,
             lot_size=int(timing_lot_size),
+            start_date=timing_start_date,
+            end_date=timing_end_date,
         )
     except Exception as exc:
         st.error(f"MA20择时回测出错：{exc}")
         return
 
     summary = result.summary
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(6)
     metric_cols[0].metric("总收益率", format_value(summary.get("总收益率(%)"), "%"))
-    metric_cols[1].metric("单独持有收益", format_value(summary.get("单独持有收益率(%)"), "%"))
+    metric_cols[1].metric("一直持有收益", format_value(summary.get("一直持有收益率(%)"), "%"))
     metric_cols[2].metric("超额收益", format_value(summary.get("超额收益(%)"), "%"))
-    metric_cols[3].metric("最大回撤", format_value(summary.get("最大回撤(%)"), "%"))
-    metric_cols[4].metric("最新信号", str(summary.get("最新信号", "-")))
+    metric_cols[3].metric("策略最大回撤", format_value(summary.get("策略最大回撤(%)"), "%"))
+    metric_cols[4].metric("一直持有最大回撤", format_value(summary.get("一直持有最大回撤(%)"), "%"))
+    metric_cols[5].metric("最新信号", str(summary.get("最新信号", "-")))
 
-    detail_cols = st.columns(4)
+    detail_cols = st.columns(5)
     detail_cols[0].metric("年化收益率", format_value(summary.get("年化收益率(%)"), "%"))
     detail_cols[1].metric("夏普比率", format_value(summary.get("夏普比率")))
-    detail_cols[2].metric("交易次数", format_value(summary.get("交易次数")))
-    detail_cols[3].metric("回测区间", f"{summary.get('开始日期')} → {summary.get('结束日期')}")
+    detail_cols[2].metric("交易胜率", format_value(summary.get("交易胜率(%)"), "%"))
+    detail_cols[3].metric("交易次数", format_value(summary.get("交易次数")))
+    detail_cols[4].metric("回测区间", f"{summary.get('开始日期')} → {summary.get('结束日期')}")
+
+    period_df = build_timing_period_table(
+        fund,
+        result.end_date,
+        ma_period=int(ma_period),
+        threshold_pct=float(timing_threshold_pct),
+        initial_capital=float(timing_initial_capital),
+        transaction_cost=float(timing_transaction_cost_bp) / 10000,
+        lot_size=int(timing_lot_size),
+    )
+    st.subheader("分期回测结果")
+    st.dataframe(period_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "下载分期回测结果 CSV",
+        data=to_csv_bytes(period_df),
+        file_name="ma20_timing_period_results.csv",
+        mime="text/csv",
+    )
 
     tab_nav, tab_signal, tab_drawdown, tab_trades, tab_daily, tab_summary = st.tabs(
         ["净值走势", "标的与信号", "回撤分析", "交易明细", "每日数据", "摘要"]
@@ -331,15 +485,15 @@ def render_ma20_timing_mode() -> None:
     with tab_daily:
         st.dataframe(result.data, use_container_width=True, hide_index=True)
     with tab_summary:
-        summary_df = pd.DataFrame([{"指标": key, "数值": value} for key, value in summary.items()])
+        summary_df = pd.DataFrame([{"指标": key, "数值": str(value)} for key, value in summary.items()])
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 
-st.set_page_config(page_title="基金轮动", layout="wide")
+st.set_page_config(page_title="策略回测", layout="wide")
 init_db()
 
-st.title("基金轮动")
-st.caption("上传文件，或输入场内/场外基金代码获取数据，按 22 个交易日动量逻辑满仓轮动。场内 ETF 按开盘价成交并计滑点，场外基金按累计净值成交。")
+st.title("策略回测")
+st.caption("上传文件，或输入场内/场外基金代码获取数据，按动量排名执行轮动；可选择盘后固定价或次日开盘成交。")
 
 st.markdown(
     """
@@ -367,11 +521,11 @@ if strategy_mode == "单标的MA20择时":
 uploaded_files = []
 tickflow_codes = ""
 eastmoney_codes = ""
-count = 5000
 adjust_option = "前复权"
 api_key = ""
 max_workers = 8
 force_refresh = False
+default_start_date, default_end_date = default_backtest_dates()
 
 st.subheader("数据来源")
 data_source = st.radio("数据来源", options=["上传文件", "TickFlow获取", "场外基金"], index=0, horizontal=True)
@@ -390,7 +544,6 @@ with st.form("fund_rotation_data_form"):
             height=96,
             placeholder="可输入 159915 512890，或 159915.SZ 512890.SH",
         )
-        count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0)
         api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         force_refresh = st.checkbox("联网更新数据", value=False)
@@ -406,6 +559,21 @@ with st.form("fund_rotation_data_form"):
 
 with st.sidebar:
     st.subheader("回测参数")
+    execution_label = st.selectbox(
+        "调仓成交方式",
+        options=["盘后固定价", "次日开盘"],
+        index=0,
+        help=(
+            "盘后固定价：调仓日收盘后用当日收盘价计算动量，并按同一收盘价模拟成交。"
+            "该机制自2026-07-06起扩展至全部A股和ETF；历史区间结果属于按当前规则的模拟，"
+            "且假设委托全部成交。"
+        ),
+    )
+    execution_mode = (
+        EXECUTION_AFTER_CLOSE
+        if execution_label == "盘后固定价"
+        else EXECUTION_NEXT_OPEN
+    )
     frequency_label = st.selectbox("轮动频率", options=["每周一", "每月1号"], index=0)
     lookback_period = st.number_input("动量周期", min_value=1, max_value=500, value=22, step=1)
     num_positions = st.number_input("持仓数量", min_value=1, max_value=20, value=1, step=1)
@@ -416,6 +584,17 @@ with st.sidebar:
         value=0.6,
         step=0.1,
         key=f"rotation_transaction_cost_bp_{data_source}",
+    )
+    st.subheader("回测区间")
+    rotation_start_date = st.date_input(
+        "开始日期",
+        value=default_start_date,
+        key="rotation_start_date",
+    )
+    rotation_end_date = st.date_input(
+        "结束日期",
+        value=default_end_date,
+        key="rotation_end_date",
     )
 
 if data_source == "上传文件" and not uploaded_files:
@@ -431,7 +610,13 @@ if data_source == "场外基金" and not eastmoney_codes.strip():
     st.stop()
 
 if not run_clicked:
-    st.info("参数设置完成后点击「运行轮动回测」。当前策略为始终满仓，信号用前一交易日收盘计算，调仓按开盘价成交并计入买卖滑点。")
+    if execution_mode == EXECUTION_AFTER_CLOSE:
+        st.info("参数设置完成后点击「运行轮动回测」。盘后固定价模式使用调仓日收盘价计算动量，并按同一收盘价模拟成交。")
+    else:
+        st.info("参数设置完成后点击「运行轮动回测」。次日开盘模式使用前一交易日收盘价计算动量，并按开盘价成交。")
+    st.stop()
+if pd.Timestamp(rotation_start_date) > pd.Timestamp(rotation_end_date):
+    st.error("开始日期不能晚于结束日期。")
     st.stop()
 
 try:
@@ -466,6 +651,7 @@ try:
                         )
                     fund = normalize_rotation_dataframe(raw_df, fallback_name=f"{code} 场外基金")
                     fund.trade_lot_size = 0
+                    fund.apply_slippage = False
                     funds.append(fund)
                 except Exception as exc:
                     errors.append(f"{code}: {exc}")
@@ -484,13 +670,7 @@ try:
                 try:
                     symbol = infer_tickflow_symbol(code)
                     cache_symbol = f"fund_rotation_{symbol}_{adjust_value}"
-                    cache_period = f"{int(count)}_1d"
-                    cached_df, cache_meta = load_dataset(
-                        cache_symbol,
-                        "tickflow_fund_rotation",
-                        "fund_rotation_raw",
-                        period=cache_period,
-                    )
+                    cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
                     if cached_df is not None and not force_refresh:
                         raw_df = cached_df
                         st.info(
@@ -502,7 +682,7 @@ try:
                             raw_df = fetch_tickflow_fund_close(
                                 symbol=symbol,
                                 api_key=api_key,
-                                count=int(count),
+                                count=FULL_HISTORY_COUNT,
                                 adjust=adjust_value,
                             )
                         save_dataset(
@@ -511,7 +691,7 @@ try:
                             "tickflow_fund_rotation",
                             "fund_rotation_raw",
                             raw_df,
-                            period=cache_period,
+                            period=FULL_HISTORY_CACHE_PERIOD,
                         )
                         st.success(f"{symbol} 已更新并保存到本地缓存。")
                     funds.append(normalize_rotation_dataframe(raw_df, fallback_name=f"{symbol} {adjust_option}"))
@@ -532,33 +712,59 @@ try:
         num_positions=int(num_positions),
         initial_capital=float(initial_capital),
         transaction_cost=float(transaction_cost_bp) / 10000,
+        start_date=rotation_start_date,
+        end_date=rotation_end_date,
+        execution_mode=execution_mode,
     )
 except Exception as exc:
     st.error(f"回测执行出错：{exc}")
     st.stop()
 
 summary = result.summary
+if execution_mode == EXECUTION_AFTER_CLOSE:
+    st.caption("盘后固定价回测假设委托可按收盘价全部成交，未模拟时间优先排队导致的部分成交或未成交。")
 metric_cols = st.columns(5)
 with metric_cols[0]:
     st.metric("总收益率", format_value(summary.get("总收益率(%)"), "%"))
 with metric_cols[1]:
     st.metric("年化收益率", format_value(summary.get("年化收益率(%)"), "%"))
 with metric_cols[2]:
-    st.metric("最大回撤", format_value(summary.get("最大回撤(%)"), "%"))
+    st.metric("策略最大回撤", format_value(summary.get("策略最大回撤(%)"), "%"))
 with metric_cols[3]:
     st.metric("期末资金", format_value(summary.get("期末资金")))
 with metric_cols[4]:
     st.metric("调仓次数", format_value(summary.get("调仓次数")))
 
-cost_cols = st.columns(4)
+cost_cols = st.columns(5)
 with cost_cols[0]:
     st.metric("年化波动率", format_value(summary.get("年化波动率(%)"), "%"))
 with cost_cols[1]:
     st.metric("夏普比率", format_value(summary.get("夏普比率")))
 with cost_cols[2]:
-    st.metric("累计总成本", format_value(summary.get("累计总成本")))
+    st.metric("交易胜率", format_value(summary.get("交易胜率(%)"), "%"))
 with cost_cols[3]:
+    st.metric("累计总成本", format_value(summary.get("累计总成本")))
+with cost_cols[4]:
     st.metric("回测区间", f"{summary.get('开始日期')} → {summary.get('结束日期')}")
+
+period_df = build_rotation_period_table(
+    funds,
+    result.end_date,
+    frequency=frequency,
+    lookback_period=int(lookback_period),
+    num_positions=int(num_positions),
+    initial_capital=float(initial_capital),
+    transaction_cost=float(transaction_cost_bp) / 10000,
+    execution_mode=execution_mode,
+)
+st.subheader("分期回测结果")
+st.dataframe(period_df, use_container_width=True, hide_index=True)
+st.download_button(
+    "下载分期回测结果 CSV",
+    data=to_csv_bytes(period_df),
+    file_name="fund_rotation_period_results.csv",
+    mime="text/csv",
+)
 
 tab_nav, tab_drawdown, tab_trades, tab_daily, tab_summary = st.tabs(
     ["净值走势", "回撤分析", "交易明细", "每日持仓", "摘要"]
@@ -604,9 +810,9 @@ with tab_daily:
     )
 
 with tab_summary:
-    summary_df = pd.DataFrame([{"指标": key, "数值": value} for key, value in summary.items()])
+    summary_df = pd.DataFrame([{"指标": key, "数值": str(value)} for key, value in summary.items()])
     st.subheader("策略摘要")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
     if not result.individual_results.empty:
-        st.subheader("单只持有对比")
+        st.subheader("一直持有对比")
         st.dataframe(result.individual_results, use_container_width=True, hide_index=True)
