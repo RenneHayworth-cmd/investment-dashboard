@@ -5,7 +5,13 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from services.market_calendar import expected_latest_trade_date, get_market_window, is_market_holiday, is_market_trading_day
+from services.market_calendar import (
+    expected_latest_trade_date,
+    get_market_window,
+    is_market_holiday,
+    is_market_trading_day,
+    latest_completed_trade_date,
+)
 
 
 INDEX_CONFIG = {
@@ -60,7 +66,7 @@ INDEX_CONFIG = {
         "market_group": "A股",
     },
     "国证自由现金流": {
-        "source": "akshare_cn",
+        "source": "akshare_cni",
         "code": "980092",
         "market": "sz",
         "market_group": "A股",
@@ -159,6 +165,70 @@ INDEX_CONFIG = {
 }
 
 
+INDEX_LONG_HISTORY_SOURCE = "index_long_history"
+INDEX_LONG_HISTORY_BARS = 20000
+
+
+def filter_market_trading_dates(
+    df: pd.DataFrame | None,
+    market_name: str,
+    date_column: str = "trade_date",
+) -> pd.DataFrame | None:
+    if df is None or df.empty or date_column not in df.columns:
+        return df
+    market = get_market_window(market_name)
+    if market is None:
+        return df
+
+    result = df.copy()
+    result[date_column] = pd.to_datetime(result[date_column], errors="coerce")
+    valid_dates = result[date_column].dt.date.map(
+        lambda day: not pd.isna(day) and day.weekday() < 5 and not is_market_holiday(market, day)
+    )
+    return result[result[date_column].notna() & valid_dates].reset_index(drop=True)
+
+
+def filter_completed_market_dates(
+    df: pd.DataFrame | None,
+    market_name: str,
+    date_column: str = "trade_date",
+) -> pd.DataFrame | None:
+    result = filter_market_trading_dates(df, market_name, date_column=date_column)
+    if result is None or result.empty or date_column not in result.columns:
+        return result
+    market = get_market_window(market_name)
+    if market is None:
+        return result
+    market_now = datetime.now(ZoneInfo(market.timezone))
+    completed_date = latest_completed_trade_date(market, market_now)
+    dates = pd.to_datetime(result[date_column], errors="coerce")
+    return result[dates.dt.date <= completed_date].reset_index(drop=True)
+
+
+def sanitize_index_report_market_dates(report_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if report_df is None or report_df.empty or "日期" not in report_df.columns:
+        return report_df
+
+    result = report_df.copy()
+    dates = pd.to_datetime(result["日期"], errors="coerce")
+    for index_name, index_config in INDEX_CONFIG.items():
+        market = get_market_window(str(index_config.get("market_group") or ""))
+        if market is None:
+            continue
+        index_columns = [column for column in result.columns if str(column).startswith(f"{index_name}_")]
+        if not index_columns:
+            continue
+        valid_dates = dates.dt.date.map(
+            lambda day: not pd.isna(day) and day.weekday() < 5 and not is_market_holiday(market, day)
+        )
+        result.loc[dates.isna() | ~valid_dates, index_columns] = pd.NA
+
+    value_columns = [column for column in result.columns if column != "日期"]
+    result = result.dropna(how="all", subset=value_columns)
+    result["日期"] = dates.loc[result.index].dt.strftime("%Y-%m-%d")
+    return result.sort_values("日期").reset_index(drop=True)
+
+
 def build_export_df(df: pd.DataFrame, index_name: str, days: int = 30) -> pd.DataFrame | None:
     if df is None or df.empty:
         return None
@@ -254,9 +324,14 @@ def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd
 
     normalized = df.copy()
     normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    market = get_market_window("A股")
+    market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    expected_date = expected_latest_trade_date(market, market_now) if market is not None else market_now.date()
+    normalized = filter_market_trading_dates(normalized, "A股")
+    if normalized is None or normalized.empty:
+        return normalized
     latest_history_date = normalized["trade_date"].max().date()
-    today = datetime.now().date()
-    if latest_history_date >= today:
+    if latest_history_date >= expected_date:
         return normalized
 
     latest_price = None
@@ -285,7 +360,7 @@ def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd
 
     latest_price = pd.to_numeric(latest_price, errors="coerce")
     if not pd.isna(latest_price):
-        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(expected_date), "close": float(latest_price)}])
         return pd.concat([normalized, supplement], ignore_index=True)
 
     yahoo_df = fetch_yahoo_latest_index_row(f"{index_code}.SS")
@@ -355,6 +430,11 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: b
         if quote_timestamp_value > 10_000_000_000:
             quote_timestamp_value = quote_timestamp_value / 1000
         quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
+        market_name = "港股" if str(secid).startswith(("124.", "125.", "305.")) else "A股"
+        quote_frame = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
+        filtered_quote = filter_market_trading_dates(quote_frame, market_name)
+        if filtered_quote is None or filtered_quote.empty:
+            return normalized
         if quote_date < latest_history_date:
             return normalized
         if quote_date == latest_history_date:
@@ -561,9 +641,14 @@ def append_hk_index_spot_row(
         if quoted is not None and not quoted.empty:
             normalized = quoted
 
+    normalized = filter_market_trading_dates(normalized, "港股")
+    if normalized is None or normalized.empty:
+        return normalized
+    market = get_market_window("港股")
+    market_now = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+    expected_date = expected_latest_trade_date(market, market_now) if market is not None else market_now.date()
     latest_history_date = normalized["trade_date"].max().date()
-    today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
-    if latest_history_date >= today:
+    if latest_history_date >= expected_date:
         return normalized
 
     try:
@@ -576,7 +661,7 @@ def append_hk_index_spot_row(
         latest_price = pd.to_numeric(matched.iloc[0][price_col], errors="coerce")
         if pd.isna(latest_price):
             return normalized
-        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(expected_date), "close": float(latest_price)}])
         return pd.concat([normalized, supplement], ignore_index=True)
     except Exception:
         return normalized
@@ -588,9 +673,14 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
 
     normalized = df.copy()
     normalized["trade_date"] = pd.to_datetime(normalized["trade_date"])
+    normalized = filter_market_trading_dates(normalized, "A股")
+    if normalized is None or normalized.empty:
+        return normalized
+    market = get_market_window("A股")
+    market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    expected_date = expected_latest_trade_date(market, market_now) if market is not None else market_now.date()
     latest_history_date = normalized["trade_date"].max().date()
-    today = datetime.now().date()
-    if latest_history_date >= today:
+    if latest_history_date >= expected_date:
         return normalized
 
     try:
@@ -607,7 +697,7 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
         latest_price = pd.to_numeric(spot_df.iloc[0][price_col], errors="coerce")
         if pd.isna(latest_price):
             return normalized
-        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(today), "close": float(latest_price)}])
+        supplement = pd.DataFrame([{"trade_date": pd.Timestamp(expected_date), "close": float(latest_price)}])
         return pd.concat([normalized, supplement], ignore_index=True)
     except Exception:
         return normalized
@@ -689,6 +779,21 @@ def get_index_data_from_akshare_cn(
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"{index_name} AkShare 获取失败：{last_error}")
+
+
+def get_index_data_from_akshare_cni(index_code: str, index_name: str, days: int = 30):
+    import akshare as ak
+
+    lookback_days = max(int(days) + 30, 120)
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
+    raw_df = ak.index_hist_cni(
+        symbol=index_code,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    df = normalize_akshare_index_df(raw_df)
+    return build_export_df(df, index_name, days=days)
 
 
 def extract_raw_from_export_df(export_df: pd.DataFrame, index_name: str) -> pd.DataFrame | None:
@@ -1024,6 +1129,8 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
             days=days,
             eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
         )
+    if source == "akshare_cni":
+        return get_index_data_from_akshare_cni(code, index_name, days=days)
     if source == "akshare_csindex":
         return get_index_data_from_akshare_csindex(code, index_name, days=days)
     if source == "akshare_us":
@@ -1063,28 +1170,131 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
     raise ValueError(f"未知数据源：{source}")
 
 
+def _append_unseen_raw_history(old_df: pd.DataFrame | None, new_df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if new_df is None or new_df.empty:
+        return merge_raw_index_data(None, old_df) if old_df is not None and not old_df.empty else None
+    normalized_new = merge_raw_index_data(None, new_df)
+    if old_df is None or old_df.empty:
+        return normalized_new
+
+    normalized_old = merge_raw_index_data(None, old_df)
+    unseen = normalized_new[~normalized_new["trade_date"].isin(normalized_old["trade_date"])]
+    if unseen.empty:
+        return normalized_old
+    return pd.concat([normalized_old, unseen], ignore_index=True).sort_values("trade_date").reset_index(drop=True)
+
+
+def _latest_completed_date_for_market(market_name: str):
+    market = get_market_window(market_name)
+    if market is None:
+        return None
+    market_now = datetime.now(ZoneInfo(market.timezone))
+    return latest_completed_trade_date(market, market_now)
+
+
+def _latest_raw_date(df: pd.DataFrame | None):
+    if df is None or df.empty or "trade_date" not in df.columns:
+        return None
+    dates = pd.to_datetime(df["trade_date"], errors="coerce").dropna()
+    return dates.max().date() if not dates.empty else None
+
+
 def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.DataFrame | None:
     if not isinstance(index_config, dict):
         return None
 
+    from core.cache import load_dataset, save_dataset
+
+    cache_symbol = raw_cache_symbol(index_name, index_config)
+    market_name = str(index_config.get("market_group") or "")
+    long_cached_raw, _ = load_dataset(
+        cache_symbol,
+        INDEX_LONG_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    long_cached_raw = filter_completed_market_dates(long_cached_raw, market_name)
+    accumulated_raw, _ = load_dataset(
+        cache_symbol,
+        "index_history",
+        "index_daily_raw",
+    )
+    accumulated_raw = filter_completed_market_dates(accumulated_raw, market_name)
+
+    is_bootstrap = long_cached_raw is None or long_cached_raw.empty
+    combined_raw = accumulated_raw if is_bootstrap else long_cached_raw
+    target_date = _latest_completed_date_for_market(market_name)
+    cached_latest_date = _latest_raw_date(combined_raw)
+    if not is_bootstrap and target_date is not None and cached_latest_date is not None:
+        if cached_latest_date >= target_date:
+            return build_export_df(combined_raw, index_name, days=days)
+
+    missing_calendar_days = (
+        max((target_date - cached_latest_date).days, 1)
+        if target_date is not None and cached_latest_date is not None
+        else 30
+    )
+    incremental_days = max(missing_calendar_days + 7, 30)
+
+    fetched_raw_parts: list[pd.DataFrame] = []
     tickflow_symbol = index_config.get("tickflow_symbol")
     if tickflow_symbol:
         try:
-            df = get_index_data_from_tickflow("", tickflow_symbol, index_name, days=days)
-            if df is not None and not df.empty:
-                eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
-                if eastmoney_quote_secid:
-                    close_col = f"{index_name}_收盘价"
-                    raw_df = df[["日期", close_col]].rename(
-                        columns={"日期": "trade_date", close_col: "close"}
-                    )
-                    raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
-                    return build_export_df(raw_df, index_name, days=days)
-                return df
+            fetch_count = INDEX_LONG_HISTORY_BARS if is_bootstrap else max(missing_calendar_days * 2 + 10, 30)
+            tickflow_raw = get_index_raw_from_tickflow("", tickflow_symbol, count=fetch_count)
+            tickflow_raw = filter_completed_market_dates(tickflow_raw, market_name)
+            if tickflow_raw is not None and not tickflow_raw.empty:
+                fetched_raw_parts.append(tickflow_raw)
         except Exception:
             pass
 
-    return fetch_index_from_source(index_name, index_config, days=days)
+    tickflow_combined = combined_raw
+    for fetched_raw in fetched_raw_parts:
+        tickflow_combined = _append_unseen_raw_history(tickflow_combined, fetched_raw)
+    tickflow_latest_date = _latest_raw_date(tickflow_combined)
+    source_needed = (
+        is_bootstrap
+        or target_date is None
+        or tickflow_latest_date is None
+        or tickflow_latest_date < target_date
+    )
+    if source_needed:
+        try:
+            source_days = days if is_bootstrap else incremental_days
+            source_df = fetch_index_from_source(index_name, index_config, days=source_days)
+            source_raw = extract_raw_from_export_df(source_df, index_name)
+            source_raw = filter_completed_market_dates(source_raw, market_name)
+            if source_raw is not None and not source_raw.empty:
+                fetched_raw_parts.append(source_raw)
+        except Exception:
+            pass
+
+    original_row_count = 0 if combined_raw is None else len(combined_raw)
+    for fetched_raw in fetched_raw_parts:
+        combined_raw = _append_unseen_raw_history(combined_raw, fetched_raw)
+    combined_raw = filter_completed_market_dates(combined_raw, market_name)
+
+    if combined_raw is None or combined_raw.empty:
+        return None
+    if not fetched_raw_parts:
+        return build_export_df(combined_raw, index_name, days=days)
+    if not is_bootstrap and len(combined_raw) == original_row_count:
+        return build_export_df(combined_raw, index_name, days=days)
+
+    save_dataset(
+        symbol=cache_symbol,
+        name=f"{index_name} 指数累计日线",
+        source="index_history",
+        data_type="index_daily_raw",
+        df=combined_raw,
+    )
+    save_dataset(
+        symbol=cache_symbol,
+        name=f"{index_name} 指数长历史日线",
+        source=INDEX_LONG_HISTORY_SOURCE,
+        data_type="index_daily_raw",
+        df=combined_raw,
+    )
+    return build_export_df(combined_raw, index_name, days=days)
 
 
 def get_index_data_from_tickflow(api_key: str, index_code: str, index_name: str, days: int = 30):
@@ -1132,6 +1342,11 @@ def append_tickflow_quote_row(client, df: pd.DataFrame, index_code: str) -> pd.D
 
         quote_timestamp = quote_row.get("timestamp")
         quote_date = tickflow_quote_date(index_code, quote_timestamp)
+        market_name = "美股" if str(index_code).upper().endswith(".US") else "A股"
+        quote_frame = pd.DataFrame([{"trade_date": quote_date, "close": float(latest_price)}])
+        filtered_quote = filter_market_trading_dates(quote_frame, market_name)
+        if filtered_quote is None or filtered_quote.empty:
+            return normalized
         latest_history_date = normalized["trade_date"].max()
         if quote_date < latest_history_date:
             return normalized
@@ -1258,6 +1473,9 @@ def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30)
 
 
 def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
+    report_df = sanitize_index_report_market_dates(report_df)
+    if report_df is None or report_df.empty:
+        return pd.DataFrame()
     rows = []
     for index_name, index_config in INDEX_CONFIG.items():
         close_col = f"{index_name}_收盘价"
@@ -1265,29 +1483,34 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
         deviation_col = f"{index_name}_偏离率(%)"
         if close_col not in report_df.columns:
             continue
-        valid_rows = report_df.dropna(subset=[close_col, ma20_col])
-        if valid_rows.empty:
+        price_rows = report_df.dropna(subset=[close_col])
+        if price_rows.empty:
             continue
-        latest = valid_rows.iloc[-1]
+        latest = price_rows.iloc[-1]
+        indicator_rows = (
+            price_rows.dropna(subset=[ma20_col])
+            if ma20_col in price_rows.columns
+            else pd.DataFrame()
+        )
         show_deviation = index_config.get("show_ma20_deviation", True)
         transition_col = f"{index_name}_状态转变时间"
         interval_col = f"{index_name}_区间涨幅(%)"
         transition_date, interval_return_pct = (pd.NA, pd.NA)
-        if show_deviation:
+        if show_deviation and not indicator_rows.empty:
             if transition_col in latest and interval_col in latest and not pd.isna(latest[transition_col]):
                 transition_date = latest[transition_col]
                 interval_return_pct = latest[interval_col]
             else:
                 transition_date, interval_return_pct = calculate_ma20_transition(
-                    valid_rows,
+                    indicator_rows,
                     close_col,
                     ma20_col,
                     date_col="日期",
                 )
         previous_close = pd.NA
         daily_change_pct = pd.NA
-        if len(valid_rows) >= 2:
-            previous_close = valid_rows.iloc[-2][close_col]
+        if len(price_rows) >= 2:
+            previous_close = price_rows.iloc[-2][close_col]
             if previous_close:
                 daily_change_pct = (latest[close_col] / previous_close - 1) * 100
         rows.append(
@@ -1298,7 +1521,7 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
                 "收盘价": latest[close_col],
                 "前收盘价": previous_close,
                 "当日涨跌幅(%)": daily_change_pct,
-                "MA20": latest[ma20_col],
+                "MA20": latest[ma20_col] if ma20_col in latest else pd.NA,
                 "偏离率(%)": latest[deviation_col] if show_deviation and deviation_col in latest else pd.NA,
                 "状态转变时间": transition_date,
                 "区间涨幅(%)": interval_return_pct,

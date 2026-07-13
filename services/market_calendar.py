@@ -230,3 +230,12 @@ def expected_latest_trade_date(market: MarketWindow, market_now: datetime) -> da
     if market_now.time() < market.sessions[0][0]:
         return previous_trading_day(market, market_now.date())
     return market_now.date()
+
+
+def latest_completed_trade_date(market: MarketWindow, market_now: datetime) -> date:
+    """Return the latest session whose regular market close has passed."""
+    if not is_market_trading_day(market, market_now):
+        return previous_trading_day(market, market_now.date())
+    if market_now.time() <= market.sessions[-1][1]:
+        return previous_trading_day(market, market_now.date())
+    return market_now.date()

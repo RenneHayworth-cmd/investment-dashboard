@@ -54,12 +54,27 @@ before a larger handoff or commit.
   records. Do not add a background-loop toggle or auto-started updater.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
-  a data source becomes unstable.
+  a data source becomes unstable. Preserve per-index raw history with
+  append-only date merges: once a date has been cached, later refreshes must
+  not change that row. A short upstream response must never replace the
+  accumulated cache used to calculate MA20. When a cumulative index cache is
+  missing or has fewer than 252 rows, bootstrap up to 1,000 calendar days so
+  MA20 state-transition dates are not calculated from a short display window;
+  TickFlow-backed indices should request up to 1,000 bars for the same bootstrap.
+- Index detail views persist a separate `index_long_history` dataset per index.
+  Bootstrap the longest available history only once. On every detail open,
+  compare the cache date with that market's latest completed session: read
+  locally when current, otherwise fetch only a short missing-date window and
+  append unseen dates to both accumulated and long-history caches. Existing
+  dates must not be replaced, and an unfinished current session must not be
+  persisted.
 - Index freshness uses `services/market_calendar.py`. Its
   `STATIC_MARKET_HOLIDAYS` table contains the published 2026 cash-market
   closures for mainland China, Hong Kong, Japan, and Korea; update that table
   when exchanges publish a new annual schedule. The US fallback is generated
   by holiday rules and also handles cross-year observed New Year's Day.
+  Real-time supplement rows must use the market's expected latest trade date;
+  never write weekend or holiday spot values under the current calendar date.
 - The `指数监控` latest summary uses dashboard-style index cards: four columns
   on desktop, fixed-height cards, index name and code on separate lines,
   A-share color convention for deltas (red up, green down), click-through
@@ -72,15 +87,18 @@ before a larger handoff or commit.
   supplement same-day spot prices so they do not remain stale during the
   trading day. Global indices may use Yahoo chart fallback when the AkShare
   Eastmoney global endpoint fails.
+- `国证自由现金流` (`980092`) uses AkShare's official CNI history
+  endpoint (`index_hist_cni`) so its back-calculated series reaches the
+  2012-12-31 base date; generic A-share and TickFlow history are shorter.
 - Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
-  spread, and futures option data. It should read local cache on first render,
-  fetch only after the user clicks the load button, refresh stale futures
-  spread/option cache to the current trading day when a same-day quote is
-  available, and use the force-refresh setting only to refetch cache that is
-  already current.
+  spread, and futures option data. It should read local cache on first render
+  and fetch only after the user clicks the load button. Loading defaults to an
+  online refresh for every holding; append ETF, spread, and option updates by
+  date so only unseen dates are added and every existing cached row is kept
+  unchanged.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.

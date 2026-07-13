@@ -11,7 +11,13 @@ import streamlit as st
 from core.cache import load_dataset
 from core.db import init_db
 from core.ui import DEFAULT_CHART_HEIGHT, apply_global_style, apply_plotly_layout, render_page_header
-from services.index_ma20 import INDEX_CONFIG, build_summary, fetch_index_history
+from services.index_ma20 import (
+    INDEX_CONFIG,
+    build_summary,
+    fetch_index_history,
+    filter_market_trading_dates,
+    sanitize_index_report_market_dates,
+)
 from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date, is_market_trading_day
 from services.update_tasks import run_index_ma20_update
 
@@ -73,7 +79,6 @@ def clear_index_detail() -> None:
     st.query_params.clear()
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 def load_index_detail(index_name: str, index_config: dict) -> pd.DataFrame | None:
     return fetch_index_history(index_name, index_config, days=10000)
 
@@ -85,6 +90,11 @@ def build_detail_dataframe(detail_df: pd.DataFrame, index_name: str) -> pd.DataF
 
     result = detail_df[["日期", close_col]].copy()
     result.columns = ["日期", "收盘价"]
+    result = filter_market_trading_dates(
+        result,
+        str(INDEX_CONFIG.get(index_name, {}).get("market_group") or ""),
+        date_column="日期",
+    )
     result["日期"] = pd.to_datetime(result["日期"], errors="coerce")
     result["收盘价"] = pd.to_numeric(result["收盘价"], errors="coerce")
     result = result.dropna(subset=["日期", "收盘价"]).sort_values("日期").reset_index(drop=True)
@@ -196,7 +206,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     title_col.markdown(f"### {index_name}")
     action_col.button("返回全部", key="clear_index_detail", on_click=clear_index_detail)
 
-    with st.spinner(f"正在读取 {index_name} 的长历史数据..."):
+    with st.spinner(f"正在读取 {index_name} 的本地长历史数据..."):
         try:
             detail_df = load_index_detail(index_name, INDEX_CONFIG[index_name])
         except Exception as exc:
@@ -207,7 +217,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     if detail.empty:
         detail = build_detail_dataframe(report_df, index_name)
         if not detail.empty:
-            st.info("长历史暂时不可用，当前先展示本地监控缓存。")
+            st.info("长历史缓存暂时不可用，当前先展示本地监控缓存。")
     if detail.empty:
         st.info("当前没有可展示的历史详情数据。")
         return
@@ -486,7 +496,6 @@ def run_single_index_update(index_name: str, api_key: str, days: int) -> None:
             max_workers=1,
         )
     st.session_state.index_update_timings = result.timings
-    load_index_detail.clear()
     if result.status == "success":
         if result.errors:
             st.session_state.index_update_notice = ("warning", result.message)
@@ -558,7 +567,6 @@ if update_clicked:
         max_workers=INDEX_UPDATE_WORKERS,
     )
     st.session_state.index_update_timings = result.timings
-    load_index_detail.clear()
     if result.status == "success":
         if result.errors:
             st.session_state.index_update_notice = ("warning", result.message)
@@ -584,6 +592,7 @@ if report_df is not None and report_meta is not None:
     st.caption(f"更新时间：{format_update_time(report_meta['last_update_time'])}")
 
 if report_df is not None:
+    report_df = sanitize_index_report_market_dates(report_df)
     summary_df = build_summary(report_df)
     if not summary_df.empty:
         selected_index = get_query_index_detail()

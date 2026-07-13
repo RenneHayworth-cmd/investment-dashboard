@@ -41,7 +41,7 @@ apply_global_style()
 
 render_page_header(
     "持仓分析",
-    "按指数监控的方式展示个人持仓标的。默认读取本地缓存，点击左侧按钮才联网补齐或刷新数据。",
+    "按指数监控的方式展示个人持仓标的。页面先展示本地缓存，点击左侧按钮默认联网增量更新。",
     eyebrow="Positions",
 )
 
@@ -683,7 +683,11 @@ with st.sidebar:
         placeholder="可选；留空优先使用免费或缓存数据",
     )
     update_clicked = st.button("加载持仓信息", type="primary", use_container_width=True)
-    force_refresh = st.checkbox("强制联网更新已有缓存", value=False)
+    force_refresh = st.checkbox(
+        "联网增量更新已有缓存",
+        value=True,
+        help="加载时联网获取最新数据，只追加缓存中不存在的日期；已有日期和值保持不变。",
+    )
     save_to_cache = st.checkbox("更新后保存到本地缓存", value=True)
 
     with st.expander("持仓清单", expanded=False):
@@ -705,7 +709,7 @@ allow_fetch = bool(update_clicked)
 refresh_existing = bool(update_clicked and force_refresh)
 
 if not update_clicked:
-    st.caption("当前为缓存视图；如某些持仓显示暂无缓存，可点击左侧「加载持仓信息」补齐。")
+    st.caption("当前为缓存视图；点击左侧「加载持仓信息」将默认联网增量更新全部持仓。")
 
 items: list[PositionItem] = []
 progress_total = len(etf_codes) + len(option_codes) + (1 if spread_contracts else 0)

@@ -74,15 +74,25 @@ def _load_dataset_if_ready(symbol: str, source: str, data_type: str, period: str
 
 
 def _merge_by_date(old_df: pd.DataFrame | None, new_df: pd.DataFrame, date_column: str) -> pd.DataFrame:
+    normalized_new = new_df.copy()
+    if date_column not in normalized_new.columns:
+        return old_df.copy() if old_df is not None and not old_df.empty else normalized_new
+    normalized_new[date_column] = pd.to_datetime(normalized_new[date_column], errors="coerce")
+    normalized_new = normalized_new.dropna(subset=[date_column])
+    normalized_new = normalized_new.sort_values(date_column).drop_duplicates(date_column, keep="last")
     if old_df is None or old_df.empty:
-        merged = new_df.copy()
-    else:
-        merged = pd.concat([old_df, new_df], ignore_index=True)
-    if date_column not in merged.columns:
-        return merged
-    merged[date_column] = pd.to_datetime(merged[date_column], errors="coerce")
-    merged = merged.dropna(subset=[date_column])
-    return merged.sort_values(date_column).drop_duplicates(date_column, keep="last").reset_index(drop=True)
+        return normalized_new.reset_index(drop=True)
+
+    normalized_old = old_df.copy()
+    normalized_old[date_column] = pd.to_datetime(normalized_old[date_column], errors="coerce")
+    normalized_old = normalized_old.dropna(subset=[date_column])
+    normalized_old = normalized_old.sort_values(date_column).drop_duplicates(date_column, keep="first")
+    unseen = normalized_new[~normalized_new[date_column].isin(normalized_old[date_column])]
+    return (
+        pd.concat([normalized_old, unseen], ignore_index=True)
+        .sort_values(date_column)
+        .reset_index(drop=True)
+    )
 
 
 def _round_metric(value: object, digits: int = 2) -> object:
@@ -305,9 +315,14 @@ def load_or_fetch_spread(
             return _missing_item("期货价差", code, "期货价差")
         try:
             data, errors = fetch_contracts(contracts, max_workers=max_workers, api_key=api_key)
-            spread_df = calculate_spreads(data, base_contract)
+            latest_spread_df = calculate_spreads(data, base_contract)
+            spread_df = (
+                _merge_by_date(cached_df, latest_spread_df, "date")
+                if cached_df is not None and cache_ready
+                else latest_spread_df
+            )
             source = "TickFlow/AkShare"
-            status = "已更新"
+            status = "已增量更新" if cached_df is not None and cache_ready else "已更新"
             if errors:
                 error = " | ".join(errors)
             if save_to_cache:
@@ -417,21 +432,17 @@ def load_or_fetch_option(
                 use_free=True,
                 ma_periods=ma_periods,
             )
-            result_df = result.dataframe.copy()
+            latest_result_df = result.dataframe.copy()
+            result_df = (
+                _merge_by_date(cached_df, latest_result_df, "date")
+                if cached_df is not None
+                else latest_result_df
+            )
             if not result.is_chain and "_data_version" not in result_df.columns:
                 result_df["_data_version"] = FUTURES_OPTION_DATA_VERSION
             source = result.source
-            status = "已更新"
+            status = "已增量更新" if cached_df is not None else "已更新"
             error = ""
-            if save_to_cache:
-                save_dataset(
-                    symbol=_futures_option_cache_key(raw_code, DATA_TYPE_OPTIONS, period, int(count)),
-                    name=f"{normalize_option_symbol(raw_code)} 期货期权数据",
-                    source="market",
-                    data_type="futures_option",
-                    period=period,
-                    df=result_df,
-                )
         except Exception as exc:
             if cached_df is None:
                 return PositionItem("期权", raw_code, normalize_option_symbol(raw_code), "失败", source="AkShare", error=str(exc))
@@ -445,8 +456,7 @@ def load_or_fetch_option(
         result_df["close"] = pd.to_numeric(result_df["close"], errors="coerce")
         result_df = result_df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
         result_df = add_indicators(result_df, ma_periods)
-        if "_data_version" not in result_df.columns:
-            result_df["_data_version"] = FUTURES_OPTION_DATA_VERSION
+        result_df["_data_version"] = FUTURES_OPTION_DATA_VERSION
         summary = build_futures_option_summary(result_df)
     except Exception as exc:
         return PositionItem("期权", raw_code, normalize_option_symbol(raw_code), "失败", source=source, error=str(exc))
@@ -460,6 +470,15 @@ def load_or_fetch_option(
         "最新成交量": _round_metric(summary.get("最新成交量"), 0),
         "最新持仓量": _round_metric(summary.get("最新持仓量"), 0),
     }
+    if status != "缓存" and save_to_cache:
+        save_dataset(
+            symbol=_futures_option_cache_key(raw_code, DATA_TYPE_OPTIONS, period, int(count)),
+            name=f"{normalize_option_symbol(raw_code)} 期货期权数据",
+            source="market",
+            data_type="futures_option",
+            period=period,
+            df=result_df,
+        )
     display_code = normalize_option_symbol(raw_code)
     return PositionItem(
         category="期权",
