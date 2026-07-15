@@ -18,7 +18,18 @@ from services.index_ma20 import (
     filter_market_trading_dates,
     sanitize_index_report_market_dates,
 )
-from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date, is_market_trading_day
+from services.index_realtime import (
+    apply_realtime_quotes_to_summary,
+    fetch_futures_main_contract_names,
+    fetch_realtime_index_quotes,
+    find_pending_post_close_index_names,
+    format_index_display_name,
+    load_futures_main_contract_names,
+    manual_quote_request_names,
+    quote_is_visible_for_manual_display,
+    save_futures_main_contract_names,
+)
+from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, latest_completed_trade_date
 from services.update_tasks import run_index_ma20_update
 
 
@@ -36,6 +47,12 @@ if "selected_index_detail" not in st.session_state:
     st.session_state.selected_index_detail = None
 if "index_update_timings" not in st.session_state:
     st.session_state.index_update_timings = []
+if "index_realtime_quote_cache" not in st.session_state:
+    st.session_state.index_realtime_quote_cache = {}
+if "index_lunch_quote_keys" not in st.session_state:
+    st.session_state.index_lunch_quote_keys = []
+if "index_futures_main_contracts" not in st.session_state:
+    st.session_state.index_futures_main_contracts = load_futures_main_contract_names()
 
 
 def format_update_time(value: str | None) -> str:
@@ -53,6 +70,13 @@ def format_number(value) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.2f}".rstrip("0").rstrip(".")
     return str(value)
+
+
+def display_index_name(index_name: str) -> str:
+    return format_index_display_name(
+        index_name,
+        st.session_state.get("index_futures_main_contracts", {}),
+    )
 
 
 def get_query_index_detail() -> str | None:
@@ -177,7 +201,7 @@ def render_detail_summary(
     if len(year_df) >= 2 and year_df.iloc[0]["收盘价"] != 0:
         ytd_return = (latest["收盘价"] / year_df.iloc[0]["收盘价"] - 1) * 100
     summary_items = [
-        ("指数名称", index_name),
+        ("指数名称", display_index_name(index_name)),
         ("指数代码", str(config.get("display_symbol", config.get("tickflow_symbol", config.get("code", "-"))))),
         ("市场分组", str(config.get("market_group", "-"))),
         ("数据源", str(config.get("source", "-"))),
@@ -203,7 +227,7 @@ def render_detail_summary(
 def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     st.divider()
     title_col, action_col = st.columns([5, 1])
-    title_col.markdown(f"### {index_name}")
+    title_col.markdown(f"### {display_index_name(index_name)}")
     action_col.button("返回全部", key="clear_index_detail", on_click=clear_index_detail)
 
     with st.spinner(f"正在读取 {index_name} 的本地长历史数据..."):
@@ -372,13 +396,21 @@ def render_index_cards(summary_df: pd.DataFrame) -> None:
 
 def render_index_card(row: pd.Series) -> None:
     delta = pd.to_numeric(row["当日涨跌幅(%)"], errors="coerce")
-    delta_class = "positive" if delta >= 0 else "negative"
-    arrow = "↑" if delta >= 0 else "↓"
+    delta_class = "positive" if not pd.isna(delta) and delta >= 0 else "negative"
+    arrow = "↑" if not pd.isna(delta) and delta >= 0 else "↓"
     index_name = str(row["指数"])
+    display_name = display_index_name(index_name)
     detail_href = f"?index_detail={quote(index_name)}"
+    realtime_source = str(row.get("实时来源", "缓存"))
+    realtime_time = pd.to_datetime(row.get("实时时间"), errors="coerce")
+    is_realtime = realtime_source != "缓存" and not pd.isna(realtime_time)
+    realtime_class = "live" if is_realtime else "cached"
+    delta_text = "-" if pd.isna(delta) else f"{float(delta):+.2f}%"
     card_html = (
         "<style>"
+        "@keyframes index-quote-flash{0%{background:rgba(219,234,254,.88)}100%{background:rgba(255,255,255,.78)}}"
         ".index-card-single{min-height:12.25rem;border:1px solid rgba(49,51,63,.14);border-radius:8px;background:rgba(255,255,255,.78);padding:1.35rem 1.5rem;box-shadow:0 10px 26px rgba(15,23,42,.06);margin:.35rem 0 .75rem;}"
+        ".index-card-single.live{animation:index-quote-flash .8s ease-out;}"
         ".index-card-single:hover{border-color:rgba(37,99,235,.42);box-shadow:0 14px 30px rgba(15,23,42,.11);}"
         ".index-card-title{min-height:2.4rem;font-size:1.18rem;font-weight:700;line-height:1.25;overflow-wrap:anywhere;}"
         ".index-card-title a{color:rgba(49,51,63,.72);text-decoration:none;}"
@@ -389,17 +421,28 @@ def render_index_card(row: pd.Series) -> None:
         ".index-card-delta.positive{color:rgb(190,18,60);background:rgba(254,226,226,.9);}"
         ".index-card-delta.negative{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
         "</style>"
-        '<div class="index-card-single">'
-        f'<div class="index-card-title"><a href="{detail_href}">{html.escape(index_name)}</a></div>'
+        f'<div class="index-card-single {realtime_class}">'
+        f'<div class="index-card-title"><a href="{detail_href}">{html.escape(display_name)}</a></div>'
         f'<div class="index-card-code">{html.escape(str(row["代码"]))}</div>'
         f'<div class="index-card-value">{float(row["收盘价"]):.2f}</div>'
         f'<div class="index-card-delta {delta_class}">'
         f"<span>{arrow}</span>"
-        f"<span>{delta:+.2f}%</span>"
+        f"<span>{delta_text}</span>"
         "</div>"
         "</div>"
     )
     st.markdown(card_html, unsafe_allow_html=True)
+
+
+def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
+    stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
+    display_quotes = {
+        index_name: quote
+        for index_name, quote in stored_quotes.items()
+        if quote_is_visible_for_manual_display(index_name, quote)
+    }
+    realtime_summary = apply_realtime_quotes_to_summary(summary_df, display_quotes)
+    render_index_cards(realtime_summary)
 
 
 def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
@@ -410,20 +453,27 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
         market_name = INDEX_CONFIG.get(index_name, {}).get("market_group", "")
         market = market_windows.get(market_name)
         latest_date = pd.to_datetime(row["日期"], errors="coerce")
-        if latest_date is pd.NaT or market is None:
+        if pd.isna(latest_date) or market is None:
             continue
 
         market_now = datetime.now(ZoneInfo(market.timezone))
         is_trading_day = is_market_trading_day(market, market_now)
-        expected_day = expected_latest_trade_date(market, market_now)
+        completed_day = latest_completed_trade_date(market, market_now)
         latest_day = latest_date.date()
+        session_in_progress = (
+            is_trading_day
+            and market.sessions[0][0] <= market_now.time() <= market.sessions[-1][1]
+        )
 
-        if latest_day >= expected_day and is_trading_day:
-            status = "已更新"
+        if latest_day >= completed_day and session_in_progress:
+            status = "交易中"
             status_class = "fresh"
-        elif latest_day >= expected_day:
+        elif latest_day >= completed_day and not is_trading_day:
             status = "休市"
             status_class = "closed"
+        elif latest_day >= completed_day:
+            status = "已更新"
+            status_class = "fresh"
         else:
             status = "待更新"
             status_class = "stale"
@@ -445,7 +495,7 @@ def render_freshness_bar(summary_df: pd.DataFrame) -> list[str]:
     for item in items:
         rows.append(
             '<div class="freshness-item">'
-            f'<span class="freshness-name">{html.escape(item["index_name"])}</span>'
+            f'<span class="freshness-name">{html.escape(display_index_name(item["index_name"]))}</span>'
             f'<span class="freshness-pill {item["status_class"]}">{item["status"]}</span>'
             f'<span class="freshness-date">{item["latest_day"]:%m-%d}</span>'
             "</div>"
@@ -537,44 +587,71 @@ if notice:
     getattr(st, level)(message)
 
 if update_clicked:
-    progress = st.progress(0)
-    status_box = st.empty()
-
-    def show_progress(index_name: str, idx: int, total: int, status: str, elapsed_seconds: float | None = None) -> None:
-        elapsed_text = "" if elapsed_seconds is None else f"，耗时 {elapsed_seconds:.2f} 秒"
-        if status == "success":
-            progress.progress(idx / total)
-            status_box.success(f"{index_name} 获取完成{elapsed_text}，进度 {idx}/{total}")
-        elif status == "stale":
-            progress.progress(idx / total)
-            status_box.info(f"{index_name} 已保存最新可得数据{elapsed_text}，进度 {idx}/{total}")
-        elif status == "cached":
-            progress.progress(idx / total)
-            status_box.info(f"{index_name} 联网失败，已沿用缓存{elapsed_text}，进度 {idx}/{total}")
-        elif status == "empty":
-            progress.progress(idx / total)
-            status_box.warning(f"{index_name} 无数据{elapsed_text}，进度 {idx}/{total}")
-        else:
-            progress.progress(idx / total)
-            status_box.warning(f"{index_name} 获取失败{elapsed_text}，进度 {idx}/{total}")
-
-    result = run_index_ma20_update(
-        api_key=api_key,
-        days=int(days),
-        cache_source="auto",
-        use_fresh_cache=False,
-        progress_callback=show_progress,
+    completed_lunch_keys = set(st.session_state.get("index_lunch_quote_keys", []))
+    quote_names, lunch_keys = manual_quote_request_names(completed_lunch_keys)
+    quotes = fetch_realtime_index_quotes(
         max_workers=INDEX_UPDATE_WORKERS,
+        force_index_names=quote_names,
     )
-    st.session_state.index_update_timings = result.timings
-    if result.status == "success":
-        if result.errors:
-            st.session_state.index_update_notice = ("warning", result.message)
-        else:
-            st.session_state.index_update_notice = ("success", result.message)
-        st.rerun()
-    else:
-        st.error(result.message)
+    if quotes:
+        stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
+        stored_quotes.update(quotes)
+        st.session_state.index_realtime_quote_cache = stored_quotes
+        completed_lunch_keys.update(
+            key for index_name, key in lunch_keys.items() if index_name in quotes
+        )
+        st.session_state.index_lunch_quote_keys = sorted(completed_lunch_keys)
+        resolved_contracts = fetch_futures_main_contract_names(quotes)
+        if resolved_contracts:
+            st.session_state.index_futures_main_contracts = save_futures_main_contract_names(
+                resolved_contracts
+            )
+
+    pending_indexes = find_pending_post_close_index_names()
+    result = None
+    if pending_indexes:
+        progress = st.progress(0)
+        status_box = st.empty()
+
+        def show_progress(index_name: str, idx: int, total: int, status: str, elapsed_seconds: float | None = None) -> None:
+            elapsed_text = "" if elapsed_seconds is None else f"，耗时 {elapsed_seconds:.2f} 秒"
+            if status == "success":
+                progress.progress(idx / total)
+                status_box.success(f"{index_name} 获取完成{elapsed_text}，进度 {idx}/{total}")
+            elif status == "stale":
+                progress.progress(idx / total)
+                status_box.info(f"{index_name} 已保存最新可得数据{elapsed_text}，进度 {idx}/{total}")
+            elif status == "cached":
+                progress.progress(idx / total)
+                status_box.info(f"{index_name} 联网失败，已沿用缓存{elapsed_text}，进度 {idx}/{total}")
+            elif status == "empty":
+                progress.progress(idx / total)
+                status_box.warning(f"{index_name} 无数据{elapsed_text}，进度 {idx}/{total}")
+            else:
+                progress.progress(idx / total)
+                status_box.warning(f"{index_name} 获取失败{elapsed_text}，进度 {idx}/{total}")
+
+        result = run_index_ma20_update(
+            api_key=api_key,
+            days=int(days),
+            cache_source="auto",
+            use_fresh_cache=False,
+            progress_callback=show_progress,
+            index_names=pending_indexes,
+            max_workers=INDEX_UPDATE_WORKERS,
+        )
+        st.session_state.index_update_timings = result.timings
+
+    message_parts = []
+    if quotes:
+        message_parts.append(f"已手动更新 {len(quotes)} 个盘中/午间报价")
+    if result is not None:
+        message_parts.append(result.message)
+    if not message_parts:
+        message_parts.append("当前没有需要联网更新的指数数据")
+    level = "warning" if result is not None and (result.status != "success" or result.errors) else "success"
+    st.session_state.index_update_notice = (level, "；".join(message_parts))
+    st.rerun()
 
 report_df = None
 report_meta = None
@@ -599,13 +676,20 @@ if report_df is not None:
         summary_date = summary_df["日期"].max()
         st.subheader(f"最新摘要 · {summary_date}")
         stale_indexes = render_freshness_bar(summary_df)
-        render_single_index_update(stale_indexes, api_key, int(days))
+        pending_indexes = find_pending_post_close_index_names()
+        render_single_index_update(
+            [index_name for index_name in stale_indexes if index_name in pending_indexes],
+            api_key,
+            int(days),
+        )
         render_update_timings()
         if selected_index:
             render_index_detail(report_df, selected_index)
-        render_index_cards(summary_df)
+        render_manual_index_cards(summary_df)
 
         display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
+        if "指数" in display_summary_df.columns:
+            display_summary_df["指数"] = display_summary_df["指数"].map(display_index_name)
         if "偏离率(%)" in display_summary_df.columns:
             display_summary_df = display_summary_df.assign(
                 _sort_deviation=pd.to_numeric(display_summary_df["偏离率(%)"], errors="coerce")
@@ -616,4 +700,4 @@ if report_df is not None:
     with st.expander("查看完整分列数据", expanded=False):
         st.dataframe(report_df, use_container_width=True, hide_index=True)
 else:
-    st.info("还没有缓存数据。可以先点击左侧按钮自动更新，或上传已有 CSV。")
+    st.info("还没有缓存数据。可以先点击左侧按钮联网更新，或上传已有 CSV。")

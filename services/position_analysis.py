@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as datetime_time
+import re
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -31,12 +32,60 @@ from services.futures_spread import (
     parse_contracts,
     spread_respects_contract_cutoffs,
 )
-from services.market_calendar import expected_latest_trade_date, get_market_window
+from services.market_calendar import (
+    expected_latest_trade_date,
+    get_market_window,
+    is_market_trading_day,
+    previous_trading_day,
+)
 
 
-DEFAULT_ETF_CODES = ["512890", "159201", "159545", "513260", "159655", "159501", "518850"]
+DEFAULT_ETF_CODES = [
+    "512890",
+    "159201",
+    "159545",
+    "513260",
+    "159655",
+    "159501",
+    "518850",
+    "588000",
+    "159915",
+    "510500",
+]
 DEFAULT_SPREAD_CONTRACTS = ["I2609", "I2701"]
 DEFAULT_OPTION_CODES = ["I2609P730", "I2609P740", "I2609P750", "I2609P760"]
+ETF_FINAL_CLOSE_READY_TIME = datetime_time(15, 5)
+
+ETF_DISPLAY_NAMES = {
+    "512890": "红利低波ETF华泰柏瑞",
+    "159201": "自由现金流ETF华夏",
+    "159545": "恒生红利低波ETF易方达",
+    "513260": "恒生科技ETF汇添富",
+    "159655": "标普500ETF华夏",
+    "159501": "纳指ETF嘉实",
+    "518850": "黄金ETF华夏",
+    "588000": "科创50ETF华夏",
+    "159915": "创业板ETF易方达",
+    "510500": "中证500ETF南方",
+}
+
+ETF_TIMING_STRATEGIES = {
+    "513260": (20, 1.0),
+    "159915": (20, 1.0),
+    "588000": (20, 1.0),
+    "510500": (20, 1.0),
+    "159201": (25, 2.0),
+    "159655": (25, 2.0),
+    "159501": (25, 2.0),
+    "159545": (10, 1.0),
+}
+
+OPTION_PRODUCT_NAMES = {
+    "i": "铁矿石",
+    "io": "沪深300股指",
+    "ho": "上证50股指",
+    "mo": "中证1000股指",
+}
 
 
 @dataclass
@@ -51,6 +100,182 @@ class PositionItem:
     metrics: dict[str, object] = field(default_factory=dict)
     dataframe: pd.DataFrame = field(default_factory=pd.DataFrame)
     error: str = ""
+
+
+def normalize_etf_base_code(code: str) -> str:
+    match = re.search(r"\d{6}", str(code))
+    return match.group(0) if match else str(code).strip().upper()
+
+
+def display_etf_name(code: str, fallback: str) -> str:
+    return ETF_DISPLAY_NAMES.get(normalize_etf_base_code(code), str(fallback))
+
+
+def etf_final_close_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and market_now.time() >= ETF_FINAL_CLOSE_READY_TIME
+    )
+
+
+def latest_final_etf_trade_date(market_now: datetime | None = None):
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if market is None:
+        return market_now.date()
+    if etf_final_close_ready(market_now):
+        return market_now.date()
+    return previous_trading_day(market, market_now.date())
+
+
+def filter_final_etf_rows(
+    df: pd.DataFrame | None,
+    *,
+    date_column: str = "日期",
+    market_now: datetime | None = None,
+    require_current_confirmation: bool = False,
+) -> pd.DataFrame | None:
+    if df is None or df.empty or date_column not in df.columns:
+        return None if df is None else df.copy()
+    result = df.copy()
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    target_date = latest_final_etf_trade_date(market_now)
+    dates = pd.to_datetime(result[date_column], errors="coerce")
+    keep = dates.dt.date <= target_date
+    if require_current_confirmation and target_date == market_now.date():
+        if "_final_close_confirmed" in result.columns:
+            confirmation_values = result["_final_close_confirmed"]
+            confirmed = confirmation_values.eq(True) | confirmation_values.astype(str).str.lower().isin(
+                {"true", "1"}
+            )
+        else:
+            confirmed = pd.Series(False, index=result.index)
+        keep &= (dates.dt.date < target_date) | confirmed
+    result = result.loc[keep].copy()
+    return result.reset_index(drop=True)
+
+
+def calculate_etf_timing_snapshot(
+    df: pd.DataFrame,
+    *,
+    ma_period: int,
+    threshold_pct: float,
+) -> dict[str, object]:
+    data = df[["date", "price"]].copy() if {"date", "price"}.issubset(df.columns) else pd.DataFrame()
+    if data.empty:
+        return {}
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["price"] = pd.to_numeric(data["price"], errors="coerce")
+    data = data.dropna(subset=["date", "price"]).sort_values("date").reset_index(drop=True)
+    if data.empty:
+        return {}
+
+    ma_col = f"ma_{int(ma_period)}"
+    data[ma_col] = data["price"].rolling(window=int(ma_period)).mean()
+    threshold = float(threshold_pct) / 100
+    position = 0
+    latest_action = "等待均线"
+    transition_date = None
+    transition_price = None
+    for _, row in data.iterrows():
+        ma_value = pd.to_numeric(row[ma_col], errors="coerce")
+        if pd.isna(ma_value):
+            continue
+        price = float(row["price"])
+        desired_position = (
+            1
+            if price > float(ma_value) * (1 + threshold)
+            else 0
+            if price < float(ma_value) * (1 - threshold)
+            else position
+        )
+        if desired_position != position:
+            latest_action = "买入" if desired_position else "卖出"
+            transition_date = pd.Timestamp(row["date"])
+            transition_price = price
+        else:
+            latest_action = "持有" if position else "空仓"
+        position = desired_position
+
+    latest = data.iloc[-1]
+    latest_ma = pd.to_numeric(latest[ma_col], errors="coerce")
+    latest_price = float(latest["price"])
+    deviation_pct = (
+        (latest_price / float(latest_ma) - 1) * 100
+        if not pd.isna(latest_ma) and float(latest_ma) != 0
+        else pd.NA
+    )
+    interval_return_pct = (
+        (latest_price / transition_price - 1) * 100
+        if transition_price is not None and transition_price != 0
+        else pd.NA
+    )
+    return {
+        "策略参数": f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
+        "策略均线": latest_ma,
+        "策略偏离(%)": deviation_pct,
+        "择时判断": latest_action,
+        "状态转换时间": transition_date.strftime("%Y-%m-%d") if transition_date is not None else pd.NA,
+        "策略区间涨幅(%)": interval_return_pct,
+    }
+
+
+def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
+    columns = [
+        "ETF名称",
+        "代码",
+        "最新价",
+        "当日涨跌幅(%)",
+        "策略参数",
+        "对应均线",
+        "偏离率(%)",
+        "择时判断",
+        "状态转换时间",
+        "区间涨幅(%)",
+    ]
+    rows = []
+    for item in items:
+        if item.category != "ETF":
+            continue
+        base_code = normalize_etf_base_code(item.code)
+        row = {
+            "ETF名称": display_etf_name(base_code, item.name),
+            "代码": base_code,
+            "最新价": item.metrics.get("最新价"),
+            "当日涨跌幅(%)": item.metrics.get("日涨跌(%)"),
+            "策略参数": pd.NA,
+            "对应均线": pd.NA,
+            "偏离率(%)": pd.NA,
+            "择时判断": pd.NA,
+            "状态转换时间": pd.NA,
+            "区间涨幅(%)": pd.NA,
+        }
+        if base_code in ETF_TIMING_STRATEGIES:
+            ma_period, threshold_pct = ETF_TIMING_STRATEGIES[base_code]
+            row.update(
+                {
+                    "策略参数": item.metrics.get(
+                        "策略参数",
+                        f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
+                    ),
+                    "对应均线": item.metrics.get("策略均线", pd.NA),
+                    "偏离率(%)": item.metrics.get("策略偏离(%)", pd.NA),
+                    "择时判断": item.metrics.get("择时判断", pd.NA),
+                    "状态转换时间": item.metrics.get("状态转换时间", pd.NA),
+                    "区间涨幅(%)": item.metrics.get("策略区间涨幅(%)", pd.NA),
+                }
+            )
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    result = pd.DataFrame(rows, columns=columns)
+    result["_sort_deviation"] = pd.to_numeric(result["偏离率(%)"], errors="coerce")
+    return result.sort_values("_sort_deviation", ascending=False, na_position="last").drop(
+        columns="_sort_deviation"
+    ).reset_index(drop=True)
 
 
 def parse_position_codes(text: str) -> list[str]:
@@ -143,6 +368,17 @@ def _futures_option_cache_candidates(symbol: str, period: str, count: int) -> li
     return keys
 
 
+def option_display_name(symbol: str) -> str:
+    display_code = normalize_option_symbol(symbol)
+    match = re.match(r"^([a-z]+)\d{4}([CP])?(\d+)?$", display_code)
+    if not match:
+        return f"{display_code} 期权"
+    product, option_type, _strike = match.groups()
+    product_name = OPTION_PRODUCT_NAMES.get(product, product.upper())
+    side_name = "看涨" if option_type == "C" else "看跌" if option_type == "P" else ""
+    return f"{display_code} {product_name}{side_name}期权"
+
+
 def _market_cache_is_usable(df: pd.DataFrame | None) -> bool:
     return df is not None and not df.empty and "date" in df.columns and "close" in df.columns
 
@@ -187,16 +423,25 @@ def load_or_fetch_etf(
     allow_fetch: bool = True,
     force_refresh: bool = False,
     save_to_cache: bool = True,
+    allow_unfinished_session: bool = False,
+    market_now: datetime | None = None,
 ) -> PositionItem:
     raw_code = code.strip()
+    base_code = normalize_etf_base_code(raw_code)
+    strategy = ETF_TIMING_STRATEGIES.get(base_code)
     try:
         symbol = infer_tickflow_symbol(raw_code)
     except Exception as exc:
-        return PositionItem("ETF", raw_code, raw_code, "失败", error=str(exc))
+        return PositionItem("ETF", raw_code, display_etf_name(base_code, raw_code), "失败", error=str(exc))
 
     cache_symbol = f"fund_close_{symbol}_{adjust or 'none'}"
     period = f"{int(count)}_1d"
     cached_df, cache_meta = _load_dataset_if_ready(cache_symbol, "tickflow", "fund_close_raw", period=period)
+    cached_df = filter_final_etf_rows(
+        cached_df,
+        market_now=market_now,
+        require_current_confirmation=True,
+    )
     used_cache = cached_df is not None and not force_refresh
     source_df = cached_df.copy() if used_cache else None
     source = "本地缓存" if used_cache else "TickFlow"
@@ -205,7 +450,7 @@ def load_or_fetch_etf(
 
     if source_df is None:
         if not allow_fetch:
-            return _missing_item("ETF", raw_code, symbol)
+            return _missing_item("ETF", raw_code, display_etf_name(base_code, symbol))
         try:
             if cached_df is not None:
                 incremental_count = min(max(120, int(count) // 20), int(count))
@@ -215,6 +460,9 @@ def load_or_fetch_etf(
                     count=incremental_count,
                     adjust=adjust,
                 )
+                if not allow_unfinished_session:
+                    latest_df = filter_final_etf_rows(latest_df, market_now=market_now)
+                    latest_df["_final_close_confirmed"] = True
                 source_df = _merge_by_date(cached_df, latest_df, "日期")
                 status = "已增量更新"
             else:
@@ -224,8 +472,11 @@ def load_or_fetch_etf(
                     count=int(count),
                     adjust=adjust,
                 )
+                if not allow_unfinished_session:
+                    source_df = filter_final_etf_rows(source_df, market_now=market_now)
+                    source_df["_final_close_confirmed"] = True
                 status = "已更新"
-            if save_to_cache:
+            if save_to_cache and not allow_unfinished_session:
                 save_dataset(
                     symbol=cache_symbol,
                     name=f"{symbol} 场内基金/股票原始收盘价",
@@ -236,18 +487,32 @@ def load_or_fetch_etf(
                 )
         except Exception as exc:
             if cached_df is None:
-                return PositionItem("ETF", raw_code, symbol, "失败", source="TickFlow", error=str(exc))
+                return PositionItem(
+                    "ETF",
+                    raw_code,
+                    display_etf_name(base_code, symbol),
+                    "失败",
+                    source="TickFlow",
+                    error=str(exc),
+                )
             source_df = cached_df.copy()
             source = "本地缓存（刷新失败）"
             status = "缓存"
             error = str(exc)
 
     try:
-        fund_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=f"{symbol} ETF")
+        analysis_source_df = source_df.drop(
+            columns=[column for column in source_df.columns if str(column).startswith("_")],
+            errors="ignore",
+        )
+        fund_name, nav_df = normalize_nav_dataframe(analysis_source_df, fallback_name=f"{symbol} ETF")
+        effective_ma_periods = set(int(period) for period in ma_periods)
+        if strategy is not None:
+            effective_ma_periods.add(int(strategy[0]))
         result = analyze_fund_nav(
             nav_df,
             fund_name=fund_name,
-            ma_periods=ma_periods,
+            ma_periods=tuple(sorted(effective_ma_periods)),
             rsi_period=int(rsi_period),
             base_date=base_date,
         )
@@ -265,10 +530,26 @@ def load_or_fetch_etf(
         "价格百分位": _round_metric(summary.get("价格百分位")),
         "年化波动(%)": _round_metric(summary.get("年化波动率(%)")),
     }
+    if strategy is not None:
+        timing_snapshot = calculate_etf_timing_snapshot(
+            result.dataframe,
+            ma_period=int(strategy[0]),
+            threshold_pct=float(strategy[1]),
+        )
+        metrics.update(
+            {
+                key: _round_metric(value, 6)
+                if key == "策略均线"
+                else _round_metric(value)
+                if key in {"策略偏离(%)", "策略区间涨幅(%)"}
+                else value
+                for key, value in timing_snapshot.items()
+            }
+        )
     return PositionItem(
         category="ETF",
         code=symbol,
-        name=str(summary.get("基金名称") or fund_name),
+        name=display_etf_name(base_code, str(summary.get("基金名称") or fund_name)),
         status=status,
         source=source,
         latest_date=str(summary.get("最新日期") or ""),
@@ -483,7 +764,7 @@ def load_or_fetch_option(
     return PositionItem(
         category="期权",
         code=display_code,
-        name=f"{display_code} 铁矿石看跌期权",
+        name=option_display_name(display_code),
         status=status,
         source=source,
         latest_date=str(summary.get("最新日期") or ""),

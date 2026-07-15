@@ -1,6 +1,9 @@
 import html
 import os
+from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote, unquote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,9 +31,13 @@ from services.position_analysis import (
     DEFAULT_OPTION_CODES,
     DEFAULT_SPREAD_CONTRACTS,
     PositionItem,
+    build_etf_timing_table,
+    etf_final_close_ready,
+    latest_final_etf_trade_date,
     load_or_fetch_etf,
     load_or_fetch_option,
     load_or_fetch_spread,
+    normalize_etf_base_code,
     parse_position_codes,
 )
 
@@ -41,7 +48,7 @@ apply_global_style()
 
 render_page_header(
     "持仓分析",
-    "按指数监控的方式展示个人持仓标的。页面先展示本地缓存，点击左侧按钮默认联网增量更新。",
+    "按指数监控的方式展示个人持仓标的。盘中加载只更新卡片，ETF择时状态在收盘确认后更新。",
     eyebrow="Positions",
 )
 
@@ -71,6 +78,10 @@ def format_metric_for_item(item: PositionItem, metric_name: str) -> str:
 
 def position_key(item: PositionItem) -> str:
     return f"{item.category}::{item.code}"
+
+
+def display_position_code(item: PositionItem) -> str:
+    return normalize_etf_base_code(item.code) if item.category == "ETF" else item.code
 
 
 def get_query_position_detail(items: list[PositionItem]) -> str | None:
@@ -111,7 +122,7 @@ def build_overview_table(items: list[PositionItem]) -> pd.DataFrame:
                 metric_order.append(key)
         row = {
             "类别": item.category,
-            "代码": item.code,
+            "代码": display_position_code(item),
             "名称": item.name,
             "状态": item.status,
             "最新日期": item.latest_date or "-",
@@ -123,6 +134,134 @@ def build_overview_table(items: list[PositionItem]) -> pd.DataFrame:
             row[key] = format_metric_for_item(item, key)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def format_etf_table_value(column: str, value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if column in {"最新价", "对应均线"}:
+        return format(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), ".3f")
+    if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)"}:
+        return format(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
+    return str(value)
+
+
+def render_etf_timing_table(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        st.info("当前没有可展示的 ETF 汇总数据。")
+        return
+    headers = "".join(f"<th>{html.escape(str(column))}</th>" for column in df.columns)
+    rows = []
+    for _, row in df.iterrows():
+        timing_action = str(row.get("择时判断", ""))
+        row_class = " timing-buy" if timing_action == "买入" else " timing-sell" if timing_action == "卖出" else ""
+        cells = "".join(
+            f"<td>{html.escape(format_etf_table_value(column, row[column]))}</td>"
+            for column in df.columns
+        )
+        rows.append(f'<tr class="{row_class.strip()}">{cells}</tr>')
+    st.markdown(
+        f"""
+        <style>
+        .position-etf-summary-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }}
+        .position-etf-summary-table th,
+        .position-etf-summary-table td {{
+            text-align: center;
+            padding: 0.45rem 0.6rem;
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            white-space: nowrap;
+        }}
+        .position-etf-summary-table th {{
+            font-weight: 600;
+            background: rgba(49, 51, 63, 0.04);
+        }}
+        .position-etf-summary-table tr.timing-buy td {{
+            background: rgba(254, 226, 226, 0.72);
+        }}
+        .position-etf-summary-table tr.timing-sell td {{
+            background: rgba(220, 252, 231, 0.78);
+        }}
+        .position-etf-summary-table tr.timing-buy td:first-child,
+        .position-etf-summary-table tr.timing-buy td:nth-child(8) {{
+            color: rgb(190, 18, 60);
+            font-weight: 700;
+        }}
+        .position-etf-summary-table tr.timing-sell td:first-child,
+        .position-etf-summary-table tr.timing-sell td:nth-child(8) {{
+            color: rgb(22, 101, 52);
+            font-weight: 700;
+        }}
+        </style>
+        <table class="position-etf-summary-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.fragment(run_every="60s")
+def render_etf_timing_section(
+    etf_codes: list[str],
+    *,
+    api_key: str,
+    count: int,
+    adjust: str | None,
+) -> None:
+    market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    formal_items = [
+        load_or_fetch_etf(
+            code,
+            api_key=api_key,
+            count=count,
+            adjust=adjust,
+            allow_fetch=False,
+            market_now=market_now,
+        )
+        for code in etf_codes
+    ]
+    target_date = latest_final_etf_trade_date(market_now)
+    stale_codes = []
+    for code, item in zip(etf_codes, formal_items):
+        item_date = pd.to_datetime(item.latest_date, errors="coerce")
+        if pd.isna(item_date) or item_date.date() < target_date:
+            stale_codes.append(code)
+
+    attempt_key = "position_etf_auto_final_last_attempt"
+    last_attempt = pd.to_datetime(st.session_state.get(attempt_key), errors="coerce")
+    retry_ready = pd.isna(last_attempt) or (market_now.replace(tzinfo=None) - last_attempt).total_seconds() >= 600
+    if (
+        etf_final_close_ready(market_now)
+        and stale_codes
+        and retry_ready
+    ):
+        with st.spinner(f"正在自动更新 {target_date:%Y-%m-%d} ETF收盘数据..."):
+            refreshed_by_code = {
+                code: load_or_fetch_etf(
+                    code,
+                    api_key=api_key,
+                    count=count,
+                    adjust=adjust,
+                    allow_fetch=True,
+                    force_refresh=True,
+                    save_to_cache=True,
+                    market_now=market_now,
+                )
+                for code in stale_codes
+            }
+            formal_items = [
+                refreshed_by_code.get(code, item)
+                for code, item in zip(etf_codes, formal_items)
+            ]
+        st.session_state[attempt_key] = market_now.replace(tzinfo=None).isoformat()
+
+    st.subheader("ETF择时状态")
+    render_etf_timing_table(build_etf_timing_table(formal_items))
 
 
 def primary_value(item: PositionItem) -> tuple[str, object, int]:
@@ -189,7 +328,7 @@ def render_position_card(item: PositionItem) -> None:
         "</style>"
         '<div class="position-card-single">'
         f'<div class="position-card-title"><a href="{detail_href}">{html.escape(title)}</a></div>'
-        f'<div class="position-card-code">{html.escape(item.category)} · {html.escape(item.code)}</div>'
+        f'<div class="position-card-code">{html.escape(item.category)} · {html.escape(display_position_code(item))}</div>'
         f'<div class="position-card-value">{html.escape(value_text)}</div>'
         '<div class="position-card-foot">'
         f'<div class="position-card-delta {delta_class}" title="{html.escape(delta_label)}">'
@@ -470,7 +609,7 @@ def render_etf_detail(item: PositionItem) -> None:
     with summary_tab:
         summary_rows = [
             ("类别", item.category),
-            ("代码", item.code),
+            ("代码", display_position_code(item)),
             ("名称", item.name),
             ("最新日期", item.latest_date),
             ("数据来源", item.source),
@@ -662,7 +801,10 @@ def render_position_detail(item: PositionItem) -> None:
     title_col, action_col = st.columns([5, 1])
     title_col.markdown(f"### {item.name}")
     action_col.button("返回全部", key="clear_position_detail", on_click=clear_position_detail)
-    st.caption(f"{item.category} · {item.code} · 最新日期：{item.latest_date or '-'} · 来源：{item.source or '-'}")
+    st.caption(
+        f"{item.category} · {display_position_code(item)} · "
+        f"最新日期：{item.latest_date or '-'} · 来源：{item.source or '-'}"
+    )
     if item.error and item.status != "无缓存":
         st.warning(item.error)
 
@@ -707,9 +849,11 @@ spread_contracts = parse_position_codes(spread_text)
 option_codes = parse_position_codes(option_text)
 allow_fetch = bool(update_clicked)
 refresh_existing = bool(update_clicked and force_refresh)
+market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+formal_close_ready = etf_final_close_ready(market_now)
 
 if not update_clicked:
-    st.caption("当前为缓存视图；点击左侧「加载持仓信息」将默认联网增量更新全部持仓。")
+    st.caption("当前为缓存视图；盘中点击加载只更新卡片，交易日15:05后才写入ETF日线并更新择时表格。")
 
 items: list[PositionItem] = []
 progress_total = len(etf_codes) + len(option_codes) + (1 if spread_contracts else 0)
@@ -729,17 +873,35 @@ def update_position_progress(label: str) -> None:
 
 with st.spinner("正在整理持仓数据..."):
     for code in etf_codes:
-        items.append(
-            load_or_fetch_etf(
+        if update_clicked and not formal_close_ready:
+            card_item = load_or_fetch_etf(
                 code,
                 api_key=api_key,
                 count=int(etf_count),
                 adjust=adjust_map[adjust_option],
-                allow_fetch=allow_fetch,
-                force_refresh=refresh_existing,
-                save_to_cache=save_to_cache,
+                allow_fetch=True,
+                force_refresh=True,
+                save_to_cache=False,
+                allow_unfinished_session=True,
+                market_now=market_now,
             )
-        )
+            if card_item.status not in {"失败", "无缓存"}:
+                card_item.status = "盘中"
+                card_item.source = "TickFlow（盘中临时，不写入缓存）"
+            items.append(card_item)
+        else:
+            items.append(
+                load_or_fetch_etf(
+                    code,
+                    api_key=api_key,
+                    count=int(etf_count),
+                    adjust=adjust_map[adjust_option],
+                    allow_fetch=allow_fetch,
+                    force_refresh=refresh_existing,
+                    save_to_cache=save_to_cache,
+                    market_now=market_now,
+                )
+            )
         update_position_progress(f"ETF {code}")
 
     if spread_contracts:
@@ -793,5 +955,9 @@ status_cols[3].metric("获取失败", failed_count)
 
 render_position_cards(items)
 
-display_df = overview_df.drop(columns=["缓存时间"], errors="ignore")
-st.dataframe(display_df, use_container_width=True, hide_index=True)
+render_etf_timing_section(
+    etf_codes,
+    api_key=api_key,
+    count=int(etf_count),
+    adjust=adjust_map[adjust_option],
+)

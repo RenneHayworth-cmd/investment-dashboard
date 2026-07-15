@@ -48,8 +48,16 @@ before a larger handoff or commit.
 - Keep `app.py` lightweight. It should act as a status and navigation overview:
   cache count, latest cache update time, latest trade date, today-focus notes,
   and common page entry text. Avoid rebuilding it as a heavy card dashboard.
-- The `指数监控` page should not block first render with a synchronous daily
-  update. Show cached data immediately and let the user refresh manually.
+- The `指数监控` page should show cached data first and must not use a periodic
+  refresh timer for its summary cards or formal summary update. The
+  `更新指数数据` button is their network trigger: fetch one read-only quote for
+  instruments currently trading, fetch the
+  mainland 11:30 lunch close only once per page session during 11:30-13:30, and
+  update formal daily data only for indexes missing their latest completed
+  session. If `index_final_history` already contains the target session, do not
+  request that index again. Intraday and lunch card quotes stay in session
+  memory and must never overwrite or persist into append-only daily history.
+  Detail views retain their separate cache-first incremental history behavior.
 - The `任务与数据` page provides manual index updates, dataset metadata, and job
   records. Do not add a background-loop toggle or auto-started updater.
 - Index MA20 updates use controlled concurrency through
@@ -61,6 +69,10 @@ before a larger handoff or commit.
   missing or has fewer than 252 rows, bootstrap up to 1,000 calendar days so
   MA20 state-transition dates are not calculated from a short display window;
   TickFlow-backed indices should request up to 1,000 bars for the same bootstrap.
+  Keep post-close confirmation rows in the append-only `index_final_history`
+  cache. Use them as a calculation overlay when an old raw row contains an
+  intraday value, without replacing the original `index_history` or
+  `index_long_history` row.
 - Index detail views persist a separate `index_long_history` dataset per index.
   Bootstrap the longest available history only once. On every detail open,
   compare the cache date with that market's latest completed session: read
@@ -80,6 +92,11 @@ before a larger handoff or commit.
   A-share color convention for deltas (red up, green down), click-through
   detail views with long-history trend/drawdown summaries, and a summary table
   sorted by MA20 deviation.
+- The four futures-main display names include the currently matched concrete
+  contract, for example `铁矿石主连（I2609）`. Re-resolve the contract only after
+  a successful manual quote update, persist the small mapping in
+  `index_futures_main_contracts`, and keep canonical index names unchanged for
+  links, cache keys, and calculations.
 - The monitored set includes mainland China indices, EastMoney micro-cap board
   index, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
   Dividend Low Volatility, Nikkei 225, Korea KOSPI, and iron ore/gold/crude
@@ -95,10 +112,22 @@ before a larger handoff or commit.
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
   spread, and futures option data. It should read local cache on first render
-  and fetch only after the user clicks the load button. Loading defaults to an
-  online refresh for every holding; append ETF, spread, and option updates by
-  date so only unseen dates are added and every existing cached row is kept
-  unchanged.
+  and fetch after the user clicks the load button. Before the A-share close is
+  confirmed at 15:05, an ETF refresh may update cards with an in-memory daily
+  quote but must not save that day's row or use it in the timing table. While
+  the page is open, a local one-minute fragment check should fetch each missing
+  formal ETF close once after 15:05, mark the current row as close-confirmed,
+  append it to cache, and then update the timing table. Earlier cached dates
+  remain unchanged; an unconfirmed same-day row left by an older version must
+  not be treated as the formal close. Spread and option updates remain tied to
+  the load button. Its bottom summary table contains ETFs only and follows the index
+  MA summary style. Use MA20/1% for 513260, 159915, 588000, and 510500;
+  MA25/2% for 159201, 159655, and 159501; and MA10/1% for 159545. Preserve the
+  previous position while price remains inside the threshold band. Treat
+  512890 and 518850 as long-term holdings: show only name, code, latest price,
+  and daily change, leaving all strategy columns blank. Use the complete fund
+  names stored in the fixed ETF display-name mapping, and show ETF codes as six
+  digits without `.SH` or `.SZ` in cards, tables, and detail captions.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -153,7 +182,7 @@ source failed when possible.
 For futures:
 
 - Specific contracts use raw contract prices.
-- Main continuous contracts use AkShare/Sina codes such as `IM0`, `I0`, `AU0`.
+- Main continuous contracts generally use AkShare/Sina codes such as `IM0`, `I0`, `AU0`. `原油主连` uses EastMoney `142.scm` for realtime and daily data so it matches the EastMoney futures page; keep `SC0` only as its futures-session symbol. Apply EastMoney rows from 2026-07-10 through the separate append-only `index_source_correction_history` overlay, without replacing accumulated raw history.
 - Main continuous series are not front-adjusted or back-adjusted by this app.
 - Futures drawdown analysis is useful, but futures options should usually focus
   on走势、波动、成交量、持仓量 rather than standard drawdown tables.

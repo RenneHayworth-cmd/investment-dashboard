@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -141,45 +142,43 @@ def save_correlation_results(pair_table: pd.DataFrame, summary: dict[str, object
             )
         )
 
-    conn = get_conn()
-    conn.executemany(
-        """
-        INSERT INTO correlation_results (
-            asset_a, asset_b, correlation, strength, start_date, end_date,
-            common_days, source_summary, created_at
+    with closing(get_conn()) as conn:
+        conn.executemany(
+            """
+            INSERT INTO correlation_results (
+                asset_a, asset_b, correlation, strength, start_date, end_date,
+                common_days, source_summary, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 def list_correlation_results(limit: int = 200) -> pd.DataFrame:
     init_db()
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT
-            id,
-            asset_a AS 标的A,
-            asset_b AS 标的B,
-            correlation AS 相关系数r,
-            strength AS 相关性,
-            start_date AS 开始日期,
-            end_date AS 结束日期,
-            common_days AS 共同日期数,
-            source_summary AS 计算说明,
-            created_at AS 计算时间
-        FROM correlation_results
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        conn,
-        params=(limit,),
-    )
-    conn.close()
+    with closing(get_conn()) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                id,
+                asset_a AS 标的A,
+                asset_b AS 标的B,
+                correlation AS 相关系数r,
+                strength AS 相关性,
+                start_date AS 开始日期,
+                end_date AS 结束日期,
+                common_days AS 共同日期数,
+                source_summary AS 计算说明,
+                created_at AS 计算时间
+            FROM correlation_results
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            conn,
+            params=(limit,),
+        )
     if not df.empty:
         df["相关系数r"] = pd.to_numeric(df["相关系数r"], errors="coerce").round(4)
     return df
@@ -191,10 +190,9 @@ def delete_correlation_results(ids: list[int]) -> None:
         return
     init_db()
     placeholders = ",".join("?" for _ in clean_ids)
-    conn = get_conn()
-    conn.execute(f"DELETE FROM correlation_results WHERE id IN ({placeholders})", clean_ids)
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn:
+        conn.execute(f"DELETE FROM correlation_results WHERE id IN ({placeholders})", clean_ids)
+        conn.commit()
 
 
 def _find_column(columns, keywords: tuple[str, ...]) -> str | None:

@@ -19,6 +19,19 @@ from services.fund_rotation import (
 
 
 class FundRotationTests(unittest.TestCase):
+    def test_normalize_rotation_rejects_empty_input(self):
+        with self.assertRaisesRegex(ValueError, "没有可回测的数据"):
+            normalize_rotation_dataframe(pd.DataFrame(), fallback_name="测试")
+
+    def test_rotation_rejects_position_count_above_fund_count(self):
+        funds = [
+            RotationInput("A", "A", pd.DataFrame()),
+            RotationInput("B", "B", pd.DataFrame()),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "持仓数量必须在 1 到 2 之间"):
+            run_fund_rotation_backtest(funds, num_positions=3)
+
     def test_momentum_uses_full_previous_close_window(self):
         dates = pd.bdate_range("2026-01-01", periods=24)
         prices = pd.Series(range(100, 124), dtype=float)

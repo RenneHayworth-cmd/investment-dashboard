@@ -14,19 +14,23 @@ from core.db import finish_job, start_job
 from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date
 from services.index_ma20 import (
     INDEX_CONFIG,
+    INDEX_FINAL_HISTORY_SOURCE,
     INDEX_LONG_HISTORY_SOURCE,
+    INDEX_SOURCE_CORRECTION_SOURCE,
     append_eastmoney_latest_index_row,
     extract_raw_from_export_df,
+    extract_source_correction_rows,
     build_export_df,
     fetch_index_from_source,
     fetch_one_index,
     filter_completed_market_dates,
-    filter_market_trading_dates,
     get_index_raw_from_tickflow,
     merge_by_date,
     merge_raw_index_data,
+    overlay_finalized_index_rows,
     raw_cache_symbol,
     sanitize_index_report_market_dates,
+    source_correction_fetch_days,
 )
 
 
@@ -176,7 +180,12 @@ def run_index_ma20_update(
 
         report = merge_by_date(all_data)
         if cached_df is not None and not cached_df.empty:
-            report = merge_index_report(cached_df, report)
+            report = merge_index_report(
+                cached_df,
+                report,
+                prefer_update_index_names={name for name, _ in selected_items},
+            )
+        report = enrich_index_report_indicators(report)
         report = sanitize_index_report_market_dates(report)
         report.attrs["errors"] = errors
         save_dataset(
@@ -246,7 +255,11 @@ def cached_report_satisfies_current_quotes(
     return True
 
 
-def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd.DataFrame:
+def merge_index_report(
+    existing_df: pd.DataFrame,
+    update_df: pd.DataFrame,
+    prefer_update_index_names: set[str] | None = None,
+) -> pd.DataFrame:
     existing = existing_df.copy()
     update = update_df.copy()
     if existing.empty:
@@ -258,7 +271,13 @@ def merge_index_report(existing_df: pd.DataFrame, update_df: pd.DataFrame) -> pd
     update["日期"] = update["日期"].astype(str)
     existing = existing.drop_duplicates("日期", keep="first").set_index("日期")
     update = update.drop_duplicates("日期", keep="last").set_index("日期")
-    merged = existing.combine_first(update).reset_index()
+    merged = existing.combine_first(update)
+    for index_name in prefer_update_index_names or set():
+        for column in update.columns:
+            if not str(column).startswith(f"{index_name}_"):
+                continue
+            merged[column] = update[column].combine_first(merged.get(column))
+    merged = merged.reset_index()
     return merged.sort_values("日期").reset_index(drop=True)
 
 
@@ -284,9 +303,7 @@ def sync_index_long_history(cache_symbol: str, index_name: str, new_df: pd.DataF
     if long_cached_raw is None or long_cached_raw.empty:
         return
 
-    market_name = str(INDEX_CONFIG.get(index_name, {}).get("market_group") or "")
     merged = append_cached_index_rows(long_cached_raw, new_df)
-    merged = filter_completed_market_dates(merged, market_name)
     if len(merged) == len(long_cached_raw):
         return
     save_dataset(
@@ -296,6 +313,53 @@ def sync_index_long_history(cache_symbol: str, index_name: str, new_df: pd.DataF
         data_type="index_daily_raw",
         df=merged,
     )
+
+
+def enrich_index_report_indicators(report_df: pd.DataFrame) -> pd.DataFrame:
+    """Fill report indicators from long history plus unsaved current display rows."""
+    if report_df is None or report_df.empty:
+        return report_df
+
+    enriched = report_df.copy()
+    for index_name, index_config in INDEX_CONFIG.items():
+        cache_symbol = raw_cache_symbol(index_name, index_config)
+        history_raw, _ = load_dataset(
+            cache_symbol,
+            INDEX_LONG_HISTORY_SOURCE,
+            "index_daily_raw",
+        )
+        if history_raw is None or history_raw.empty:
+            history_raw, _ = load_dataset(
+                cache_symbol,
+                "index_history",
+                "index_daily_raw",
+            )
+        finalized_raw, _ = load_dataset(
+            cache_symbol,
+            INDEX_FINAL_HISTORY_SOURCE,
+            "index_daily_raw",
+        )
+        history_raw = overlay_finalized_index_rows(history_raw, finalized_raw)
+        correction_raw, _ = load_dataset(
+            cache_symbol,
+            INDEX_SOURCE_CORRECTION_SOURCE,
+            "index_daily_raw",
+        )
+        correction_raw = extract_source_correction_rows(correction_raw, index_config)
+        history_raw = overlay_finalized_index_rows(history_raw, correction_raw)
+        report_raw = extract_raw_from_export_df(enriched, index_name)
+        if report_raw is None or report_raw.empty:
+            continue
+
+        combined_raw = append_cached_index_rows(history_raw, report_raw)
+        combined_raw = filter_completed_market_dates(
+            combined_raw,
+            str(index_config.get("market_group") or ""),
+        )
+        calculated = build_export_df(combined_raw, index_name, days=120)
+        if calculated is not None and not calculated.empty:
+            enriched = merge_index_report(enriched, calculated)
+    return enriched
 
 
 def extract_cached_index_report(cached_df: pd.DataFrame | None, index_name: str) -> pd.DataFrame | None:
@@ -420,21 +484,44 @@ def fetch_index_report(
 ) -> pd.DataFrame | None:
     df = None
     cache_symbol = raw_cache_symbol(index_name, index_config)
-    cached_history_raw, _ = load_dataset(
+    cached_history_storage_raw, _ = load_dataset(
         cache_symbol,
         "index_history",
         "index_daily_raw",
     )
-    if cached_history_raw is None or cached_history_raw.empty:
+    if cached_history_storage_raw is None or cached_history_storage_raw.empty:
         cached_index_report = extract_cached_index_report(cached_report, index_name)
-        cached_history_raw = extract_raw_from_export_df(cached_index_report, index_name)
+        cached_history_storage_raw = extract_raw_from_export_df(cached_index_report, index_name)
     market_name = str(index_config.get("market_group") or "")
-    cached_history_raw = filter_market_trading_dates(cached_history_raw, market_name)
-    needs_history_bootstrap = cached_history_raw is None or len(cached_history_raw) < INDEX_HISTORY_MIN_ROWS
+    cached_history_raw = filter_completed_market_dates(cached_history_storage_raw, market_name)
+    finalized_raw, _ = load_dataset(
+        cache_symbol,
+        INDEX_FINAL_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    finalized_raw = filter_completed_market_dates(finalized_raw, market_name)
+    correction_storage_raw, _ = load_dataset(
+        cache_symbol,
+        INDEX_SOURCE_CORRECTION_SOURCE,
+        "index_daily_raw",
+    )
+    correction_raw = filter_completed_market_dates(
+        extract_source_correction_rows(correction_storage_raw, index_config),
+        market_name,
+    )
+    effective_history_raw = overlay_finalized_index_rows(cached_history_raw, finalized_raw)
+    effective_history_raw = overlay_finalized_index_rows(effective_history_raw, correction_raw)
+    needs_history_bootstrap = effective_history_raw is None or len(effective_history_raw) < INDEX_HISTORY_MIN_ROWS
     source_days = (
         max(int(days), INDEX_HISTORY_BOOTSTRAP_DAYS)
         if needs_history_bootstrap
         else INDEX_HISTORY_INCREMENTAL_DAYS
+    )
+    source_days = source_correction_fetch_days(
+        index_config,
+        correction_raw,
+        market_name,
+        source_days,
     )
     tickflow_symbol = index_config.get("tickflow_symbol") if isinstance(index_config, dict) else None
     if tickflow_symbol:
@@ -454,26 +541,43 @@ def fetch_index_report(
                 tickflow_symbol,
                 count=fetch_count,
             )
-            latest_raw = filter_market_trading_dates(latest_raw, market_name)
+            latest_raw = filter_completed_market_dates(latest_raw, market_name)
             if latest_raw is not None and not latest_raw.empty:
+                previous_finalized_count = 0 if finalized_raw is None else len(finalized_raw)
+                finalized_raw = append_cached_index_rows(finalized_raw, latest_raw)
+                if len(finalized_raw) > previous_finalized_count:
+                    save_dataset(
+                        symbol=cache_symbol,
+                        name=f"{index_name} 指数收盘确认日线",
+                        source=INDEX_FINAL_HISTORY_SOURCE,
+                        data_type="index_daily_raw",
+                        df=finalized_raw,
+                    )
+                previous_tickflow_count = 0 if cached_raw is None else len(cached_raw)
                 raw_df = append_cached_index_rows(cached_raw, latest_raw)
-                save_dataset(
-                    symbol=cache_symbol,
-                    name=f"{index_name} 指数原始日线",
-                    source="tickflow",
-                    data_type="index_daily_raw",
-                    df=raw_df,
-                )
-                raw_df = append_cached_index_rows(cached_history_raw, raw_df)
-                save_dataset(
-                    symbol=cache_symbol,
-                    name=f"{index_name} 指数累计日线",
-                    source="index_history",
-                    data_type="index_daily_raw",
-                    df=raw_df,
-                )
-                cached_history_raw = raw_df
-                df = build_export_df(raw_df, index_name, days=days)
+                if len(raw_df) > previous_tickflow_count:
+                    save_dataset(
+                        symbol=cache_symbol,
+                        name=f"{index_name} 指数原始日线",
+                        source="tickflow",
+                        data_type="index_daily_raw",
+                        df=raw_df,
+                    )
+                previous_history_count = 0 if cached_history_storage_raw is None else len(cached_history_storage_raw)
+                history_storage_raw = append_cached_index_rows(cached_history_storage_raw, raw_df)
+                if len(history_storage_raw) > previous_history_count:
+                    save_dataset(
+                        symbol=cache_symbol,
+                        name=f"{index_name} 指数累计日线",
+                        source="index_history",
+                        data_type="index_daily_raw",
+                        df=history_storage_raw,
+                    )
+                cached_history_storage_raw = history_storage_raw
+                cached_history_raw = filter_completed_market_dates(history_storage_raw, market_name)
+                effective_history_raw = overlay_finalized_index_rows(cached_history_raw, finalized_raw)
+                effective_history_raw = overlay_finalized_index_rows(effective_history_raw, correction_raw)
+                df = build_export_df(effective_history_raw, index_name, days=days)
                 if df is not None and not df.empty and not has_current_index_quote(df, index_name, index_config):
                     df = fetch_index_from_source(index_name, index_config, days=source_days)
         except Exception:
@@ -483,19 +587,48 @@ def fetch_index_report(
         df = fetch_one_index(index_name, index_config, api_key=api_key, days=source_days)
 
     latest_raw = extract_raw_from_export_df(df, index_name)
-    latest_raw = filter_market_trading_dates(latest_raw, market_name)
+    latest_raw = filter_completed_market_dates(latest_raw, market_name)
     if latest_raw is None or latest_raw.empty:
-        return df
+        return build_export_df(effective_history_raw, index_name, days=days)
 
-    accumulated_raw = append_cached_index_rows(cached_history_raw, latest_raw)
-    accumulated_raw = filter_market_trading_dates(accumulated_raw, market_name)
-    save_dataset(
-        symbol=cache_symbol,
-        name=f"{index_name} 指数累计日线",
-        source="index_history",
-        data_type="index_daily_raw",
-        df=accumulated_raw,
-    )
-    sync_index_long_history(cache_symbol, index_name, accumulated_raw)
-    rebuilt = build_export_df(accumulated_raw, index_name, days=days)
+    latest_correction_raw = extract_source_correction_rows(latest_raw, index_config)
+    if latest_correction_raw is not None and not latest_correction_raw.empty:
+        previous_correction_count = 0 if correction_storage_raw is None else len(correction_storage_raw)
+        correction_storage_raw = append_cached_index_rows(correction_storage_raw, latest_correction_raw)
+        if len(correction_storage_raw) > previous_correction_count:
+            save_dataset(
+                symbol=cache_symbol,
+                name=f"{index_name} 指数来源校正日线",
+                source=INDEX_SOURCE_CORRECTION_SOURCE,
+                data_type="index_daily_raw",
+                df=correction_storage_raw,
+            )
+        correction_raw = filter_completed_market_dates(correction_storage_raw, market_name)
+
+    previous_finalized_count = 0 if finalized_raw is None else len(finalized_raw)
+    finalized_raw = append_cached_index_rows(finalized_raw, latest_raw)
+    if len(finalized_raw) > previous_finalized_count:
+        save_dataset(
+            symbol=cache_symbol,
+            name=f"{index_name} 指数收盘确认日线",
+            source=INDEX_FINAL_HISTORY_SOURCE,
+            data_type="index_daily_raw",
+            df=finalized_raw,
+        )
+
+    previous_history_count = 0 if cached_history_storage_raw is None else len(cached_history_storage_raw)
+    accumulated_storage_raw = append_cached_index_rows(cached_history_storage_raw, latest_raw)
+    if len(accumulated_storage_raw) > previous_history_count:
+        save_dataset(
+            symbol=cache_symbol,
+            name=f"{index_name} 指数累计日线",
+            source="index_history",
+            data_type="index_daily_raw",
+            df=accumulated_storage_raw,
+        )
+        sync_index_long_history(cache_symbol, index_name, accumulated_storage_raw)
+    accumulated_raw = filter_completed_market_dates(accumulated_storage_raw, market_name)
+    effective_history_raw = overlay_finalized_index_rows(accumulated_raw, finalized_raw)
+    effective_history_raw = overlay_finalized_index_rows(effective_history_raw, correction_raw)
+    rebuilt = build_export_df(effective_history_raw, index_name, days=days)
     return df if rebuilt is None or rebuilt.empty else rebuilt

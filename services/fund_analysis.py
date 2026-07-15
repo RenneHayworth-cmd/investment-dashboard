@@ -4,11 +4,15 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
+import logging
 import time
 
 import numpy as np
 import pandas as pd
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 DATE_KEYWORDS = ("日期", "date", "trade_date", "净值日期")
@@ -118,8 +122,8 @@ def fetch_eastmoney_fund_name(fund_code: str) -> str:
                 name = str(item.get("NAME", "")).strip()
                 if name:
                     return name
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.info("东方财富基金 %s 名称获取失败，沿用基金代码：%s", fund_code, exc)
     return fund_code
 
 
@@ -131,7 +135,21 @@ def _fetch_eastmoney_total_count(fund_code: str) -> int:
 def _fetch_eastmoney_fund_nav_page(fund_code: str, page_index: int, page_size: int) -> pd.DataFrame:
     time.sleep(0.02)
     payload = _request_eastmoney_page(fund_code, page_index=page_index, page_size=page_size)
-    nav_list = payload.get("Data", {}).get("LSJZList", [])
+    data = payload.get("Data")
+    total_count = int(payload.get("TotalCount") or 0)
+    if data is None and total_count == 0:
+        nav_list = []
+    elif not isinstance(data, dict):
+        raise ValueError("东方财富接口响应格式异常：Data 字段缺失或不是对象。")
+    elif "LSJZList" not in data:
+        if total_count == 0:
+            nav_list = []
+        else:
+            raise ValueError("东方财富接口响应格式异常：Data.LSJZList 字段缺失。")
+    else:
+        nav_list = data["LSJZList"]
+        if not isinstance(nav_list, list):
+            raise ValueError("东方财富接口响应格式异常：Data.LSJZList 不是列表。")
     rows = []
     for item in nav_list:
         date = item.get("FSRQ")
@@ -169,6 +187,8 @@ def _request_eastmoney_page(fund_code: str, page_index: int, page_size: int) -> 
     )
     response.raise_for_status()
     payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("东方财富接口响应格式异常：JSON 根节点不是对象。")
     if payload.get("ErrCode") not in (0, None):
         raise ValueError(payload.get("ErrMsg") or "东方财富接口返回错误。")
     return payload

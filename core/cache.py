@@ -1,3 +1,4 @@
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -36,54 +37,52 @@ def save_dataset(
 
     last_trade_date = latest_trade_date_text(df)
 
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO datasets (
-            symbol, name, source, data_type, period, file_path,
-            last_trade_date, last_update_time, row_count, status, error_message
+    with closing(get_conn()) as conn:
+        conn.execute(
+            """
+            INSERT INTO datasets (
+                symbol, name, source, data_type, period, file_path,
+                last_trade_date, last_update_time, row_count, status, error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, source, data_type, period)
+            DO UPDATE SET
+                name=excluded.name,
+                file_path=excluded.file_path,
+                last_trade_date=excluded.last_trade_date,
+                last_update_time=excluded.last_update_time,
+                row_count=excluded.row_count,
+                status=excluded.status,
+                error_message=excluded.error_message
+            """,
+            (
+                symbol,
+                name,
+                source,
+                data_type,
+                period,
+                str(file_path),
+                last_trade_date,
+                datetime.now().isoformat(timespec="seconds"),
+                len(df),
+                "success",
+                None,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(symbol, source, data_type, period)
-        DO UPDATE SET
-            name=excluded.name,
-            file_path=excluded.file_path,
-            last_trade_date=excluded.last_trade_date,
-            last_update_time=excluded.last_update_time,
-            row_count=excluded.row_count,
-            status=excluded.status,
-            error_message=excluded.error_message
-        """,
-        (
-            symbol,
-            name,
-            source,
-            data_type,
-            period,
-            str(file_path),
-            last_trade_date,
-            datetime.now().isoformat(timespec="seconds"),
-            len(df),
-            "success",
-            None,
-        ),
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
     return file_path
 
 
 def load_dataset(symbol: str, source: str, data_type: str, period: str = "1d"):
-    conn = get_conn()
-    row = conn.execute(
-        """
-        SELECT file_path, last_trade_date, last_update_time, status
-        FROM datasets
-        WHERE symbol=? AND source=? AND data_type=? AND period=?
-        """,
-        (symbol, source, data_type, period),
-    ).fetchone()
-    conn.close()
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            """
+            SELECT file_path, last_trade_date, last_update_time, status
+            FROM datasets
+            WHERE symbol=? AND source=? AND data_type=? AND period=?
+            """,
+            (symbol, source, data_type, period),
+        ).fetchone()
 
     if not row:
         return None, None
@@ -97,15 +96,14 @@ def load_dataset(symbol: str, source: str, data_type: str, period: str = "1d"):
 
 
 def list_datasets() -> pd.DataFrame:
-    conn = get_conn()
-    df = pd.read_sql_query(
-        """
-        SELECT symbol, name, source, data_type, period, last_trade_date,
-               last_update_time, row_count, status, file_path
-        FROM datasets
-        ORDER BY last_update_time DESC
-        """,
-        conn,
-    )
-    conn.close()
+    with closing(get_conn()) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT symbol, name, source, data_type, period, last_trade_date,
+                   last_update_time, row_count, status, file_path
+            FROM datasets
+            ORDER BY last_update_time DESC
+            """,
+            conn,
+        )
     return df

@@ -4,8 +4,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
 from functools import lru_cache
+import logging
 
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import exchange_calendars as xcals
@@ -180,8 +184,23 @@ def _get_exchange_calendar(calendar_name: str):
         return None
     try:
         return xcals.get_calendar(calendar_name)
-    except Exception:
+    except Exception as exc:
+        logger.warning("交易所日历 %s 加载失败，将使用静态休市日兜底：%s", calendar_name, exc)
         return None
+
+
+@lru_cache(maxsize=None)
+def _warn_static_calendar_coverage(market_name: str, year: int) -> None:
+    covered_years = sorted({day.year for day in STATIC_MARKET_HOLIDAYS.get(market_name, set())})
+    if not covered_years or year <= max(covered_years):
+        return
+    coverage = "、".join(str(value) for value in covered_years)
+    logger.warning(
+        "%s 交易所日历不可用；静态休市日仅覆盖 %s 年，%s 年休市判断可能不完整。",
+        market_name,
+        coverage,
+        year,
+    )
 
 
 def get_market_window(name: str) -> MarketWindow | None:
@@ -194,8 +213,10 @@ def is_market_holiday(market: MarketWindow, day: date) -> bool:
         if calendar is not None:
             try:
                 return not bool(calendar.is_session(pd.Timestamp(day)))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("%s 交易所日历查询 %s 失败，将使用静态休市日兜底：%s", market.name, day, exc)
+    if market.name != "美股":
+        _warn_static_calendar_coverage(market.name, day.year)
     if day in STATIC_MARKET_HOLIDAYS.get(market.name, set()):
         return True
     if market.name == "美股":
