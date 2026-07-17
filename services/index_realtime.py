@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 import re
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -18,7 +19,8 @@ from services.index_ma20 import (
 from services.market_calendar import (
     get_market_window,
     is_market_trading_day,
-    latest_completed_trade_date,
+    latest_settled_trade_date,
+    previous_trading_day,
 )
 
 
@@ -98,10 +100,30 @@ FUTURES_TRADING_SESSIONS = {
 }
 
 POST_CLOSE_DAILY_DELAY = timedelta(minutes=10)
+_RUNTIME_QUOTE_CACHE: dict[str, dict[str, object]] = {}
+_RUNTIME_QUOTE_CACHE_LOCK = Lock()
 
 
 def _supported_realtime_index_names() -> set[str]:
     return set(EASTMONEY_QUOTE_SECIDS) | set(YAHOO_QUOTE_SYMBOLS) | set(FUTURES_QUOTE_SYMBOLS)
+
+
+def remember_runtime_realtime_quotes(quotes: dict[str, dict[str, object]]) -> None:
+    """Keep card-only quotes in process memory so a browser refresh can restore them."""
+    if not quotes:
+        return
+    with _RUNTIME_QUOTE_CACHE_LOCK:
+        for index_name, quote in quotes.items():
+            _RUNTIME_QUOTE_CACHE[str(index_name)] = dict(quote)
+
+
+def load_runtime_realtime_quotes() -> dict[str, dict[str, object]]:
+    """Return an isolated copy of the transient card quote cache."""
+    with _RUNTIME_QUOTE_CACHE_LOCK:
+        return {
+            index_name: dict(quote)
+            for index_name, quote in _RUNTIME_QUOTE_CACHE.items()
+        }
 
 
 def _is_mainland_lunch(index_name: str, *, now: datetime | None = None) -> bool:
@@ -321,22 +343,24 @@ def _daily_update_target(
     if market is None:
         return None
     market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
-    current_time = market_now.time()
-    if is_market_trading_day(market, market_now):
-        if market.sessions[0][0] <= current_time <= market.sessions[-1][1]:
-            return None
-        close_at = datetime.combine(market_now.date(), market.sessions[-1][1], tzinfo=ZoneInfo(market.timezone))
-        if close_at < market_now < close_at + POST_CLOSE_DAILY_DELAY:
-            return None
+    target_date = latest_settled_trade_date(
+        market,
+        market_now,
+        settlement_delay=POST_CLOSE_DAILY_DELAY,
+    )
 
     futures_symbol = str(config.get("futures_symbol") or config.get("code") or "").upper()
-    if futures_symbol in FUTURES_TRADING_SESSIONS and _futures_market_is_open(futures_symbol, now=now):
-        return None
-    return latest_completed_trade_date(market, market_now)
+    if (
+        futures_symbol in FUTURES_TRADING_SESSIONS
+        and _futures_market_is_open(futures_symbol, now=now)
+        and target_date == market_now.date()
+    ):
+        return previous_trading_day(market, market_now.date())
+    return target_date
 
 
 def daily_update_eligible_index_names(*, now: datetime | None = None) -> set[str]:
-    """Return indexes whose current market session is not in progress."""
+    """Return indexes with a safe completed-session target."""
     return {
         index_name
         for index_name in INDEX_CONFIG

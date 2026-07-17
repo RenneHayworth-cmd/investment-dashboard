@@ -13,6 +13,7 @@ from core.db import init_db
 from core.ui import DEFAULT_CHART_HEIGHT, apply_global_style, apply_plotly_layout, render_page_header
 from services.index_ma20 import (
     INDEX_CONFIG,
+    INDEX_REPORT_DISPLAY_DAYS,
     build_summary,
     fetch_index_history,
     filter_market_trading_dates,
@@ -25,21 +26,39 @@ from services.index_realtime import (
     find_pending_post_close_index_names,
     format_index_display_name,
     load_futures_main_contract_names,
+    load_runtime_realtime_quotes,
     manual_quote_request_names,
     quote_is_visible_for_manual_display,
+    remember_runtime_realtime_quotes,
     save_futures_main_contract_names,
 )
 from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, latest_completed_trade_date
-from services.update_tasks import run_index_ma20_update
+from services.update_tasks import (
+    enrich_index_report_indicators,
+    run_index_ma20_update,
+    trim_index_report,
+)
 
 
 st.set_page_config(page_title="指数监控", layout="wide")
 init_db()
 apply_global_style()
+st.markdown(
+    """
+    <style>
+    div[data-testid="stElementContainer"][data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 render_page_header("指数监控", "跟踪主要指数、跨市场指数和期货主连相对 MA20 的位置与趋势。", eyebrow="Index Monitor")
 
 INDEX_UPDATE_WORKERS = 8
+MA20_TABLE_EXCLUDED_INDEXES = {"VIX恐慌指数"}
 
 if "index_update_notice" not in st.session_state:
     st.session_state.index_update_notice = None
@@ -48,7 +67,7 @@ if "selected_index_detail" not in st.session_state:
 if "index_update_timings" not in st.session_state:
     st.session_state.index_update_timings = []
 if "index_realtime_quote_cache" not in st.session_state:
-    st.session_state.index_realtime_quote_cache = {}
+    st.session_state.index_realtime_quote_cache = load_runtime_realtime_quotes()
 if "index_lunch_quote_keys" not in st.session_state:
     st.session_state.index_lunch_quote_keys = []
 if "index_futures_main_contracts" not in st.session_state:
@@ -435,7 +454,8 @@ def render_index_card(row: pd.Series) -> None:
 
 
 def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
-    stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
+    stored_quotes = load_runtime_realtime_quotes()
+    stored_quotes.update(st.session_state.get("index_realtime_quote_cache", {}))
     display_quotes = {
         index_name: quote
         for index_name, quote in stored_quotes.items()
@@ -477,6 +497,7 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
         else:
             status = "待更新"
             status_class = "stale"
+        display_day = market_now.date() if status == "休市" else latest_day
 
         items.append(
             {
@@ -484,6 +505,7 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
                 "status": status,
                 "status_class": status_class,
                 "latest_day": latest_day,
+                "display_day": display_day,
             }
         )
     return items
@@ -497,7 +519,7 @@ def render_freshness_bar(summary_df: pd.DataFrame) -> list[str]:
             '<div class="freshness-item">'
             f'<span class="freshness-name">{html.escape(display_index_name(item["index_name"]))}</span>'
             f'<span class="freshness-pill {item["status_class"]}">{item["status"]}</span>'
-            f'<span class="freshness-date">{item["latest_day"]:%m-%d}</span>'
+            f'<span class="freshness-date">{item["display_day"]:%m-%d}</span>'
             "</div>"
         )
 
@@ -535,11 +557,11 @@ def render_update_timings() -> None:
         st.dataframe(timing_df, use_container_width=True, hide_index=True)
 
 
-def run_single_index_update(index_name: str, api_key: str, days: int) -> None:
+def run_single_index_update(index_name: str, api_key: str) -> None:
     with st.spinner(f"正在更新 {index_name}..."):
         result = run_index_ma20_update(
             api_key=api_key,
-            days=int(days),
+            days=INDEX_REPORT_DISPLAY_DAYS,
             cache_source="auto",
             use_fresh_cache=False,
             index_names=[index_name],
@@ -556,7 +578,7 @@ def run_single_index_update(index_name: str, api_key: str, days: int) -> None:
         st.error(result.message)
 
 
-def render_single_index_update(stale_indexes: list[str], api_key: str, days: int) -> None:
+def render_single_index_update(stale_indexes: list[str], api_key: str) -> None:
     if not stale_indexes:
         return
     update_col, button_col = st.columns([3, 1])
@@ -567,7 +589,7 @@ def render_single_index_update(stale_indexes: list[str], api_key: str, days: int
         label_visibility="collapsed",
     )
     if button_col.button("只更新选中指数", use_container_width=True):
-        run_single_index_update(selected_index, api_key, days)
+        run_single_index_update(selected_index, api_key)
 
 
 with st.sidebar:
@@ -578,7 +600,6 @@ with st.sidebar:
         type="password",
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
-    days = st.number_input("展示最近天数", min_value=10, max_value=365, value=30, step=5)
     update_clicked = st.button("更新指数数据", type="primary")
 
 notice = st.session_state.pop("index_update_notice", None)
@@ -594,6 +615,7 @@ if update_clicked:
         force_index_names=quote_names,
     )
     if quotes:
+        remember_runtime_realtime_quotes(quotes)
         stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
         stored_quotes.update(quotes)
         st.session_state.index_realtime_quote_cache = stored_quotes
@@ -633,7 +655,7 @@ if update_clicked:
 
         result = run_index_ma20_update(
             api_key=api_key,
-            days=int(days),
+            days=INDEX_REPORT_DISPLAY_DAYS,
             cache_source="auto",
             use_fresh_cache=False,
             progress_callback=show_progress,
@@ -670,6 +692,8 @@ if report_df is not None and report_meta is not None:
 
 if report_df is not None:
     report_df = sanitize_index_report_market_dates(report_df)
+    report_df = enrich_index_report_indicators(report_df)
+    report_df = trim_index_report(report_df, days=INDEX_REPORT_DISPLAY_DAYS)
     summary_df = build_summary(report_df)
     if not summary_df.empty:
         selected_index = get_query_index_detail()
@@ -680,14 +704,16 @@ if report_df is not None:
         render_single_index_update(
             [index_name for index_name in stale_indexes if index_name in pending_indexes],
             api_key,
-            int(days),
         )
         render_update_timings()
         if selected_index:
             render_index_detail(report_df, selected_index)
         render_manual_index_cards(summary_df)
 
-        display_summary_df = summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
+        table_summary_df = summary_df.loc[
+            ~summary_df["指数"].isin(MA20_TABLE_EXCLUDED_INDEXES)
+        ].copy()
+        display_summary_df = table_summary_df.drop(columns=["代码", "日期", "前收盘价"], errors="ignore")
         if "指数" in display_summary_df.columns:
             display_summary_df["指数"] = display_summary_df["指数"].map(display_index_name)
         if "偏离率(%)" in display_summary_df.columns:

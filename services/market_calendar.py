@@ -112,6 +112,7 @@ STATIC_MARKET_HOLIDAYS = {
         "2026-03-02",
         "2026-05-01", "2026-05-05", "2026-05-25",
         "2026-06-03",
+        "2026-07-17",
         "2026-08-17",
         "2026-09-24", "2026-09-25", "2026-09-28",
         "2026-10-05", "2026-10-09",
@@ -258,5 +259,24 @@ def latest_completed_trade_date(market: MarketWindow, market_now: datetime) -> d
     if not is_market_trading_day(market, market_now):
         return previous_trading_day(market, market_now.date())
     if market_now.time() <= market.sessions[-1][1]:
+        return previous_trading_day(market, market_now.date())
+    return market_now.date()
+
+
+def latest_settled_trade_date(
+    market: MarketWindow,
+    market_now: datetime,
+    *,
+    settlement_delay: timedelta = timedelta(minutes=10),
+) -> date:
+    """Return the latest session safe to persist as a formal daily close."""
+    if not is_market_trading_day(market, market_now):
+        return previous_trading_day(market, market_now.date())
+    close_at = datetime.combine(
+        market_now.date(),
+        market.sessions[-1][1],
+        tzinfo=market_now.tzinfo,
+    )
+    if market_now < close_at + settlement_delay:
         return previous_trading_day(market, market_now.date())
     return market_now.date()

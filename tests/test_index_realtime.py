@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from services.index_realtime import (
+    _daily_update_target,
     _futures_market_is_open,
     _fetch_futures_quote,
     _infer_main_contract_symbol,
@@ -17,9 +18,11 @@ from services.index_realtime import (
     format_index_display_name,
     find_final_close_quote_names,
     find_pending_post_close_index_names,
+    load_runtime_realtime_quotes,
     manual_quote_request_names,
     quote_is_visible_for_manual_display,
     quote_is_active_for_display,
+    remember_runtime_realtime_quotes,
 )
 
 
@@ -29,6 +32,9 @@ class IndexRealtimeTests(unittest.TestCase):
 
         self.assertNotIn("run_every=", page_source)
         self.assertNotIn("盘中卡片每10分钟自动刷新", page_source)
+        self.assertIn('[data-stale="true"]', page_source)
+        self.assertIn("opacity: 1 !important", page_source)
+        self.assertIn('display_day = market_now.date() if status == "休市" else latest_day', page_source)
 
     def test_manual_lunch_quote_is_requested_only_once_for_mainland_instruments(self):
         lunch_time = datetime(2026, 7, 15, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -40,6 +46,25 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertIn("原油主连", first_names)
         self.assertNotIn("沪深300", second_names)
         self.assertNotIn("原油主连", second_names)
+
+    def test_runtime_quote_cache_returns_an_isolated_copy(self):
+        quote_time = datetime(2026, 7, 17, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        remember_runtime_realtime_quotes(
+            {
+                "测试指数": {
+                    "price": 123.45,
+                    "quote_time": quote_time,
+                    "source": "测试",
+                }
+            }
+        )
+
+        first_read = load_runtime_realtime_quotes()
+        first_read["测试指数"]["price"] = 999.0
+        second_read = load_runtime_realtime_quotes()
+
+        self.assertEqual(second_read["测试指数"]["price"], 123.45)
+        self.assertEqual(second_read["测试指数"]["quote_time"], quote_time)
 
     def test_lunch_quote_remains_visible_until_mainland_afternoon_session(self):
         lunch_time = datetime(2026, 7, 15, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -183,6 +208,14 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertFalse(quote_is_active_for_display("原油主连", now=china_time))
         self.assertTrue(quote_is_active_for_display("恒生科技", now=china_time))
 
+    def test_manual_quotes_include_nikkei_but_exclude_kospi_on_korean_holiday(self):
+        china_time = datetime(2026, 7, 17, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        names, _ = manual_quote_request_names(set(), now=china_time)
+
+        self.assertIn("日经225", names)
+        self.assertNotIn("韩国KOSPI", names)
+
     @patch("akshare.futures_zh_spot")
     def test_futures_quote_uses_cached_daily_close_for_change(self, spot_mock):
         spot_mock.return_value = pd.DataFrame(
@@ -230,14 +263,42 @@ class IndexRealtimeTests(unittest.TestCase):
         before_delay = datetime(2026, 7, 14, 14, 35, tzinfo=ZoneInfo("Asia/Shanghai"))
         after_delay = datetime(2026, 7, 14, 14, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-        before = daily_update_eligible_index_names(now=before_delay)
-        after = daily_update_eligible_index_names(now=after_delay)
+        self.assertEqual(_daily_update_target("日经225", now=before_delay).isoformat(), "2026-07-13")
+        self.assertEqual(_daily_update_target("韩国KOSPI", now=before_delay).isoformat(), "2026-07-13")
+        self.assertEqual(_daily_update_target("日经225", now=after_delay).isoformat(), "2026-07-14")
+        self.assertEqual(_daily_update_target("韩国KOSPI", now=after_delay).isoformat(), "2026-07-14")
 
-        self.assertNotIn("日经225", before)
-        self.assertNotIn("韩国KOSPI", before)
-        self.assertIn("日经225", after)
-        self.assertIn("韩国KOSPI", after)
-        self.assertNotIn("沪深300", after)
+        self.assertEqual(_daily_update_target("沪深300", now=after_delay).isoformat(), "2026-07-13")
+
+    def test_hong_kong_daily_update_starts_ten_minutes_after_close(self):
+        before_delay = datetime(2026, 7, 15, 16, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+        after_delay = datetime(2026, 7, 15, 16, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        self.assertEqual(_daily_update_target("恒生科技", now=before_delay).isoformat(), "2026-07-14")
+        self.assertEqual(
+            _daily_update_target("恒生港股通高息低波", now=before_delay).isoformat(),
+            "2026-07-14",
+        )
+        self.assertEqual(_daily_update_target("恒生科技", now=after_delay).isoformat(), "2026-07-15")
+        self.assertEqual(
+            _daily_update_target("恒生港股通高息低波", now=after_delay).isoformat(),
+            "2026-07-15",
+        )
+
+    @patch("services.index_realtime.load_dataset")
+    def test_current_session_still_updates_missing_previous_close(self, load_dataset_mock):
+        def load_side_effect(_symbol, _source, _data_type):
+            return pd.DataFrame({"trade_date": ["2026-07-15"], "close": [100.0]}), {}
+
+        load_dataset_mock.side_effect = load_side_effect
+        current_session = datetime(2026, 7, 17, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        pending = find_pending_post_close_index_names(
+            now=current_session,
+            index_names={"沪深300", "恒生科技", "日经225", "韩国KOSPI"},
+        )
+
+        self.assertEqual(pending, {"沪深300", "恒生科技", "日经225", "韩国KOSPI"})
 
     @patch("services.index_realtime.load_dataset")
     def test_pending_daily_update_uses_finalized_cache_date(self, load_dataset_mock):

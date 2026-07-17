@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -11,11 +11,12 @@ import pandas as pd
 
 from core.cache import load_dataset, save_dataset
 from core.db import finish_job, start_job
-from services.market_calendar import MARKET_WINDOWS, expected_latest_trade_date
+from services.market_calendar import MARKET_WINDOWS, latest_settled_trade_date
 from services.index_ma20 import (
     INDEX_CONFIG,
     INDEX_FINAL_HISTORY_SOURCE,
     INDEX_LONG_HISTORY_SOURCE,
+    INDEX_REPORT_DISPLAY_DAYS,
     INDEX_SOURCE_CORRECTION_SOURCE,
     append_eastmoney_latest_index_row,
     extract_raw_from_export_df,
@@ -52,7 +53,7 @@ class UpdateResult:
 
 def run_index_ma20_update(
     api_key: str = "",
-    days: int = 30,
+    days: int = INDEX_REPORT_DISPLAY_DAYS,
     cache_source: str = "auto",
     use_fresh_cache: bool = True,
     progress_callback: ProgressCallback | None = None,
@@ -154,6 +155,8 @@ def run_index_ma20_update(
                         )
                         current_enough = has_current_index_quote(cached_index_df, index_name, index_config)
                         status = "success" if current_enough else "cached"
+                        if current_enough:
+                            persist_confirmed_index_report_row(index_name, index_config, cached_index_df)
                         message = (
                             "\u4e1c\u65b9\u8d22\u5bccK\u7ebf\u63a5\u53e3\u5931\u8d25\uff0c\u5df2\u4f7f\u7528\u672c\u5730\u5386\u53f2\u5e8f\u5217 + \u4e1c\u65b9\u8d22\u5bcc\u5217\u8868\u6700\u65b0\u4ef7\u8865\u9f50\u5f53\u5929\u6570\u636e"
                             if current_enough
@@ -187,6 +190,7 @@ def run_index_ma20_update(
             )
         report = enrich_index_report_indicators(report)
         report = sanitize_index_report_market_dates(report)
+        report = trim_index_report(report, days=INDEX_REPORT_DISPLAY_DAYS)
         report.attrs["errors"] = errors
         save_dataset(
             symbol="index_ma20_latest",
@@ -281,6 +285,18 @@ def merge_index_report(
     return merged.sort_values("日期").reset_index(drop=True)
 
 
+def trim_index_report(
+    report_df: pd.DataFrame,
+    days: int = INDEX_REPORT_DISPLAY_DAYS,
+) -> pd.DataFrame:
+    if report_df is None or report_df.empty or "日期" not in report_df.columns:
+        return report_df
+
+    cutoff = datetime.now() - timedelta(days=max(int(days), 1))
+    dates = pd.to_datetime(report_df["日期"], errors="coerce")
+    return report_df.loc[dates >= cutoff].reset_index(drop=True)
+
+
 def append_cached_index_rows(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
     """Append unseen dates while keeping every existing cached row unchanged."""
     normalized_new = merge_raw_index_data(None, new_df)
@@ -356,9 +372,17 @@ def enrich_index_report_indicators(report_df: pd.DataFrame) -> pd.DataFrame:
             combined_raw,
             str(index_config.get("market_group") or ""),
         )
-        calculated = build_export_df(combined_raw, index_name, days=120)
+        calculated = build_export_df(
+            combined_raw,
+            index_name,
+            days=INDEX_REPORT_DISPLAY_DAYS,
+        )
         if calculated is not None and not calculated.empty:
-            enriched = merge_index_report(enriched, calculated)
+            enriched = merge_index_report(
+                enriched,
+                calculated,
+                prefer_update_index_names={index_name},
+            )
     return enriched
 
 
@@ -429,6 +453,45 @@ def refresh_cached_eastmoney_index_report(
     return cached_index_df
 
 
+def persist_confirmed_index_report_row(
+    index_name: str,
+    index_config: dict,
+    report_df: pd.DataFrame,
+) -> None:
+    market_name = str(index_config.get("market_group") or "")
+    market = next((item for item in MARKET_WINDOWS if item.name == market_name), None)
+    if market is None:
+        return
+    market_now = datetime.now(ZoneInfo(market.timezone))
+    target_date = latest_settled_trade_date(market, market_now)
+    report_raw = extract_raw_from_export_df(report_df, index_name)
+    report_raw = filter_completed_market_dates(report_raw, market_name)
+    if report_raw is None or report_raw.empty:
+        return
+    report_dates = pd.to_datetime(report_raw["trade_date"], errors="coerce")
+    target_rows = report_raw.loc[report_dates.dt.date == target_date].copy()
+    if target_rows.empty:
+        return
+
+    cache_symbol = raw_cache_symbol(index_name, index_config)
+    finalized_raw, _ = load_dataset(
+        cache_symbol,
+        INDEX_FINAL_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    previous_count = 0 if finalized_raw is None else len(finalized_raw)
+    finalized_raw = append_cached_index_rows(finalized_raw, target_rows)
+    if len(finalized_raw) <= previous_count:
+        return
+    save_dataset(
+        symbol=cache_symbol,
+        name=f"{index_name} 指数收盘确认日线",
+        source=INDEX_FINAL_HISTORY_SOURCE,
+        data_type="index_daily_raw",
+        df=finalized_raw,
+    )
+
+
 def latest_index_trade_date(df: pd.DataFrame | None, index_name: str) -> pd.Timestamp | None:
     if df is None or df.empty:
         return None
@@ -455,7 +518,7 @@ def build_stale_quote_message(index_name: str, index_config: dict, df: pd.DataFr
     market = next((item for item in MARKET_WINDOWS if item.name == market_name), None)
     if market is not None:
         market_now = datetime.now(ZoneInfo(market.timezone))
-        expected_text = expected_latest_trade_date(market, market_now).strftime("%Y-%m-%d")
+        expected_text = latest_settled_trade_date(market, market_now).strftime("%Y-%m-%d")
 
     return f"{index_name}: {source_label} 最新到 {latest_text}，预期 {expected_text}，{action_text}"
 
@@ -469,7 +532,7 @@ def has_current_index_quote(df: pd.DataFrame, index_name: str, index_config: dic
     if market is None:
         return True
     market_now = datetime.now(ZoneInfo(market.timezone))
-    expected_date = expected_latest_trade_date(market, market_now)
+    expected_date = latest_settled_trade_date(market, market_now)
 
     latest_date = latest_index_trade_date(df, index_name)
     return not pd.isna(latest_date) and latest_date.date() >= expected_date

@@ -51,6 +51,7 @@ DEFAULT_ETF_CODES = [
     "588000",
     "159915",
     "510500",
+    "159967",
 ]
 DEFAULT_SPREAD_CONTRACTS = ["I2609", "I2701"]
 DEFAULT_OPTION_CODES = ["I2609P730", "I2609P740", "I2609P750", "I2609P760"]
@@ -67,18 +68,22 @@ ETF_DISPLAY_NAMES = {
     "588000": "科创50ETF华夏",
     "159915": "创业板ETF易方达",
     "510500": "中证500ETF南方",
+    "159967": "创业板成长ETF华夏",
 }
 
 ETF_TIMING_STRATEGIES = {
     "513260": (20, 1.0),
     "159915": (20, 1.0),
     "588000": (20, 1.0),
-    "510500": (20, 1.0),
+    "510500": (15, 1.0),
     "159201": (25, 2.0),
     "159655": (25, 2.0),
     "159501": (25, 2.0),
     "159545": (10, 1.0),
+    "159967": (25, 2.0),
+    "518850": (30, 1.5),
 }
+ETF_TIMING_TABLE_EXCLUDED_CODES = {"512890"}
 
 OPTION_PRODUCT_NAMES = {
     "i": "铁矿石",
@@ -241,6 +246,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
         if item.category != "ETF":
             continue
         base_code = normalize_etf_base_code(item.code)
+        if base_code in ETF_TIMING_TABLE_EXCLUDED_CODES:
+            continue
         row = {
             "ETF名称": display_etf_name(base_code, item.name),
             "代码": base_code,

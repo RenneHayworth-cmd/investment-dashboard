@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -26,6 +27,12 @@ from services.position_analysis import (
 
 
 class PositionAnalysisTests(unittest.TestCase):
+    def test_position_page_stays_clear_while_data_is_loading(self):
+        page_source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
+
+        self.assertIn('[data-stale="true"]', page_source)
+        self.assertIn("opacity: 1 !important", page_source)
+
     def test_default_etf_list_includes_new_holdings(self):
         self.assertEqual(
             DEFAULT_ETF_CODES,
@@ -40,12 +47,15 @@ class PositionAnalysisTests(unittest.TestCase):
                 "588000",
                 "159915",
                 "510500",
+                "159967",
             ],
         )
-        self.assertEqual(ETF_TIMING_STRATEGIES["510500"], (20, 1.0))
+        self.assertEqual(ETF_TIMING_STRATEGIES["510500"], (15, 1.0))
+        self.assertEqual(ETF_TIMING_STRATEGIES["159967"], (25, 2.0))
+        self.assertEqual(ETF_TIMING_STRATEGIES["518850"], (30, 1.5))
         self.assertNotIn("512890", ETF_TIMING_STRATEGIES)
-        self.assertNotIn("518850", ETF_TIMING_STRATEGIES)
         self.assertEqual(ETF_DISPLAY_NAMES["159915"], "创业板ETF易方达")
+        self.assertEqual(ETF_DISPLAY_NAMES["159967"], "创业板成长ETF华夏")
         self.assertEqual(set(ETF_DISPLAY_NAMES), set(DEFAULT_ETF_CODES))
 
     def test_timing_snapshot_retains_state_inside_band_and_marks_transitions(self):
@@ -188,7 +198,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
         self.assertAlmostEqual(item.metrics["策略均线"], 1.90292, places=6)
 
-    def test_etf_timing_table_excludes_derivatives_and_blanks_long_term_strategy(self):
+    def test_etf_timing_table_excludes_derivatives_and_long_term_etf(self):
         items = [
             PositionItem(
                 "ETF",
@@ -196,6 +206,20 @@ class PositionAnalysisTests(unittest.TestCase):
                 "红利低波ETF",
                 "缓存",
                 metrics={"最新价": 1.2345, "日涨跌(%)": 0.5},
+            ),
+            PositionItem(
+                "ETF",
+                "518850.SH",
+                "黄金ETF",
+                "缓存",
+                metrics={
+                    "最新价": 6.2,
+                    "日涨跌(%)": 0.1,
+                    "策略参数": "MA30 / 1.5%",
+                    "策略均线": 6.0,
+                    "策略偏离(%)": 3.33,
+                    "择时判断": "持有",
+                },
             ),
             PositionItem(
                 "ETF",
@@ -219,10 +243,10 @@ class PositionAnalysisTests(unittest.TestCase):
 
         table = build_etf_timing_table(items)
 
-        self.assertEqual(table["代码"].tolist(), ["513260", "512890"])
+        self.assertEqual(table["代码"].tolist(), ["513260", "518850"])
         self.assertEqual(table.iloc[0]["ETF名称"], "恒生科技ETF汇添富")
-        self.assertTrue(pd.isna(table.iloc[1]["策略参数"]))
-        self.assertTrue(pd.isna(table.iloc[1]["对应均线"]))
+        self.assertNotIn("512890", table["代码"].tolist())
+        self.assertEqual(table.iloc[1]["策略参数"], "MA30 / 1.5%")
         self.assertNotIn("期货价差", table.to_string())
 
     def test_missing_timed_etf_still_shows_configured_strategy(self):
@@ -231,7 +255,7 @@ class PositionAnalysisTests(unittest.TestCase):
         )
 
         self.assertEqual(table.iloc[0]["ETF名称"], "中证500ETF南方")
-        self.assertEqual(table.iloc[0]["策略参数"], "MA20 / 1.0%")
+        self.assertEqual(table.iloc[0]["策略参数"], "MA15 / 1.0%")
         self.assertTrue(pd.isna(table.iloc[0]["对应均线"]))
 
     def test_merge_by_date_keeps_existing_same_day_value(self):

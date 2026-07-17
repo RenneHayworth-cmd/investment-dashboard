@@ -28,7 +28,9 @@ from services.update_tasks import (
     append_cached_index_rows,
     enrich_index_report_indicators,
     fetch_index_report,
+    has_current_index_quote,
     merge_index_report,
+    persist_confirmed_index_report_row,
     refresh_cached_eastmoney_index_report,
     sync_index_long_history,
 )
@@ -60,6 +62,31 @@ class _FakeSession:
 
 
 class MarketAndCacheTests(unittest.TestCase):
+    def test_previous_close_is_current_during_next_trading_session(self):
+        class CurrentSessionDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 17, 11, 30)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        config = {"market_group": "A股", "require_current_quote": True}
+        current = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-16"]),
+                "沪深300_收盘价": [4500.0],
+            }
+        )
+        stale = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-15"]),
+                "沪深300_收盘价": [4400.0],
+            }
+        )
+
+        with patch("services.update_tasks.datetime", CurrentSessionDateTime):
+            self.assertTrue(has_current_index_quote(current, "沪深300", config))
+            self.assertFalse(has_current_index_quote(stale, "沪深300", config))
+
     def test_crude_oil_config_uses_eastmoney_but_keeps_futures_session_symbol(self):
         config = INDEX_CONFIG["原油主连"]
 
@@ -73,6 +100,7 @@ class MarketAndCacheTests(unittest.TestCase):
             ("A股", "2026-10-01T12:00:00"),
             ("日本", "2026-01-01T12:00:00"),
             ("韩国", "2026-01-01T12:00:00"),
+            ("韩国", "2026-07-17T12:00:00"),
             ("美股", "2021-12-31T12:00:00"),
         ]
         for market_name, value in cases:
@@ -232,6 +260,31 @@ class MarketAndCacheTests(unittest.TestCase):
 
         self.assertEqual(refreshed.iloc[-1]["微盘股_MA20"], 3275.76)
 
+    @patch("services.update_tasks.save_dataset")
+    @patch("services.update_tasks.load_dataset", return_value=(None, None))
+    def test_post_close_list_quote_is_saved_as_final_confirmation(self, _load_mock, save_mock):
+        class PostCloseDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 15, 16, 13)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        report = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-14", "2026-07-15"]),
+                "恒生港股通高息低波_收盘价": [4108.46, 4143.65],
+            }
+        )
+        config = {"market_group": "港股", "code": "124.HSHYLV"}
+
+        with patch("services.update_tasks.datetime", PostCloseDateTime):
+            persist_confirmed_index_report_row("恒生港股通高息低波", config, report)
+
+        saved = save_mock.call_args.kwargs
+        self.assertEqual(saved["source"], INDEX_FINAL_HISTORY_SOURCE)
+        self.assertEqual(saved["df"]["trade_date"].max(), pd.Timestamp("2026-07-15"))
+        self.assertEqual(saved["df"].iloc[-1]["close"], 4143.65)
+
     def test_index_raw_cache_never_replaces_existing_date(self):
         cached = pd.DataFrame(
             {
@@ -327,6 +380,30 @@ class MarketAndCacheTests(unittest.TestCase):
         self.assertFalse(pd.isna(latest["微盘股_偏离率(%)"]))
         self.assertFalse(pd.isna(latest["微盘股_状态转变时间"]))
         self.assertFalse(pd.isna(latest["微盘股_区间涨幅(%)"]))
+
+    def test_index_report_calculates_each_historical_transition_interval(self):
+        history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-07-15", periods=24),
+                "close": [100.0] * 20 + [90.0, 80.0, 120.0, 132.0],
+            }
+        )
+
+        report = build_export_df(history, "测试指数", days=10000)
+
+        first_below = report.loc[report["日期"] == "2026-07-10"].iloc[0]
+        still_below = report.loc[report["日期"] == "2026-07-13"].iloc[0]
+        first_above = report.loc[report["日期"] == "2026-07-14"].iloc[0]
+        still_above = report.loc[report["日期"] == "2026-07-15"].iloc[0]
+
+        self.assertEqual(first_below["测试指数_状态转变时间"], "2026-07-10")
+        self.assertEqual(first_below["测试指数_区间涨幅(%)"], 0.0)
+        self.assertEqual(still_below["测试指数_状态转变时间"], "2026-07-10")
+        self.assertEqual(still_below["测试指数_区间涨幅(%)"], -11.11)
+        self.assertEqual(first_above["测试指数_状态转变时间"], "2026-07-14")
+        self.assertEqual(first_above["测试指数_区间涨幅(%)"], 0.0)
+        self.assertEqual(still_above["测试指数_状态转变时间"], "2026-07-14")
+        self.assertEqual(still_above["测试指数_区间涨幅(%)"], 10.0)
 
     def test_index_detail_reads_long_history_cache_without_network(self):
         long_cached = pd.DataFrame(

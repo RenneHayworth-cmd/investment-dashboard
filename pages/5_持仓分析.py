@@ -45,6 +45,17 @@ from services.position_analysis import (
 st.set_page_config(page_title="持仓分析", layout="wide")
 init_db()
 apply_global_style()
+st.markdown(
+    """
+    <style>
+    div[data-testid="stElementContainer"][data-stale="true"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 render_page_header(
     "持仓分析",

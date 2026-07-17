@@ -55,8 +55,14 @@ before a larger handoff or commit.
   mainland 11:30 lunch close only once per page session during 11:30-13:30, and
   update formal daily data only for indexes missing their latest completed
   session. If `index_final_history` already contains the target session, do not
-  request that index again. Intraday and lunch card quotes stay in session
-  memory and must never overwrite or persist into append-only daily history.
+  request that index again. Intraday and lunch card quotes stay in session and
+  process-local transient memory so browser refreshes can restore them; they
+  must never overwrite or persist into append-only daily history.
+  The split-column report has no user-selectable display window: retain the
+  latest 120 calendar days. For every displayed trading day, show that day's
+  latest MA20 state-transition date and the return accumulated from the
+  transition-day close; do not repeat only the current transition metrics
+  across all historical rows.
   Detail views retain their separate cache-first incremental history behavior.
 - The `任务与数据` page provides manual index updates, dataset metadata, and job
   records. Do not add a background-loop toggle or auto-started updater.
@@ -91,7 +97,8 @@ before a larger handoff or commit.
   on desktop, fixed-height cards, index name and code on separate lines,
   A-share color convention for deltas (red up, green down), click-through
   detail views with long-history trend/drawdown summaries, and a summary table
-  sorted by MA20 deviation.
+  sorted by MA20 deviation. Keep VIX in the cards and detail view, but exclude
+  it from the MA20 summary table.
 - The four futures-main display names include the currently matched concrete
   contract, for example `铁矿石主连（I2609）`. Re-resolve the contract only after
   a successful manual quote update, persist the small mapping in
@@ -121,11 +128,12 @@ before a larger handoff or commit.
   remain unchanged; an unconfirmed same-day row left by an older version must
   not be treated as the formal close. Spread and option updates remain tied to
   the load button. Its bottom summary table contains ETFs only and follows the index
-  MA summary style. Use MA20/1% for 513260, 159915, 588000, and 510500;
-  MA25/2% for 159201, 159655, and 159501; and MA10/1% for 159545. Preserve the
+  MA summary style. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
+  MA25/2% for 159201, 159655, 159501, and 159967; MA10/1% for 159545; and
+  MA30/1.5% for 518850. Preserve the
   previous position while price remains inside the threshold band. Treat
-  512890 and 518850 as long-term holdings: show only name, code, latest price,
-  and daily change, leaving all strategy columns blank. Use the complete fund
+  512890 as a long-term holding: keep it out of the bottom ETF timing table
+  while retaining its card and detail view. Use the complete fund
   names stored in the fixed ETF display-name mapping, and show ETF codes as six
   digits without `.SH` or `.SZ` in cards, tables, and detail captions.
 - Analysis pages should follow the same control layout: keep analysis settings
