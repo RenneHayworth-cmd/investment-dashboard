@@ -119,9 +119,10 @@ before a larger handoff or commit.
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
   spread, and futures option data. It should read local cache on first render
-  and fetch after the user clicks the load button. Before the A-share close is
-  confirmed at 15:05, an ETF refresh may update cards with an in-memory daily
-  quote but must not save that day's row or use it in the timing table. While
+  and fetch after the user clicks the load button. From the A-share open through
+  15:05, an ETF refresh should batch TickFlow real-time quotes and update cards
+  only; it must not save that quote or use it in the timing table. Before the
+  open, on non-trading days, and from 15:05 onward, use the daily-history path. While
   the page is open, a local one-minute fragment check should fetch each missing
   formal ETF close once after 15:05, mark the current row as close-confirmed,
   append it to cache, and then update the timing table. Earlier cached dates
@@ -129,7 +130,7 @@ before a larger handoff or commit.
   not be treated as the formal close. Spread and option updates remain tied to
   the load button. Its bottom summary table contains ETFs only and follows the index
   MA summary style. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
-  MA25/2% for 159201, 159655, 159501, and 159967; MA10/1% for 159545; and
+  MA20/0.5% for 159201; MA25/2% for 159655, 159501, and 159967; MA10/1% for 159545; and
   MA30/1.5% for 518850. Preserve the
   previous position while price remains inside the threshold band. Treat
   512890 as a long-term holding: keep it out of the bottom ETF timing table

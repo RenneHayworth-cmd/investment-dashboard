@@ -385,6 +385,29 @@ def fetch_yahoo_latest_index_row(symbol: str) -> pd.DataFrame | None:
         return None
 
 
+def supplement_stale_yahoo_history(
+    df: pd.DataFrame,
+    symbol: str,
+    *,
+    now: datetime | None = None,
+) -> pd.DataFrame:
+    """Retry Yahoo's short window only when its main history response is stale."""
+    if df is None or df.empty or "trade_date" not in df.columns:
+        return df
+
+    market = get_market_window("美股")
+    if market is None:
+        return df
+    market_now = now or datetime.now(ZoneInfo(market.timezone))
+    expected_date = latest_completed_trade_date(market, market_now)
+    latest_date = pd.to_datetime(df["trade_date"], errors="coerce").max()
+    if not pd.isna(latest_date) and latest_date.date() >= expected_date:
+        return df
+
+    latest_row = fetch_yahoo_latest_index_row(symbol)
+    return merge_newer_index_rows(df, latest_row)
+
+
 def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -981,7 +1004,8 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
             rows.append({"trade_date": pd.Timestamp(latest_date), "close": float(latest_price)})
     if not rows:
         return None
-    return build_export_df(pd.DataFrame(rows), index_name, days=days)
+    raw_df = supplement_stale_yahoo_history(pd.DataFrame(rows), symbol)
+    return build_export_df(raw_df, index_name, days=days)
 
 
 def is_sparse_daily_history(df: pd.DataFrame) -> bool:

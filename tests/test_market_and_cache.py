@@ -21,11 +21,13 @@ from services.index_ma20 import (
     filter_completed_market_dates,
     overlay_finalized_index_rows,
     sanitize_index_report_market_dates,
+    supplement_stale_yahoo_history,
 )
 from services.market_calendar import get_market_window, is_market_trading_day, latest_completed_trade_date
 from services.position_analysis import _cache_has_expected_trade_date
 from services.update_tasks import (
     append_cached_index_rows,
+    build_index_update_message,
     enrich_index_report_indicators,
     fetch_index_report,
     has_current_index_quote,
@@ -62,6 +64,62 @@ class _FakeSession:
 
 
 class MarketAndCacheTests(unittest.TestCase):
+    @patch("services.index_ma20.fetch_yahoo_latest_index_row")
+    def test_stale_yahoo_history_retries_short_window(self, latest_row_mock):
+        history = pd.DataFrame(
+            {
+                "trade_date": pd.to_datetime(["2026-07-16", "2026-07-17"]),
+                "close": [100.0, 101.0],
+            }
+        )
+        latest_row_mock.return_value = pd.DataFrame(
+            {"trade_date": pd.to_datetime(["2026-07-20"]), "close": [102.0]}
+        )
+
+        result = supplement_stale_yahoo_history(
+            history,
+            "^TEST",
+            now=datetime(2026, 7, 21, 11, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        self.assertEqual(result["trade_date"].max(), pd.Timestamp("2026-07-20"))
+        latest_row_mock.assert_called_once_with("^TEST")
+
+    @patch("services.index_ma20.fetch_yahoo_latest_index_row")
+    def test_current_yahoo_history_does_not_retry_short_window(self, latest_row_mock):
+        history = pd.DataFrame(
+            {"trade_date": pd.to_datetime(["2026-07-20"]), "close": [102.0]}
+        )
+
+        result = supplement_stale_yahoo_history(
+            history,
+            "^TEST",
+            now=datetime(2026, 7, 21, 11, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        self.assertEqual(result["trade_date"].max(), pd.Timestamp("2026-07-20"))
+        latest_row_mock.assert_not_called()
+
+    def test_index_update_message_lists_only_actual_successes_as_successful(self):
+        timings = [
+            {"指数": "沪深300", "状态": "成功"},
+            {"指数": "标普500", "状态": "使用缓存"},
+            {"指数": "恒生科技", "状态": "最新可得"},
+        ]
+
+        message = build_index_update_message(
+            selected_indexes={"沪深300", "标普500", "恒生科技"},
+            selected_markets=set(),
+            timings=timings,
+            errors=["标普500: 最新数据未达到预期日期"],
+        )
+
+        self.assertIn("正式日线更新成功：沪深300", message)
+        self.assertIn("仅保存最新可得数据：恒生科技", message)
+        self.assertIn("正式日线未更新，沿用缓存：标普500", message)
+        self.assertNotIn("正式日线更新成功：沪深300、标普500", message)
+        self.assertIn("未完成原因：标普500: 最新数据未达到预期日期", message)
+
     def test_previous_close_is_current_during_next_trading_session(self):
         class CurrentSessionDateTime(datetime):
             @classmethod

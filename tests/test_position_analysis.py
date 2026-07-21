@@ -15,18 +15,64 @@ from services.position_analysis import (
     ETF_TIMING_STRATEGIES,
     PositionItem,
     _merge_by_date,
+    apply_etf_realtime_quote,
     build_etf_timing_table,
     calculate_etf_timing_snapshot,
     etf_final_close_ready,
+    etf_intraday_quote_ready,
+    fetch_tickflow_etf_quotes,
+    filter_current_etf_realtime_quotes,
     filter_final_etf_rows,
     latest_final_etf_trade_date,
+    load_runtime_etf_quotes,
     load_or_fetch_etf,
     load_or_fetch_option,
     load_or_fetch_spread,
+    remember_runtime_etf_quotes,
 )
 
 
 class PositionAnalysisTests(unittest.TestCase):
+    def test_runtime_etf_quote_cache_returns_an_isolated_copy(self):
+        remember_runtime_etf_quotes(
+            {
+                "159201.SZ": {
+                    "price": 1.234,
+                    "quote_time": datetime(2026, 7, 21, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+                }
+            }
+        )
+
+        loaded = load_runtime_etf_quotes()
+        loaded["159201"]["price"] = 9.999
+
+        self.assertEqual(load_runtime_etf_quotes()["159201"]["price"], 1.234)
+
+    def test_current_etf_quotes_survive_same_day_reruns_only(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+        quotes = {
+            "159201": {
+                "price": 1.234,
+                "quote_time": datetime(2026, 7, 21, 10, 30, tzinfo=timezone),
+            },
+            "588000": {
+                "price": 1.111,
+                "quote_time": datetime(2026, 7, 20, 14, 30, tzinfo=timezone),
+            },
+        }
+
+        intraday = filter_current_etf_realtime_quotes(
+            quotes,
+            market_now=datetime(2026, 7, 21, 11, 0, tzinfo=timezone),
+        )
+        after_close = filter_current_etf_realtime_quotes(
+            quotes,
+            market_now=datetime(2026, 7, 21, 15, 5, tzinfo=timezone),
+        )
+
+        self.assertEqual(set(intraday), {"159201"})
+        self.assertEqual(after_close, {})
+
     def test_position_page_stays_clear_while_data_is_loading(self):
         page_source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
 
@@ -51,6 +97,8 @@ class PositionAnalysisTests(unittest.TestCase):
             ],
         )
         self.assertEqual(ETF_TIMING_STRATEGIES["510500"], (15, 1.0))
+        self.assertEqual(ETF_TIMING_STRATEGIES["159201"], (20, 0.5))
+        self.assertEqual(ETF_TIMING_STRATEGIES["588000"], (20, 1.0))
         self.assertEqual(ETF_TIMING_STRATEGIES["159967"], (25, 2.0))
         self.assertEqual(ETF_TIMING_STRATEGIES["518850"], (30, 1.5))
         self.assertNotIn("512890", ETF_TIMING_STRATEGIES)
@@ -82,6 +130,121 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(latest_final_etf_trade_date(before).isoformat(), "2026-07-14")
         self.assertTrue(etf_final_close_ready(ready))
         self.assertEqual(latest_final_etf_trade_date(ready).isoformat(), "2026-07-15")
+
+    def test_etf_intraday_quote_window_excludes_preopen_postclose_and_holidays(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+
+        self.assertFalse(etf_intraday_quote_ready(datetime(2026, 7, 15, 9, 29, tzinfo=timezone)))
+        self.assertTrue(etf_intraday_quote_ready(datetime(2026, 7, 15, 10, 0, tzinfo=timezone)))
+        self.assertTrue(etf_intraday_quote_ready(datetime(2026, 7, 15, 12, 0, tzinfo=timezone)))
+        self.assertTrue(etf_intraday_quote_ready(datetime(2026, 7, 15, 15, 4, tzinfo=timezone)))
+        self.assertFalse(etf_intraday_quote_ready(datetime(2026, 7, 15, 15, 5, tzinfo=timezone)))
+        self.assertFalse(etf_intraday_quote_ready(datetime(2026, 7, 18, 10, 0, tzinfo=timezone)))
+
+    @patch("tickflow.TickFlow")
+    def test_fetch_tickflow_etf_quotes_uses_realtime_endpoint_and_rejects_stale_rows(self, tickflow_mock):
+        current_timestamp = int(
+            datetime(2026, 7, 15, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+        )
+        stale_timestamp = int(
+            datetime(2026, 7, 14, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+        )
+        tickflow_mock.return_value.quotes.get.return_value = pd.DataFrame(
+            [
+                {
+                    "symbol": "512890.SH",
+                    "last_price": 1.2,
+                    "prev_close": 1.1,
+                    "timestamp": current_timestamp,
+                    "ext.change_pct": 0.09,
+                },
+                {
+                    "symbol": "159201.SZ",
+                    "last_price": 1.3,
+                    "prev_close": 1.25,
+                    "timestamp": stale_timestamp,
+                },
+            ]
+        )
+
+        quotes = fetch_tickflow_etf_quotes(
+            ["512890", "159201"],
+            api_key="test-key",
+            market_now=datetime(2026, 7, 15, 10, 31, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        tickflow_mock.return_value.quotes.get.assert_called_once_with(
+            symbols=["512890.SH", "159201.SZ"],
+            as_dataframe=True,
+        )
+        self.assertEqual(list(quotes), ["512890"])
+        self.assertAlmostEqual(quotes["512890"]["change_pct"], 9.090909, places=5)
+
+    @patch("tickflow.TickFlow")
+    def test_fetch_tickflow_etf_quotes_splits_requests_into_batches_of_five(self, tickflow_mock):
+        current_timestamp = int(
+            datetime(2026, 7, 15, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000
+        )
+
+        def build_batch(*, symbols, as_dataframe):
+            self.assertTrue(as_dataframe)
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": symbol,
+                        "last_price": 1.2,
+                        "prev_close": 1.1,
+                        "timestamp": current_timestamp,
+                    }
+                    for symbol in symbols
+                ]
+            )
+
+        tickflow_mock.return_value.quotes.get.side_effect = build_batch
+        quotes = fetch_tickflow_etf_quotes(
+            DEFAULT_ETF_CODES,
+            api_key="test-key",
+            market_now=datetime(2026, 7, 15, 10, 31, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        request_sizes = [
+            len(call.kwargs["symbols"])
+            for call in tickflow_mock.return_value.quotes.get.call_args_list
+        ]
+        self.assertEqual(request_sizes, [5, 5, 1])
+        self.assertEqual(set(quotes), set(DEFAULT_ETF_CODES))
+
+    def test_apply_etf_realtime_quote_updates_card_only(self):
+        cached_data = pd.DataFrame({"date": pd.to_datetime(["2026-07-14"]), "price": [1.1]})
+        cached_item = PositionItem(
+            "ETF",
+            "512890.SH",
+            "红利低波ETF华泰柏瑞",
+            "缓存",
+            source="本地缓存",
+            latest_date="2026-07-14",
+            metrics={"最新价": 1.1, "日涨跌(%)": 0.0, "20日涨跌(%)": 2.5},
+            dataframe=cached_data,
+        )
+        quote_time = datetime(2026, 7, 15, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        updated = apply_etf_realtime_quote(
+            cached_item,
+            {
+                "symbol": "512890.SH",
+                "price": 1.2,
+                "previous_close": 1.1,
+                "change_pct": 0.09,
+                "quote_time": quote_time,
+            },
+        )
+
+        self.assertEqual(updated.status, "盘中")
+        self.assertEqual(updated.latest_date, "2026-07-15")
+        self.assertEqual(updated.metrics["最新价"], 1.2)
+        self.assertAlmostEqual(updated.metrics["日涨跌(%)"], 9.09, places=2)
+        self.assertEqual(updated.metrics["20日涨跌(%)"], 2.5)
+        self.assertTrue(updated.dataframe.equals(cached_data))
 
     def test_unconfirmed_same_day_cache_is_excluded_after_1505(self):
         market_now = datetime(2026, 7, 15, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai"))

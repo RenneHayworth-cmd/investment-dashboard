@@ -31,14 +31,20 @@ from services.position_analysis import (
     DEFAULT_OPTION_CODES,
     DEFAULT_SPREAD_CONTRACTS,
     PositionItem,
+    apply_etf_realtime_quote,
     build_etf_timing_table,
     etf_final_close_ready,
+    etf_intraday_quote_ready,
+    fetch_tickflow_etf_quotes,
+    filter_current_etf_realtime_quotes,
     latest_final_etf_trade_date,
+    load_runtime_etf_quotes,
     load_or_fetch_etf,
     load_or_fetch_option,
     load_or_fetch_spread,
     normalize_etf_base_code,
     parse_position_codes,
+    remember_runtime_etf_quotes,
 )
 
 
@@ -861,7 +867,8 @@ option_codes = parse_position_codes(option_text)
 allow_fetch = bool(update_clicked)
 refresh_existing = bool(update_clicked and force_refresh)
 market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-formal_close_ready = etf_final_close_ready(market_now)
+intraday_market_active = etf_intraday_quote_ready(market_now)
+intraday_quote_mode = bool(update_clicked and intraday_market_active)
 
 if not update_clicked:
     st.caption("当前为缓存视图；盘中点击加载只更新卡片，交易日15:05后才写入ETF日线并更新择时表格。")
@@ -882,37 +889,64 @@ def update_position_progress(label: str) -> None:
     progress_status.info(f"{label} 处理完成，进度 {progress_done}/{progress_total}")
 
 
+intraday_quotes: dict[str, dict[str, object]] = {}
+intraday_quote_error = ""
+if intraday_quote_mode:
+    try:
+        intraday_quotes = fetch_tickflow_etf_quotes(
+            etf_codes,
+            api_key=api_key,
+            market_now=market_now,
+        )
+        missing_quote_codes = [
+            code for code in etf_codes
+            if normalize_etf_base_code(code) not in intraday_quotes
+        ]
+        if missing_quote_codes:
+            intraday_quote_error = f"部分ETF未返回当天实时行情：{', '.join(missing_quote_codes)}"
+        stored_intraday_quotes = dict(st.session_state.get("position_etf_realtime_quotes", {}))
+        stored_intraday_quotes.update(intraday_quotes)
+        st.session_state.position_etf_realtime_quotes = stored_intraday_quotes
+        remember_runtime_etf_quotes(intraday_quotes)
+    except Exception as exc:
+        intraday_quote_error = str(exc)
+
+stored_intraday_quotes = load_runtime_etf_quotes()
+stored_intraday_quotes.update(st.session_state.get("position_etf_realtime_quotes", {}))
+active_intraday_quotes = filter_current_etf_realtime_quotes(
+    stored_intraday_quotes,
+    market_now=market_now,
+)
+if not active_intraday_quotes and "position_etf_realtime_quotes" in st.session_state:
+    del st.session_state.position_etf_realtime_quotes
+
+
 with st.spinner("正在整理持仓数据..."):
     for code in etf_codes:
-        if update_clicked and not formal_close_ready:
+        if intraday_quote_mode:
             card_item = load_or_fetch_etf(
                 code,
                 api_key=api_key,
                 count=int(etf_count),
                 adjust=adjust_map[adjust_option],
-                allow_fetch=True,
-                force_refresh=True,
-                save_to_cache=False,
-                allow_unfinished_session=True,
+                allow_fetch=False,
                 market_now=market_now,
             )
-            if card_item.status not in {"失败", "无缓存"}:
-                card_item.status = "盘中"
-                card_item.source = "TickFlow（盘中临时，不写入缓存）"
-            items.append(card_item)
         else:
-            items.append(
-                load_or_fetch_etf(
-                    code,
-                    api_key=api_key,
-                    count=int(etf_count),
-                    adjust=adjust_map[adjust_option],
-                    allow_fetch=allow_fetch,
-                    force_refresh=refresh_existing,
-                    save_to_cache=save_to_cache,
-                    market_now=market_now,
-                )
+            card_item = load_or_fetch_etf(
+                code,
+                api_key=api_key,
+                count=int(etf_count),
+                adjust=adjust_map[adjust_option],
+                allow_fetch=allow_fetch,
+                force_refresh=refresh_existing,
+                save_to_cache=save_to_cache,
+                market_now=market_now,
             )
+        quote_data = active_intraday_quotes.get(normalize_etf_base_code(code))
+        if quote_data is not None:
+            card_item = apply_etf_realtime_quote(card_item, quote_data)
+        items.append(card_item)
         update_position_progress(f"ETF {code}")
 
     if spread_contracts:
@@ -944,6 +978,8 @@ with st.spinner("正在整理持仓数据..."):
 if progress_bar is not None and progress_status is not None:
     progress_bar.progress(1.0)
     progress_status.success(f"持仓数据整理完成，共 {progress_total} 个标的。")
+if intraday_quote_error:
+    st.warning(f"ETF盘中实时行情获取失败，卡片继续显示正式日线缓存：{intraday_quote_error}")
 
 overview_df = build_overview_table(items)
 selected_key = get_query_position_detail(items)

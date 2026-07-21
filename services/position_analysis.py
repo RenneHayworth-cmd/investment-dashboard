@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time as datetime_time
 import re
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -76,7 +77,7 @@ ETF_TIMING_STRATEGIES = {
     "159915": (20, 1.0),
     "588000": (20, 1.0),
     "510500": (15, 1.0),
-    "159201": (25, 2.0),
+    "159201": (20, 0.5),
     "159655": (25, 2.0),
     "159501": (25, 2.0),
     "159545": (10, 1.0),
@@ -84,6 +85,8 @@ ETF_TIMING_STRATEGIES = {
     "518850": (30, 1.5),
 }
 ETF_TIMING_TABLE_EXCLUDED_CODES = {"512890"}
+_RUNTIME_ETF_QUOTE_CACHE: dict[str, dict[str, object]] = {}
+_RUNTIME_ETF_QUOTE_CACHE_LOCK = Lock()
 
 OPTION_PRODUCT_NAMES = {
     "i": "铁矿石",
@@ -123,6 +126,155 @@ def etf_final_close_ready(market_now: datetime | None = None) -> bool:
         market is not None
         and is_market_trading_day(market, market_now)
         and market_now.time() >= ETF_FINAL_CLOSE_READY_TIME
+    )
+
+
+def etf_intraday_quote_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and market.sessions[0][0] <= market_now.time() < ETF_FINAL_CLOSE_READY_TIME
+    )
+
+
+def _tickflow_quote_datetime(row: pd.Series) -> datetime | None:
+    timestamp = pd.to_numeric(row.get("timestamp"), errors="coerce")
+    if not pd.isna(timestamp):
+        unit = "ms" if float(timestamp) > 10_000_000_000 else "s"
+        parsed = pd.to_datetime(float(timestamp), unit=unit, utc=True, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.tz_convert("Asia/Shanghai").to_pydatetime()
+    trade_date = pd.to_datetime(row.get("trade_date"), errors="coerce")
+    if pd.isna(trade_date):
+        return None
+    trade_time_value = row.get("trade_time")
+    trade_time = "00:00:00" if pd.isna(trade_time_value) else str(trade_time_value)
+    parsed = pd.to_datetime(f"{trade_date:%Y-%m-%d} {trade_time}", errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.tz_localize("Asia/Shanghai").to_pydatetime()
+
+
+def fetch_tickflow_etf_quotes(
+    codes: list[str],
+    *,
+    api_key: str,
+    market_now: datetime | None = None,
+) -> dict[str, dict[str, object]]:
+    if not api_key.strip():
+        raise ValueError("TickFlow实时行情需要填写API Key。")
+
+    from tickflow import TickFlow
+
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    symbols = [infer_tickflow_symbol(code) for code in codes]
+    client = TickFlow(api_key=api_key)
+    quote_frames = []
+    for start in range(0, len(symbols), 5):
+        batch = symbols[start:start + 5]
+        batch_df = client.quotes.get(symbols=batch, as_dataframe=True)
+        if batch_df is not None and not batch_df.empty:
+            quote_frames.append(batch_df)
+    if not quote_frames:
+        raise ValueError("TickFlow未返回ETF实时行情。")
+    quote_df = pd.concat(quote_frames, ignore_index=True)
+    if "symbol" not in quote_df.columns:
+        quote_df = quote_df.reset_index()
+
+    quotes: dict[str, dict[str, object]] = {}
+    for _, row in quote_df.iterrows():
+        symbol = str(row.get("symbol") or "").strip().upper()
+        latest_price = pd.to_numeric(row.get("last_price"), errors="coerce")
+        quote_time = _tickflow_quote_datetime(row)
+        if not symbol or pd.isna(latest_price) or quote_time is None:
+            continue
+        if quote_time.date() != market_now.date():
+            continue
+        previous_close = pd.to_numeric(row.get("prev_close"), errors="coerce")
+        if not pd.isna(previous_close) and float(previous_close) != 0:
+            change_pct = (float(latest_price) / float(previous_close) - 1) * 100
+        else:
+            change_pct = pd.to_numeric(row.get("ext.change_pct"), errors="coerce")
+        quotes[normalize_etf_base_code(symbol)] = {
+            "symbol": symbol,
+            "price": float(latest_price),
+            "previous_close": None if pd.isna(previous_close) else float(previous_close),
+            "change_pct": None if pd.isna(change_pct) else float(change_pct),
+            "quote_time": quote_time,
+        }
+
+    if not quotes:
+        raise ValueError("TickFlow未返回当天ETF实时行情。")
+    return quotes
+
+
+def remember_runtime_etf_quotes(quotes: dict[str, dict[str, object]]) -> None:
+    if not quotes:
+        return
+    with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        for code, quote in quotes.items():
+            _RUNTIME_ETF_QUOTE_CACHE[normalize_etf_base_code(code)] = dict(quote)
+
+
+def load_runtime_etf_quotes() -> dict[str, dict[str, object]]:
+    with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        return {
+            code: dict(quote)
+            for code, quote in _RUNTIME_ETF_QUOTE_CACHE.items()
+        }
+
+
+def filter_current_etf_realtime_quotes(
+    quotes: dict[str, dict[str, object]] | None,
+    *,
+    market_now: datetime | None = None,
+) -> dict[str, dict[str, object]]:
+    """Keep session quotes only during their same-day intraday display window."""
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not etf_intraday_quote_ready(market_now):
+        return {}
+
+    current: dict[str, dict[str, object]] = {}
+    for code, quote in (quotes or {}).items():
+        quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+        if pd.isna(quote_time) or quote_time.date() != market_now.date():
+            continue
+        current[normalize_etf_base_code(code)] = dict(quote)
+    return current
+
+
+def apply_etf_realtime_quote(item: PositionItem, quote: dict[str, object]) -> PositionItem:
+    symbol = str(quote.get("symbol") or item.code).strip().upper()
+    base_code = normalize_etf_base_code(symbol)
+    latest_price = pd.to_numeric(quote.get("price"), errors="coerce")
+    if pd.isna(latest_price):
+        return item
+
+    metrics = dict(item.metrics)
+    previous_close = pd.to_numeric(quote.get("previous_close"), errors="coerce")
+    if pd.isna(previous_close):
+        previous_close = pd.to_numeric(metrics.get("最新价"), errors="coerce")
+    if not pd.isna(previous_close) and float(previous_close) != 0:
+        change_pct = (float(latest_price) / float(previous_close) - 1) * 100
+    else:
+        change_pct = pd.to_numeric(quote.get("change_pct"), errors="coerce")
+    metrics["最新价"] = _round_metric(latest_price, 4)
+    metrics["日涨跌(%)"] = _round_metric(change_pct)
+
+    quote_time = quote.get("quote_time")
+    quote_date = pd.to_datetime(quote_time, errors="coerce")
+    return PositionItem(
+        category="ETF",
+        code=symbol,
+        name=display_etf_name(base_code, item.name),
+        status="盘中",
+        source="TickFlow实时行情（不写入缓存）",
+        latest_date="" if pd.isna(quote_date) else quote_date.strftime("%Y-%m-%d"),
+        cache_time=item.cache_time,
+        metrics=metrics,
+        dataframe=item.dataframe,
     )
 
 

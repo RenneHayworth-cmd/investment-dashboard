@@ -200,14 +200,12 @@ def run_index_ma20_update(
             df=report,
         )
 
-        if selected_indexes:
-            message = f"{'、'.join(sorted(selected_indexes))}更新成功"
-        elif selected_markets:
-            message = f"{'、'.join(sorted(selected_markets))}更新成功"
-        else:
-            message = "更新成功"
-        if errors:
-            message += "；部分指数失败：" + " | ".join(errors)
+        message = build_index_update_message(
+            selected_indexes=selected_indexes,
+            selected_markets=selected_markets,
+            timings=timings,
+            errors=errors,
+        )
         if timings:
             slowest = max(timings, key=lambda item: item["耗时(秒)"])
             message += f"；最慢：{slowest['指数']} {slowest['耗时(秒)']:.2f}秒"
@@ -217,6 +215,45 @@ def run_index_ma20_update(
     except Exception as exc:
         finish_job(job_id, "failed", str(exc))
         return UpdateResult("failed", f"更新失败：{exc}", errors=errors, timings=timings)
+
+
+def build_index_update_message(
+    *,
+    selected_indexes: set[str],
+    selected_markets: set[str],
+    timings: list[dict],
+    errors: list[str],
+) -> str:
+    names_by_status: dict[str, list[str]] = {}
+    for timing in timings:
+        status = str(timing.get("状态") or "")
+        index_name = str(timing.get("指数") or "")
+        if index_name:
+            names_by_status.setdefault(status, []).append(index_name)
+
+    parts = []
+    status_labels = (
+        ("成功", "正式日线更新成功"),
+        ("最新可得", "仅保存最新可得数据"),
+        ("使用缓存", "正式日线未更新，沿用缓存"),
+        ("无数据", "未取得数据"),
+        ("失败", "获取失败"),
+    )
+    for status, label in status_labels:
+        names = sorted(set(names_by_status.get(status, [])))
+        if names:
+            parts.append(f"{label}：{'、'.join(names)}")
+
+    if not parts:
+        if selected_indexes:
+            parts.append(f"已处理：{'、'.join(sorted(selected_indexes))}")
+        elif selected_markets:
+            parts.append(f"已处理：{'、'.join(sorted(selected_markets))}")
+        else:
+            parts.append("指数更新处理完成")
+    if errors:
+        parts.append("未完成原因：" + " | ".join(errors))
+    return "；".join(parts)
 
 
 def build_timing_row(

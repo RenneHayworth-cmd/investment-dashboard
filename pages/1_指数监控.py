@@ -453,7 +453,7 @@ def render_index_card(row: pd.Series) -> None:
     st.markdown(card_html, unsafe_allow_html=True)
 
 
-def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
+def build_manual_realtime_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
     stored_quotes = load_runtime_realtime_quotes()
     stored_quotes.update(st.session_state.get("index_realtime_quote_cache", {}))
     display_quotes = {
@@ -461,8 +461,11 @@ def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
         for index_name, quote in stored_quotes.items()
         if quote_is_visible_for_manual_display(index_name, quote)
     }
-    realtime_summary = apply_realtime_quotes_to_summary(summary_df, display_quotes)
-    render_index_cards(realtime_summary)
+    return apply_realtime_quotes_to_summary(summary_df, display_quotes)
+
+
+def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
+    render_index_cards(build_manual_realtime_summary(summary_df))
 
 
 def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
@@ -512,7 +515,7 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
 
 
 def render_freshness_bar(summary_df: pd.DataFrame) -> list[str]:
-    items = build_freshness_items(summary_df)
+    items = build_freshness_items(build_manual_realtime_summary(summary_df))
     rows = []
     for item in items:
         rows.append(
@@ -666,7 +669,7 @@ if update_clicked:
 
     message_parts = []
     if quotes:
-        message_parts.append(f"已手动更新 {len(quotes)} 个盘中/午间报价")
+        message_parts.append(f"实时卡片已更新 {len(quotes)} 个盘中/午间报价")
     if result is not None:
         message_parts.append(result.message)
     if not message_parts:
