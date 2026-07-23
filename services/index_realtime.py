@@ -25,12 +25,14 @@ from services.market_calendar import (
 
 
 EASTMONEY_QUOTE_SECIDS = {
+    "上证指数": "1.000001",
     "创业板指": "0.399006",
     "沪深300": "1.000300",
     "中证500": "1.000905",
     "中证1000": "1.000852",
     "中证2000": "2.932000",
     "微盘股": "90.BK1158",
+    "科创50": "1.000688",
     "中证红利低波": "2.H30269",
     "国证自由现金流": "0.980092",
     "恒生科技": "124.HSTECH",
@@ -47,6 +49,8 @@ YAHOO_QUOTE_SYMBOLS = {
 }
 
 FUTURES_QUOTE_SYMBOLS = {
+    "中证500期货主连": "IC0",
+    "中证1000期货主连": "IM0",
     "铁矿石主连": "I0",
     "沪金主连": "AU0",
     "沪银主连": "AG0",
@@ -58,6 +62,8 @@ EASTMONEY_FUTURES_QUOTE_SECIDS = {
 }
 
 FUTURES_MAIN_CONTRACT_PRODUCTS = {
+    "中证500期货主连": ("IC0", "中证500指数期货"),
+    "中证1000期货主连": ("IM0", "中证1000股指期货"),
     "铁矿石主连": ("I0", "铁矿石"),
     "沪金主连": ("AU0", "黄金"),
     "沪银主连": ("AG0", "白银"),
@@ -66,10 +72,21 @@ FUTURES_MAIN_CONTRACT_PRODUCTS = {
 
 FUTURES_MAIN_CONTRACT_CACHE_SYMBOL = "index_futures_main_contracts"
 FUTURES_MAIN_CONTRACT_CACHE_SOURCE = "index_metadata"
-MAINLAND_LUNCH_START = time(11, 30)
-MAINLAND_LUNCH_END = time(13, 30)
+LUNCH_QUOTE_MARKETS = {"A股", "港股", "日本"}
+FUTURES_LUNCH_WINDOWS = {
+    "IC0": (time(11, 30), time(13, 0)),
+    "IM0": (time(11, 30), time(13, 0)),
+}
 
 FUTURES_TRADING_SESSIONS = {
+    "IC0": (
+        (time(9, 30), time(11, 30)),
+        (time(13, 0), time(15, 0)),
+    ),
+    "IM0": (
+        (time(9, 30), time(11, 30)),
+        (time(13, 0), time(15, 0)),
+    ),
     "I0": (
         (time(9, 0), time(10, 15)),
         (time(10, 30), time(11, 30)),
@@ -126,16 +143,31 @@ def load_runtime_realtime_quotes() -> dict[str, dict[str, object]]:
         }
 
 
-def _is_mainland_lunch(index_name: str, *, now: datetime | None = None) -> bool:
+def _is_supported_market_lunch(index_name: str, *, now: datetime | None = None) -> bool:
     config = INDEX_CONFIG.get(index_name, {})
-    if str(config.get("market_group") or "") != "A股":
+    market_name = str(config.get("market_group") or "")
+    if market_name not in LUNCH_QUOTE_MARKETS:
         return False
-    market_now = now.astimezone(ZoneInfo("Asia/Shanghai")) if now else datetime.now(ZoneInfo("Asia/Shanghai"))
-    market = get_market_window("A股")
+    market = get_market_window(market_name)
+    if market is None:
+        return False
+    market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
+    if not is_market_trading_day(market, market_now):
+        return False
+    futures_symbol = str(config.get("futures_symbol") or config.get("code") or "").upper()
+    if futures_symbol in FUTURES_TRADING_SESSIONS:
+        lunch_start, lunch_end = FUTURES_LUNCH_WINDOWS.get(
+            futures_symbol,
+            (time(11, 30), time(13, 30)),
+        )
+        return lunch_start <= market_now.time() < lunch_end
+    if len(market.sessions) < 2:
+        return False
     return bool(
-        market is not None
-        and is_market_trading_day(market, market_now)
-        and MAINLAND_LUNCH_START <= market_now.time() < MAINLAND_LUNCH_END
+        any(
+            previous_end <= market_now.time() < next_start
+            for (_, previous_end), (next_start, _) in zip(market.sessions, market.sessions[1:])
+        )
     )
 
 
@@ -148,13 +180,15 @@ def manual_quote_request_names(
     completed = completed_lunch_keys or set()
     names: set[str] = set()
     lunch_keys: dict[str, str] = {}
-    china_now = now.astimezone(ZoneInfo("Asia/Shanghai")) if now else datetime.now(ZoneInfo("Asia/Shanghai"))
     for index_name in _supported_realtime_index_names():
         if quote_is_active_for_display(index_name, now=now):
             names.add(index_name)
-        if not _is_mainland_lunch(index_name, now=now):
+        if not _is_supported_market_lunch(index_name, now=now):
             continue
-        key = f"{index_name}:{china_now.date().isoformat()}:lunch"
+        market_name = str(INDEX_CONFIG.get(index_name, {}).get("market_group") or "")
+        market = get_market_window(market_name)
+        market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
+        key = f"{index_name}:{market_now.date().isoformat()}:lunch"
         if key not in completed:
             names.add(index_name)
             lunch_keys[index_name] = key
@@ -167,16 +201,19 @@ def quote_is_visible_for_manual_display(
     *,
     now: datetime | None = None,
 ) -> bool:
-    if quote_is_active_for_display(index_name, now=now):
-        return True
-    if not _is_mainland_lunch(index_name, now=now):
+    if not (
+        quote_is_active_for_display(index_name, now=now)
+        or _is_supported_market_lunch(index_name, now=now)
+    ):
         return False
     quote_time = quote.get("quote_time")
     if not isinstance(quote_time, datetime):
         return False
-    china_now = now.astimezone(ZoneInfo("Asia/Shanghai")) if now else datetime.now(ZoneInfo("Asia/Shanghai"))
-    quote_china = quote_time.astimezone(ZoneInfo("Asia/Shanghai")) if quote_time.tzinfo else quote_time
-    return quote_china.date() == china_now.date()
+    market_name = str(INDEX_CONFIG.get(index_name, {}).get("market_group") or "")
+    market = get_market_window(market_name)
+    market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
+    quote_market = quote_time.astimezone(ZoneInfo(market.timezone)) if quote_time.tzinfo else quote_time
+    return quote_market.date() == market_now.date()
 
 
 def format_index_display_name(index_name: str, contract_names: dict[str, str] | None = None) -> str:
@@ -527,6 +564,44 @@ def _fetch_futures_quote(index_name: str, symbol: str) -> dict[str, object] | No
         return _fetch_eastmoney_quote(index_name, eastmoney_secid)
     try:
         import akshare as ak
+
+        product = FUTURES_MAIN_CONTRACT_PRODUCTS.get(index_name)
+        if symbol.upper() in {"IC0", "IM0"} and product is not None:
+            realtime_df = ak.futures_zh_realtime(symbol=product[1])
+            if realtime_df is None or realtime_df.empty or "symbol" not in realtime_df.columns:
+                return None
+            main_rows = realtime_df[
+                realtime_df["symbol"].astype(str).str.strip().str.upper() == symbol.upper()
+            ]
+            if main_rows.empty:
+                return None
+            latest = main_rows.iloc[0]
+            price = pd.to_numeric(latest.get("trade"), errors="coerce")
+            if pd.isna(price):
+                return None
+            previous_close = pd.to_numeric(latest.get("preclose"), errors="coerce")
+            change_pct = None
+            if not pd.isna(previous_close) and float(previous_close) != 0:
+                change_pct = (float(price) / float(previous_close) - 1) * 100
+            quote_time = pd.to_datetime(
+                f"{latest.get('tradedate', '')} {latest.get('ticktime', '')}",
+                errors="coerce",
+            )
+            if pd.isna(quote_time):
+                quote_time = datetime.now(ZoneInfo("Asia/Shanghai"))
+            else:
+                quote_time = quote_time.to_pydatetime().replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            volume = pd.to_numeric(latest.get("volume"), errors="coerce")
+            position = pd.to_numeric(latest.get("position"), errors="coerce")
+            return {
+                "price": float(price),
+                "previous_close": None if pd.isna(previous_close) else float(previous_close),
+                "change_pct": change_pct,
+                "volume": None if pd.isna(volume) else float(volume),
+                "position": None if pd.isna(position) else float(position),
+                "quote_time": quote_time,
+                "source": "AkShare",
+            }
 
         spot_df = ak.futures_zh_spot(symbol=symbol, market="CF", adjust="0")
         if spot_df is None or spot_df.empty:

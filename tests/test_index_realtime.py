@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from services.index_ma20 import INDEX_CONFIG
 from services.index_realtime import (
     _daily_update_target,
     _futures_market_is_open,
@@ -27,6 +28,16 @@ from services.index_realtime import (
 
 
 class IndexRealtimeTests(unittest.TestCase):
+    def test_new_indexes_are_in_requested_card_order(self):
+        names = list(INDEX_CONFIG)
+
+        self.assertEqual(names[0], "上证指数")
+        self.assertEqual(names[names.index("微盘股") + 1], "科创50")
+        self.assertEqual(
+            names[names.index("铁矿石主连") - 2 : names.index("铁矿石主连")],
+            ["中证500期货主连", "中证1000期货主连"],
+        )
+
     def test_index_page_has_no_periodic_refresh(self):
         page_source = (Path(__file__).parents[1] / "pages" / "1_指数监控.py").read_text(encoding="utf-8")
 
@@ -75,6 +86,69 @@ class IndexRealtimeTests(unittest.TestCase):
 
         self.assertTrue(quote_is_visible_for_manual_display("沪深300", quote, now=lunch_time))
 
+    def test_nikkei_lunch_close_is_requested_once_during_japan_break(self):
+        japan_lunch = datetime(2026, 7, 23, 10, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        first_names, first_keys = manual_quote_request_names(set(), now=japan_lunch)
+        second_names, _ = manual_quote_request_names(set(first_keys.values()), now=japan_lunch)
+
+        self.assertIn("日经225", first_names)
+        self.assertEqual(first_keys["日经225"], "日经225:2026-07-23:lunch")
+        self.assertNotIn("日经225", second_names)
+
+    def test_nikkei_lunch_close_remains_visible_during_japan_break(self):
+        japan_lunch = datetime(2026, 7, 23, 10, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+        quote = {
+            "price": 66424.44,
+            "quote_time": datetime(2026, 7, 23, 11, 30, tzinfo=ZoneInfo("Asia/Tokyo")),
+        }
+
+        self.assertTrue(quote_is_visible_for_manual_display("日经225", quote, now=japan_lunch))
+
+    def test_hong_kong_lunch_closes_are_requested_once(self):
+        hong_kong_lunch = datetime(2026, 7, 23, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        first_names, first_keys = manual_quote_request_names(set(), now=hong_kong_lunch)
+        second_names, _ = manual_quote_request_names(set(first_keys.values()), now=hong_kong_lunch)
+
+        self.assertIn("恒生科技", first_names)
+        self.assertIn("恒生港股通高息低波", first_names)
+        self.assertNotIn("恒生科技", second_names)
+        self.assertNotIn("恒生港股通高息低波", second_names)
+
+    def test_futures_lunch_quote_remains_visible_until_afternoon_session(self):
+        before_futures_reopen = datetime(2026, 7, 23, 13, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
+        quote = {
+            "price": 800.0,
+            "quote_time": datetime(2026, 7, 23, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        }
+
+        self.assertTrue(
+            quote_is_visible_for_manual_display("铁矿石主连", quote, now=before_futures_reopen)
+        )
+
+    def test_index_futures_reopen_at_one_pm(self):
+        lunch_time = datetime(2026, 7, 23, 12, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        reopened = datetime(2026, 7, 23, 13, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        lunch_names, _ = manual_quote_request_names(set(), now=lunch_time)
+
+        self.assertIn("中证500期货主连", lunch_names)
+        self.assertIn("中证1000期货主连", lunch_names)
+        self.assertFalse(_futures_market_is_open("IC0", now=lunch_time))
+        self.assertTrue(_futures_market_is_open("IC0", now=reopened))
+
+    def test_previous_day_runtime_quote_is_hidden_during_current_session(self):
+        current_session = datetime(2026, 7, 23, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        stale_quote = {
+            "price": 4000.0,
+            "quote_time": datetime(2026, 7, 22, 14, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        }
+
+        self.assertFalse(
+            quote_is_visible_for_manual_display("沪深300", stale_quote, now=current_session)
+        )
+
     def test_main_contract_inference_matches_source_quote_instead_of_highest_position(self):
         contracts = pd.DataFrame(
             {
@@ -111,6 +185,8 @@ class IndexRealtimeTests(unittest.TestCase):
     @patch("akshare.futures_zh_realtime")
     def test_contract_names_are_refreshed_from_successful_manual_quotes(self, realtime_mock):
         rows = {
+            "中证500指数期货": [("IC0", 7545.4, 174182), ("IC2609", 7545.4, 174182)],
+            "中证1000股指期货": [("IM0", 7008.0, 235495), ("IM2609", 7008.0, 235495)],
             "铁矿石": [("I0", 762.0, 536320), ("I2609", 762.0, 536320)],
             "黄金": [("AU0", 879.64, 113826), ("AU2608", 879.64, 113826)],
             "白银": [("AG0", 14247.0, 190224), ("AG2608", 14247.0, 190224)],
@@ -131,6 +207,8 @@ class IndexRealtimeTests(unittest.TestCase):
 
         realtime_mock.side_effect = side_effect
         quotes = {
+            "中证500期货主连": {"price": 7545.4},
+            "中证1000期货主连": {"price": 7008.0},
             "铁矿石主连": {"price": 762.0},
             "沪金主连": {"price": 879.64},
             "沪银主连": {"price": 14247.0},
@@ -142,6 +220,8 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertEqual(
             contracts,
             {
+                "中证500期货主连": "IC2609",
+                "中证1000期货主连": "IM2609",
                 "铁矿石主连": "I2609",
                 "沪金主连": "AU2608",
                 "沪银主连": "AG2608",
@@ -231,6 +311,30 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertEqual(quote["price"], 519.4)
         self.assertIsNone(quote["previous_close"])
         self.assertIsNone(quote["change_pct"])
+
+    @patch("akshare.futures_zh_realtime")
+    def test_index_futures_quote_uses_cffex_realtime_table(self, realtime_mock):
+        realtime_mock.return_value = pd.DataFrame(
+            [
+                {
+                    "symbol": "IC0",
+                    "trade": 7545.4,
+                    "preclose": 7611.0,
+                    "volume": 64188,
+                    "position": 174182,
+                    "tradedate": "2026-07-23",
+                    "ticktime": "11:07:59",
+                }
+            ]
+        )
+
+        quote = _fetch_futures_quote("中证500期货主连", "IC0")
+
+        realtime_mock.assert_called_once_with(symbol="中证500指数期货")
+        self.assertEqual(quote["price"], 7545.4)
+        self.assertEqual(quote["previous_close"], 7611.0)
+        self.assertAlmostEqual(quote["change_pct"], (7545.4 / 7611.0 - 1) * 100)
+        self.assertEqual(quote["quote_time"].isoformat(), "2026-07-23T11:07:59+08:00")
 
     @patch("services.index_realtime._fetch_eastmoney_quote")
     def test_crude_oil_quote_uses_eastmoney_main_contract(self, eastmoney_mock):
@@ -363,7 +467,7 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertNotIn("标普500", requested_eastmoney)
         self.assertNotIn("纳斯达克100", requested_eastmoney)
         yahoo.assert_not_called()
-        self.assertEqual(futures.call_count, 4)
+        self.assertEqual(futures.call_count, 6)
 
     @patch("services.index_realtime._fetch_futures_quote")
     @patch("services.index_realtime._fetch_yahoo_quote")

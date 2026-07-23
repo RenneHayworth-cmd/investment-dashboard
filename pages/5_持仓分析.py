@@ -32,6 +32,7 @@ from services.position_analysis import (
     DEFAULT_SPREAD_CONTRACTS,
     PositionItem,
     apply_etf_realtime_quote,
+    build_recent_etf_operation_guidance,
     build_etf_timing_table,
     etf_final_close_ready,
     etf_intraday_quote_ready,
@@ -156,7 +157,7 @@ def build_overview_table(items: list[PositionItem]) -> pd.DataFrame:
 def format_etf_table_value(column: str, value: object) -> str:
     if value is None or pd.isna(value):
         return ""
-    if column in {"最新价", "对应均线"}:
+    if column in {"最新价", "对应均线", "触发收盘价"}:
         return format(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), ".3f")
     if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)"}:
         return format(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
@@ -171,7 +172,13 @@ def render_etf_timing_table(df: pd.DataFrame) -> None:
     rows = []
     for _, row in df.iterrows():
         timing_action = str(row.get("择时判断", ""))
-        row_class = " timing-buy" if timing_action == "买入" else " timing-sell" if timing_action == "卖出" else ""
+        row_class = (
+            " timing-buy"
+            if timing_action in {"买入", "加至满仓"}
+            else " timing-sell"
+            if timing_action in {"卖出", "降至半仓"}
+            else ""
+        )
         cells = "".join(
             f"<td>{html.escape(format_etf_table_value(column, row[column]))}</td>"
             for column in df.columns
@@ -214,6 +221,66 @@ def render_etf_timing_table(df: pd.DataFrame) -> None:
         }}
         </style>
         <table class="position-etf-summary-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_etf_operation_guidance(df: pd.DataFrame) -> None:
+    headers = "".join(f"<th>{html.escape(str(column))}</th>" for column in df.columns)
+    rows = []
+    for _, row in df.iterrows():
+        action = str(row.get("操作指引", ""))
+        row_class = (
+            "timing-buy"
+            if action in {"买入", "加至满仓"}
+            else "timing-sell"
+            if action in {"卖出", "降至半仓"}
+            else ""
+        )
+        cells = "".join(
+            f"<td>{html.escape(format_etf_table_value(column, row[column]))}</td>"
+            for column in df.columns
+        )
+        rows.append(f'<tr class="{row_class}">{cells}</tr>')
+    st.markdown(
+        f"""
+        <style>
+        .position-operation-guidance-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+        }}
+        .position-operation-guidance-table th,
+        .position-operation-guidance-table td {{
+            text-align: center;
+            padding: 0.45rem 0.6rem;
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            white-space: nowrap;
+        }}
+        .position-operation-guidance-table th {{
+            font-weight: 600;
+            background: rgba(49, 51, 63, 0.04);
+        }}
+        .position-operation-guidance-table tr.timing-buy td {{
+            background: rgba(254, 226, 226, 0.72);
+        }}
+        .position-operation-guidance-table tr.timing-sell td {{
+            background: rgba(220, 252, 231, 0.78);
+        }}
+        .position-operation-guidance-table tr.timing-buy td:nth-child(5) {{
+            color: rgb(190, 18, 60);
+            font-weight: 700;
+        }}
+        .position-operation-guidance-table tr.timing-sell td:nth-child(5) {{
+            color: rgb(22, 101, 52);
+            font-weight: 700;
+        }}
+        </style>
+        <table class="position-operation-guidance-table">
             <thead><tr>{headers}</tr></thead>
             <tbody>{''.join(rows)}</tbody>
         </table>
@@ -279,6 +346,14 @@ def render_etf_timing_section(
 
     st.subheader("ETF择时状态")
     render_etf_timing_table(build_etf_timing_table(formal_items))
+
+    st.subheader("近一周操作指引")
+    guidance_df = build_recent_etf_operation_guidance(formal_items, days=7)
+    if guidance_df.empty:
+        st.info("最近7个自然日没有新的调仓指引，继续按上方当前仓位执行。")
+    else:
+        render_etf_operation_guidance(guidance_df)
+    st.caption("依据正式收盘日线计算；盘中实时报价不参与，展示窗口以最新正式交易日为截止日。")
 
 
 def primary_value(item: PositionItem) -> tuple[str, object, int]:

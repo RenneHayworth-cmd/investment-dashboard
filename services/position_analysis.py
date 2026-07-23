@@ -85,6 +85,18 @@ ETF_TIMING_STRATEGIES = {
     "518850": (30, 1.5),
 }
 ETF_TIMING_TABLE_EXCLUDED_CODES = {"512890"}
+ETF_POSITION_STRATEGIES = {
+    "159655": "半仓持有半仓择时",
+    "159501": "半仓持有半仓择时",
+    "159201": "纯择时",
+    "159545": "纯择时",
+    "518850": "纯择时",
+    "513260": "纯择时",
+    "588000": "纯择时",
+    "159915": "纯择时",
+    "510500": "纯择时",
+    "159967": "纯择时",
+}
 _RUNTIME_ETF_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_ETF_QUOTE_CACHE_LOCK = Lock()
 
@@ -380,6 +392,136 @@ def calculate_etf_timing_snapshot(
     }
 
 
+def etf_position_decision(code: str, timing_action: object) -> object:
+    if timing_action is None or pd.isna(timing_action):
+        return pd.NA
+    action = str(timing_action)
+    if ETF_POSITION_STRATEGIES.get(normalize_etf_base_code(code)) != "半仓持有半仓择时":
+        return action
+    return {
+        "买入": "加至满仓",
+        "持有": "持有",
+        "卖出": "降至半仓",
+        "空仓": "半仓",
+        "等待均线": "半仓（等待均线）",
+    }.get(action, action)
+
+
+def calculate_etf_timing_transitions(
+    df: pd.DataFrame,
+    *,
+    ma_period: int,
+    threshold_pct: float,
+) -> pd.DataFrame:
+    columns = ["日期", "收盘价", "均线", "原始信号"]
+    if df is None or df.empty or not {"date", "price"}.issubset(df.columns):
+        return pd.DataFrame(columns=columns)
+
+    data = df[["date", "price"]].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["price"] = pd.to_numeric(data["price"], errors="coerce")
+    data = data.dropna(subset=["date", "price"]).sort_values("date").reset_index(drop=True)
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+
+    ma_col = f"ma_{int(ma_period)}"
+    data[ma_col] = data["price"].rolling(window=int(ma_period)).mean()
+    threshold = float(threshold_pct) / 100
+    position = 0
+    rows = []
+    for _, row in data.iterrows():
+        ma_value = pd.to_numeric(row[ma_col], errors="coerce")
+        if pd.isna(ma_value):
+            continue
+        price = float(row["price"])
+        desired_position = (
+            1
+            if price > float(ma_value) * (1 + threshold)
+            else 0
+            if price < float(ma_value) * (1 - threshold)
+            else position
+        )
+        if desired_position != position:
+            rows.append(
+                {
+                    "日期": pd.Timestamp(row["date"]),
+                    "收盘价": price,
+                    "均线": float(ma_value),
+                    "原始信号": "买入" if desired_position else "卖出",
+                }
+            )
+        position = desired_position
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_recent_etf_operation_guidance(
+    items: list[PositionItem],
+    *,
+    days: int = 7,
+) -> pd.DataFrame:
+    columns = ["日期", "ETF名称", "代码", "策略参数", "操作指引", "操作后仓位", "触发收盘价"]
+    latest_dates = []
+    for item in items:
+        if item.category != "ETF" or item.dataframe is None or item.dataframe.empty:
+            continue
+        dates = pd.to_datetime(item.dataframe.get("date"), errors="coerce").dropna()
+        if not dates.empty:
+            latest_dates.append(dates.max())
+    if not latest_dates:
+        return pd.DataFrame(columns=columns)
+
+    end_date = max(latest_dates).normalize()
+    start_date = end_date - pd.Timedelta(days=max(int(days), 1) - 1)
+    rows = []
+    for item in items:
+        if item.category != "ETF":
+            continue
+        base_code = normalize_etf_base_code(item.code)
+        strategy = ETF_TIMING_STRATEGIES.get(base_code)
+        if strategy is None or base_code in ETF_TIMING_TABLE_EXCLUDED_CODES:
+            continue
+        ma_period, threshold_pct = strategy
+        transitions = calculate_etf_timing_transitions(
+            item.dataframe,
+            ma_period=ma_period,
+            threshold_pct=threshold_pct,
+        )
+        if transitions.empty:
+            continue
+        transitions = transitions[
+            (transitions["日期"] >= start_date) & (transitions["日期"] <= end_date)
+        ]
+        for _, transition in transitions.iterrows():
+            raw_action = str(transition["原始信号"])
+            action = etf_position_decision(base_code, raw_action)
+            half_timing = ETF_POSITION_STRATEGIES.get(base_code) == "半仓持有半仓择时"
+            post_position = (
+                "持有"
+                if raw_action == "买入" and half_timing
+                else "半仓"
+                if raw_action == "卖出" and half_timing
+                else "持有"
+                if raw_action == "买入"
+                else "空仓"
+            )
+            rows.append(
+                {
+                    "日期": pd.Timestamp(transition["日期"]).strftime("%Y-%m-%d"),
+                    "ETF名称": display_etf_name(base_code, item.name),
+                    "代码": base_code,
+                    "策略参数": f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
+                    "操作指引": action,
+                    "操作后仓位": post_position,
+                    "触发收盘价": round(float(transition["收盘价"]), 3),
+                }
+            )
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["日期", "代码"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+
 def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
     columns = [
         "ETF名称",
@@ -422,7 +564,10 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
                     ),
                     "对应均线": item.metrics.get("策略均线", pd.NA),
                     "偏离率(%)": item.metrics.get("策略偏离(%)", pd.NA),
-                    "择时判断": item.metrics.get("择时判断", pd.NA),
+                    "择时判断": etf_position_decision(
+                        base_code,
+                        item.metrics.get("择时判断", pd.NA),
+                    ),
                     "状态转换时间": item.metrics.get("状态转换时间", pd.NA),
                     "区间涨幅(%)": item.metrics.get("策略区间涨幅(%)", pd.NA),
                 }

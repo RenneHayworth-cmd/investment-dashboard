@@ -19,6 +19,7 @@ from services.index_ma20 import (
     fetch_index_history,
     fetch_eastmoney_clist_latest_index_row,
     filter_completed_market_dates,
+    get_index_data_from_akshare_futures_main,
     overlay_finalized_index_rows,
     sanitize_index_report_market_dates,
     supplement_stale_yahoo_history,
@@ -297,6 +298,21 @@ class MarketAndCacheTests(unittest.TestCase):
 
         for result in (china, hong_kong, futures):
             self.assertEqual(result["trade_date"].max(), pd.Timestamp("2026-07-10"))
+
+    @patch("akshare.futures_zh_spot")
+    @patch("akshare.futures_zh_daily_sina")
+    def test_index_futures_history_does_not_append_intraday_spot(self, daily_mock, spot_mock):
+        daily_mock.return_value = pd.DataFrame(
+            {
+                "date": ["2026-07-21", "2026-07-22"],
+                "close": [7685.8, 7611.0],
+            }
+        )
+
+        result = get_index_data_from_akshare_futures_main("IC0", "中证500期货主连", days=30)
+
+        spot_mock.assert_not_called()
+        self.assertEqual(result["日期"].max(), "2026-07-22")
 
     @patch("services.update_tasks.append_eastmoney_latest_index_row", side_effect=lambda _ak, raw, *_args, **_kwargs: raw)
     def test_short_fallback_does_not_erase_cached_ma20(self, _append_mock):

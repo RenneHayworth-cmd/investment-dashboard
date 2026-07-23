@@ -15,6 +15,13 @@ from services.market_calendar import (
 
 
 INDEX_CONFIG = {
+    "上证指数": {
+        "source": "akshare_cn",
+        "code": "000001",
+        "market": "sh",
+        "market_group": "A股",
+        "tickflow_symbol": "000001.SH",
+    },
     "创业板指": {
         "source": "akshare_cn",
         "code": "399006",
@@ -59,6 +66,13 @@ INDEX_CONFIG = {
         "fqt": "1",
         "akshare_board_symbol": "BK1158",
         "require_current_quote": True,
+    },
+    "科创50": {
+        "source": "akshare_cn",
+        "code": "000688",
+        "market": "sh",
+        "market_group": "A股",
+        "tickflow_symbol": "000688.SH",
     },
     "中证红利低波": {
         "source": "akshare_csindex",
@@ -137,6 +151,18 @@ INDEX_CONFIG = {
         "display_symbol": "KOSPI",
         "market_group": "韩国",
         "require_current_quote": True,
+    },
+    "中证500期货主连": {
+        "source": "akshare_futures_main",
+        "code": "IC0",
+        "display_symbol": "IC0",
+        "market_group": "A股",
+    },
+    "中证1000期货主连": {
+        "source": "akshare_futures_main",
+        "code": "IM0",
+        "display_symbol": "IM0",
+        "market_group": "A股",
     },
     "铁矿石主连": {
         "source": "akshare_futures_main",
@@ -1204,7 +1230,8 @@ def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, d
 
     raw_df = ak.futures_zh_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
-    df = append_futures_spot_row(ak, df, index_code)
+    if index_code.upper() not in {"IC0", "IM0"}:
+        df = append_futures_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
 
 

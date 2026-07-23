@@ -6,6 +6,11 @@ import pandas as pd
 from services.fund_rotation import (
     EXECUTION_AFTER_CLOSE,
     EXECUTION_NEXT_OPEN,
+    PORTFOLIO_STRATEGY_CASH,
+    PORTFOLIO_STRATEGY_HALF_TIMING,
+    PORTFOLIO_STRATEGY_HOLD,
+    PORTFOLIO_STRATEGY_TIMING,
+    PortfolioTimingAllocation,
     RotationInput,
     _calculate_momentum,
     _calculate_sharpe_ratio,
@@ -15,13 +20,145 @@ from services.fund_rotation import (
     normalize_rotation_dataframe,
     run_fund_rotation_backtest,
     run_ma20_timing_backtest,
+    run_portfolio_timing_backtest,
 )
 
 
 class FundRotationTests(unittest.TestCase):
+    def test_portfolio_timing_rejects_weights_above_one_hundred_percent(self):
+        dates = pd.bdate_range("2026-01-01", periods=5)
+        fund = RotationInput(
+            "A",
+            "A",
+            pd.DataFrame({"trade_date": dates, "open": 10.0, "close": 10.0}),
+        )
+
+        with self.assertRaisesRegex(ValueError, "配置比例合计不能超过 100%"):
+            run_portfolio_timing_backtest(
+                [fund],
+                [PortfolioTimingAllocation("A", "A", 110, PORTFOLIO_STRATEGY_HOLD)],
+            )
+
+    def test_portfolio_timing_assigns_unallocated_weight_to_cash(self):
+        dates = pd.bdate_range("2026-01-01", periods=5)
+        fund = RotationInput(
+            "A",
+            "A",
+            pd.DataFrame({"trade_date": dates, "open": 10.0, "close": 10.0}),
+        )
+
+        result = run_portfolio_timing_backtest(
+            [fund],
+            [PortfolioTimingAllocation("A", "A", 80, PORTFOLIO_STRATEGY_HOLD)],
+            transaction_cost=0,
+            lot_size=1,
+        )
+
+        self.assertEqual(result.component_results["配置比例(%)"].tolist(), [80.0, 20.0])
+        self.assertEqual(result.component_results.iloc[-1]["标的名称"], "剩余现金")
+        self.assertEqual(result.summary["当前ETF仓位(%)"], 80.0)
+        self.assertEqual(result.summary["当前现金仓位(%)"], 20.0)
+
+    def test_portfolio_timing_ignores_zero_weight_rows(self):
+        dates = pd.bdate_range("2026-01-01", periods=5)
+        fund = RotationInput(
+            "A",
+            "A",
+            pd.DataFrame({"trade_date": dates, "open": 10.0, "close": 10.0}),
+        )
+
+        result = run_portfolio_timing_backtest(
+            [fund],
+            [
+                PortfolioTimingAllocation("A", "A", 0, PORTFOLIO_STRATEGY_TIMING, 2, 0),
+                PortfolioTimingAllocation("", "现金", 100, PORTFOLIO_STRATEGY_CASH),
+            ],
+        )
+
+        self.assertEqual(result.summary["总收益率(%)"], 0.0)
+        self.assertEqual(result.component_results["代码"].tolist(), [""])
+
+    def test_portfolio_timing_combines_hold_half_timing_and_cash(self):
+        dates = pd.bdate_range("2026-01-01", periods=8)
+        prices = pd.Series([10.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0])
+        fund = RotationInput(
+            "A",
+            "A",
+            pd.DataFrame({"trade_date": dates, "open": prices, "close": prices}),
+        )
+        allocations = [
+            PortfolioTimingAllocation(
+                "A",
+                "A",
+                60,
+                PORTFOLIO_STRATEGY_HALF_TIMING,
+                ma_period=2,
+                threshold_pct=0,
+            ),
+            PortfolioTimingAllocation("", "现金", 40, PORTFOLIO_STRATEGY_CASH),
+        ]
+
+        result = run_portfolio_timing_backtest(
+            [fund],
+            allocations,
+            initial_capital=100000,
+            transaction_cost=0,
+            lot_size=1,
+        )
+
+        self.assertGreater(result.summary["总收益率(%)"], 0)
+        self.assertEqual(result.summary["当前ETF仓位(%)"], 60.0)
+        self.assertEqual(result.summary["当前现金仓位(%)"], 40.0)
+        self.assertEqual(result.component_results.iloc[0]["最新状态"], "满仓")
+        self.assertIn("一直持有净值", result.nav_data.columns)
+        self.assertFalse(result.trades.empty)
+
+    def test_portfolio_timing_uses_latest_common_inception_date(self):
+        early_dates = pd.bdate_range("2026-01-01", periods=12)
+        late_dates = early_dates[4:]
+        funds = [
+            RotationInput(
+                "A",
+                "A",
+                pd.DataFrame({"trade_date": early_dates, "open": 10.0, "close": 10.0}),
+            ),
+            RotationInput(
+                "B",
+                "B",
+                pd.DataFrame({"trade_date": late_dates, "open": 20.0, "close": 20.0}),
+            ),
+        ]
+        allocations = [
+            PortfolioTimingAllocation("A", "A", 50, PORTFOLIO_STRATEGY_HOLD),
+            PortfolioTimingAllocation("B", "B", 50, PORTFOLIO_STRATEGY_TIMING, 2, 0),
+        ]
+
+        result = run_portfolio_timing_backtest(
+            funds,
+            allocations,
+            transaction_cost=0,
+            lot_size=1,
+        )
+
+        self.assertEqual(result.start_date, late_dates[0])
+        self.assertEqual(result.end_date, late_dates[-1])
+
     def test_normalize_rotation_rejects_empty_input(self):
         with self.assertRaisesRegex(ValueError, "没有可回测的数据"):
             normalize_rotation_dataframe(pd.DataFrame(), fallback_name="测试")
+
+    def test_normalize_rotation_prefers_exact_close_over_internal_confirmation_column(self):
+        raw = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-16", "2026-07-17"]),
+                "收盘价": [1.234, 1.256],
+                "_final_close_confirmed": [pd.NA, True],
+            }
+        )
+
+        fund = normalize_rotation_dataframe(raw, fallback_name="测试")
+
+        self.assertEqual(fund.dataframe["close"].tolist(), [1.234, 1.256])
 
     def test_rotation_rejects_position_count_above_fund_count(self):
         funds = [

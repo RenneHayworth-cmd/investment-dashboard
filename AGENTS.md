@@ -51,8 +51,9 @@ before a larger handoff or commit.
 - The `指数监控` page should show cached data first and must not use a periodic
   refresh timer for its summary cards or formal summary update. The
   `更新指数数据` button is their network trigger: fetch one read-only quote for
-  instruments currently trading, fetch the
-  mainland 11:30 lunch close only once per page session during 11:30-13:30, and
+  instruments currently trading, fetch mainland, Hong Kong, Japan, and domestic
+  futures lunch closes only once per page session during their respective
+  breaks, and
   update formal daily data only for indexes missing their latest completed
   session. If `index_final_history` already contains the target session, do not
   request that index again. Intraday and lunch card quotes stay in session and
@@ -99,15 +100,15 @@ before a larger handoff or commit.
   detail views with long-history trend/drawdown summaries, and a summary table
   sorted by MA20 deviation. Keep VIX in the cards and detail view, but exclude
   it from the MA20 summary table.
-- The four futures-main display names include the currently matched concrete
+- The six futures-main display names include the currently matched concrete
   contract, for example `铁矿石主连（I2609）`. Re-resolve the contract only after
   a successful manual quote update, persist the small mapping in
   `index_futures_main_contracts`, and keep canonical index names unchanged for
   links, cache keys, and calculations.
-- The monitored set includes mainland China indices, EastMoney micro-cap board
-  index, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
+- The monitored set includes the Shanghai Composite, mainland China indices,
+  EastMoney micro-cap board index, STAR 50, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
   Dividend Low Volatility, Nikkei 225, Korea KOSPI, and iron ore/gold/crude
-  oil/silver main-continuous futures. Main-continuous futures should try to
+  oil/silver and CSI 500/CSI 1000 main-continuous futures. Main-continuous futures should try to
   supplement same-day spot prices so they do not remain stale during the
   trading day. Global indices may use Yahoo chart fallback when the AkShare
   Eastmoney global endpoint fails.
@@ -133,10 +134,16 @@ before a larger handoff or commit.
   MA20/0.5% for 159201; MA25/2% for 159655, 159501, and 159967; MA10/1% for 159545; and
   MA30/1.5% for 518850. Preserve the
   previous position while price remains inside the threshold band. Treat
+  159655 and 159501 as half long-term holding and half MA timing: display a
+  bearish timing state as half position rather than empty. Treat 159201,
+  159545, 518850, 513260, 588000, 159915, 510500, and 159967 as pure timing.
+  Treat
   512890 as a long-term holding: keep it out of the bottom ETF timing table
   while retaining its card and detail view. Use the complete fund
   names stored in the fixed ETF display-name mapping, and show ETF codes as six
-  digits without `.SH` or `.SZ` in cards, tables, and detail captions.
+  digits without `.SH` or `.SZ` in cards, tables, and detail captions. At the
+  very bottom, show every position transition reconstructed from formal daily
+  closes in the latest seven calendar days; intraday quotes must not affect it.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -199,6 +206,14 @@ For futures:
 For fund rotation:
 
 - The app now has a dedicated `策略回测` page after `A股分析`.
+- The page also provides a multi-ETF allocation timing mode. Each row configures
+  an ETF or cash weight and chooses always-hold, pure MA timing, or half
+  always-hold plus half MA timing. Weights must total 100%. Use the latest
+  common available trading date range, execute MA signals at that day's close,
+  retain the existing transaction-cost and lot-size rules, and compare against
+  the same ETF weights held continuously. Cash rows remain cash in both paths;
+  zero-weight rows stay editable but are excluded from the run, and any total
+  below 100% is automatically assigned to cash. Reject totals above 100%.
 - Data sources include uploaded files, TickFlow exchange-traded funds/ETFs, and
   EastMoney off-exchange mutual funds.
 - TickFlow data is cached with `core.cache`. Single-asset MA timing fetches

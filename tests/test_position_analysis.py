@@ -12,14 +12,17 @@ from services.futures_spread import SPREAD_CALCULATION_VERSION
 from services.position_analysis import (
     DEFAULT_ETF_CODES,
     ETF_DISPLAY_NAMES,
+    ETF_POSITION_STRATEGIES,
     ETF_TIMING_STRATEGIES,
     PositionItem,
     _merge_by_date,
     apply_etf_realtime_quote,
+    build_recent_etf_operation_guidance,
     build_etf_timing_table,
     calculate_etf_timing_snapshot,
     etf_final_close_ready,
     etf_intraday_quote_ready,
+    etf_position_decision,
     fetch_tickflow_etf_quotes,
     filter_current_etf_realtime_quotes,
     filter_final_etf_rows,
@@ -33,6 +36,52 @@ from services.position_analysis import (
 
 
 class PositionAnalysisTests(unittest.TestCase):
+    def test_position_page_uses_one_week_operation_guidance(self):
+        page_source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('st.subheader("近一周操作指引")', page_source)
+        self.assertIn("build_recent_etf_operation_guidance(formal_items, days=7)", page_source)
+        self.assertNotIn("近一月操作指引", page_source)
+
+    def test_recent_operation_guidance_lists_pure_and_half_position_transitions(self):
+        data = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-07-01", periods=7, freq="D"),
+                "price": [100.0, 100.0, 100.0, 104.0, 103.0, 100.0, 100.0],
+            }
+        )
+        pure = PositionItem("ETF", "513260.SH", "恒生科技ETF汇添富", "缓存", dataframe=data)
+        half = PositionItem("ETF", "159501.SZ", "纳指ETF嘉实", "缓存", dataframe=data)
+
+        with patch.dict(
+            ETF_TIMING_STRATEGIES,
+            {"513260": (3, 1.0), "159501": (3, 1.0)},
+            clear=True,
+        ):
+            result = build_recent_etf_operation_guidance([pure, half], days=4)
+
+        self.assertEqual(
+            set(result["操作指引"]),
+            {"买入", "卖出", "加至满仓", "降至半仓"},
+        )
+        half_rows = result[result["代码"] == "159501"]
+        self.assertEqual(set(half_rows["操作后仓位"]), {"持有", "半仓"})
+        self.assertEqual(result["日期"].min(), "2026-07-04")
+
+    def test_half_timing_position_decisions_keep_the_base_half(self):
+        self.assertEqual(ETF_POSITION_STRATEGIES["159501"], "半仓持有半仓择时")
+        self.assertEqual(etf_position_decision("159501", "买入"), "加至满仓")
+        self.assertEqual(etf_position_decision("159501", "持有"), "持有")
+        self.assertEqual(etf_position_decision("159501", "卖出"), "降至半仓")
+        self.assertEqual(etf_position_decision("159501", "空仓"), "半仓")
+        self.assertEqual(etf_position_decision("159655", "空仓"), "半仓")
+        self.assertEqual(etf_position_decision("159201", "空仓"), "空仓")
+        self.assertEqual(etf_position_decision("159545", "空仓"), "空仓")
+        self.assertEqual(etf_position_decision("518850", "空仓"), "空仓")
+        self.assertEqual(etf_position_decision("513260", "空仓"), "空仓")
+
     def test_runtime_etf_quote_cache_returns_an_isolated_copy(self):
         remember_runtime_etf_quotes(
             {
@@ -78,6 +127,9 @@ class PositionAnalysisTests(unittest.TestCase):
 
         self.assertIn('[data-stale="true"]', page_source)
         self.assertIn("opacity: 1 !important", page_source)
+        self.assertIn("position-operation-guidance-table", page_source)
+        self.assertIn('action in {"买入", "加至满仓"}', page_source)
+        self.assertIn('action in {"卖出", "降至半仓"}', page_source)
 
     def test_default_etf_list_includes_new_holdings(self):
         self.assertEqual(
