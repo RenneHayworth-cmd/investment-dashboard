@@ -1,0 +1,62 @@
+{
+  "initial_capital": 100000.0,
+  "commission_rate": 0.00006,
+  "lot_size": 100,
+  "start_date": "2025-02-27",
+  "end_date": null,
+  "research_end_date": "2026-07-27",
+  "full_history_start_date": "20000101",
+  "full_history_dividend_start_year": 2013,
+  "freeze_date": "2026-07-28",
+  "frozen_parameter_version": "etf-timing-20260728-v1",
+  "frozen_strategy_path": "config/frozen_strategy_20260728.json",
+  "known_share_splits": {
+    "510500": [
+      {"effective_date": "2015-04-15", "event_date": "2015-04-14", "ratio": 0.28032483, "rounding": "floor", "source": "南方基金份额折算结果公告"},
+      {"effective_date": "2022-08-29", "event_date": "2022-08-26", "ratio": 1.14539, "rounding": "ceil", "source": "南方基金份额拆分结果公告"}
+    ],
+    "512890": [
+      {"effective_date": "2021-10-25", "event_date": "2021-10-22", "ratio": 2.0, "rounding": "floor", "source": "华泰柏瑞基金份额拆分公告"}
+    ],
+    "159967": [
+      {"effective_date": "2020-11-06", "event_date": "2020-11-05", "ratio": 3.63839094, "rounding": "floor", "source": "华夏基金份额拆分结果公告"}
+    ]
+  },
+  "random_seed": 20260727,
+  "execution_mode": "after_close",
+  "after_hours_fill_rate": 1.0,
+  "slippage_bp": 0.0,
+  "cash_annual_rate": 0.0,
+  "data_source": "akshare_tencent",
+  "allocations": [
+    {"symbol": "512890", "name": "红利低波ETF华泰柏瑞", "weight_pct": 10.0, "strategy": "hold", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "159201", "name": "自由现金流ETF华夏", "weight_pct": 10.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 0.5},
+    {"symbol": "513260", "name": "恒生科技ETF汇添富", "weight_pct": 10.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "588000", "name": "科创50ETF华夏", "weight_pct": 10.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "510500", "name": "中证500ETF南方", "weight_pct": 10.0, "strategy": "timing", "ma_period": 15, "threshold_pct": 1.0},
+    {"symbol": "159967", "name": "创业板成长ETF华夏", "weight_pct": 10.0, "strategy": "timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "159545", "name": "恒生红利低波ETF易方达", "weight_pct": 10.0, "strategy": "timing", "ma_period": 10, "threshold_pct": 1.0},
+    {"symbol": "159501", "name": "纳指ETF嘉实", "weight_pct": 10.0, "strategy": "half_timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "159655", "name": "标普500ETF华夏", "weight_pct": 10.0, "strategy": "half_timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "518850", "name": "黄金ETF华夏", "weight_pct": 10.0, "strategy": "timing", "ma_period": 30, "threshold_pct": 1.5}
+  ],
+  "risk_buckets": {
+    "红利与现金流": ["512890", "159201", "159545"],
+    "A股中小盘与成长": ["510500", "159967", "588000"],
+    "港股成长": ["513260"],
+    "美国权益": ["159501", "159655"],
+    "黄金": ["518850"]
+  },
+  "parameter_grid": {
+    "ma_periods": [5, 10, 15, 20, 25, 30, 40, 50, 60],
+    "threshold_pcts": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+    "atr_k_values": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+  },
+  "sensitivity": {
+    "after_hours_fill_rates": [1.0, 0.95, 0.9],
+    "slippage_bps": [0.0, 2.0, 5.0, 10.0, 20.0],
+    "cash_annual_rates": [0.0, 0.01, 0.015, 0.02],
+    "missed_signal_rates": [0.05, 0.1, 0.2],
+    "train_test_splits": [0.6, 0.7, 0.8]
+  }
+}

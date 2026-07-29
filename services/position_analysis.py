@@ -327,6 +327,20 @@ def filter_final_etf_rows(
     return result.reset_index(drop=True)
 
 
+def etf_cache_has_latest_final_close(
+    df: pd.DataFrame | None,
+    *,
+    date_column: str = "日期",
+    market_now: datetime | None = None,
+) -> bool:
+    if df is None or df.empty or date_column not in df.columns:
+        return False
+    dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
+    if dates.empty:
+        return False
+    return dates.max().date() >= latest_final_etf_trade_date(market_now)
+
+
 def calculate_etf_timing_snapshot(
     df: pd.DataFrame,
     *,
@@ -746,7 +760,13 @@ def load_or_fetch_etf(
         market_now=market_now,
         require_current_confirmation=True,
     )
-    used_cache = cached_df is not None and not force_refresh
+    cache_is_current = etf_cache_has_latest_final_close(
+        cached_df,
+        date_column="日期",
+        market_now=market_now,
+    )
+    should_refresh = force_refresh or (allow_fetch and not cache_is_current)
+    used_cache = cached_df is not None and not should_refresh
     source_df = cached_df.copy() if used_cache else None
     source = "本地缓存" if used_cache else "TickFlow"
     status = "缓存"

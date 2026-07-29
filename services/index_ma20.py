@@ -198,6 +198,10 @@ INDEX_FINAL_HISTORY_SOURCE = "index_final_history"
 INDEX_SOURCE_CORRECTION_SOURCE = "index_source_correction_history"
 INDEX_LONG_HISTORY_BARS = 20000
 INDEX_REPORT_DISPLAY_DAYS = 120
+CFFEX_FUTURES_MAIN_PRODUCTS = {
+    "IC0": "中证500指数期货",
+    "IM0": "中证1000股指期货",
+}
 
 
 def overlay_finalized_index_rows(
@@ -800,7 +804,39 @@ def append_futures_spot_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFra
         return normalized
 
     try:
-        spot_df = ak.futures_zh_spot(symbol=index_code.upper(), market="CF", adjust="0")
+        normalized_code = index_code.upper()
+        cffex_product = CFFEX_FUTURES_MAIN_PRODUCTS.get(normalized_code)
+        if cffex_product:
+            spot_df = ak.futures_zh_realtime(symbol=cffex_product)
+            if spot_df is None or spot_df.empty or "symbol" not in spot_df.columns:
+                return normalized
+            matched = spot_df[
+                spot_df["symbol"].astype(str).str.strip().str.upper() == normalized_code
+            ]
+            if matched.empty:
+                return normalized
+            latest = matched.iloc[0]
+            quote_date = pd.to_datetime(latest.get("tradedate"), errors="coerce")
+            quote_time = pd.to_datetime(latest.get("ticktime"), errors="coerce")
+            if (
+                pd.isna(quote_date)
+                or quote_date.date() != expected_date
+                or pd.isna(quote_time)
+                or quote_time.time() < time(15, 0)
+            ):
+                return normalized
+            latest_price = pd.to_numeric(
+                latest.get("close", latest.get("trade")),
+                errors="coerce",
+            )
+            if pd.isna(latest_price):
+                return normalized
+            supplement = pd.DataFrame(
+                [{"trade_date": pd.Timestamp(expected_date), "close": float(latest_price)}]
+            )
+            return pd.concat([normalized, supplement], ignore_index=True)
+
+        spot_df = ak.futures_zh_spot(symbol=normalized_code, market="CF", adjust="0")
         if spot_df is None or spot_df.empty:
             return normalized
         price_col = "current_price" if "current_price" in spot_df.columns else "last_close"
@@ -1230,8 +1266,7 @@ def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, d
 
     raw_df = ak.futures_zh_daily_sina(symbol=index_code)
     df = normalize_akshare_index_df(raw_df)
-    if index_code.upper() not in {"IC0", "IM0"}:
-        df = append_futures_spot_row(ak, df, index_code)
+    df = append_futures_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
 
 

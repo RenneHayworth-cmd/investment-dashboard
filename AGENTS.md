@@ -67,6 +67,13 @@ before a larger handoff or commit.
   Detail views retain their separate cache-first incremental history behavior.
 - The `任务与数据` page provides manual index updates, dataset metadata, and job
   records. Do not add a background-loop toggle or auto-started updater.
+- Iron ore price alerts run independently through
+  `scripts/monitor_iron_ore_price.py`; do not tie them to a Streamlit page loop.
+  The default threshold is 730 yuan/ton. Notify ordinary WeChat through
+  ServerChan only on the first below-threshold observation, suppress repeats
+  until the price returns to or above the threshold, and never persist or log
+  the SendKey. The Windows scheduled task may invoke the script every minute;
+  the script itself must skip non-trading sessions.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
   a data source becomes unstable. Preserve per-index raw history with
@@ -121,8 +128,9 @@ before a larger handoff or commit.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
   spread, and futures option data. It should read local cache on first render
   and fetch after the user clicks the load button. From the A-share open through
-  15:05, an ETF refresh should batch TickFlow real-time quotes and update cards
-  only; it must not save that quote or use it in the timing table. Before the
+  15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
+  it may also incrementally backfill missing completed sessions, but must not
+  save the current unfinished quote or use it in the timing table. Before the
   open, on non-trading days, and from 15:05 onward, use the daily-history path. While
   the page is open, a local one-minute fragment check should fetch each missing
   formal ETF close once after 15:05, mark the current row as close-confirmed,

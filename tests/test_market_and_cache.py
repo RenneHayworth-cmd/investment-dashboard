@@ -299,20 +299,69 @@ class MarketAndCacheTests(unittest.TestCase):
         for result in (china, hong_kong, futures):
             self.assertEqual(result["trade_date"].max(), pd.Timestamp("2026-07-10"))
 
-    @patch("akshare.futures_zh_spot")
+    @patch("akshare.futures_zh_realtime")
     @patch("akshare.futures_zh_daily_sina")
-    def test_index_futures_history_does_not_append_intraday_spot(self, daily_mock, spot_mock):
+    def test_index_futures_history_appends_confirmed_cffex_close(self, daily_mock, realtime_mock):
+        class PostCloseDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 23, 15, 20)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
         daily_mock.return_value = pd.DataFrame(
             {
                 "date": ["2026-07-21", "2026-07-22"],
                 "close": [7685.8, 7611.0],
             }
         )
+        realtime_mock.return_value = pd.DataFrame(
+            [
+                {
+                    "symbol": "IC0",
+                    "trade": 7602.6,
+                    "close": 7602.6,
+                    "tradedate": "2026-07-23",
+                    "ticktime": "15:00:00",
+                }
+            ]
+        )
 
-        result = get_index_data_from_akshare_futures_main("IC0", "中证500期货主连", days=30)
+        with patch("services.index_ma20.datetime", PostCloseDateTime):
+            result = get_index_data_from_akshare_futures_main(
+                "IC0", "中证500期货主连", days=30
+            )
 
-        spot_mock.assert_not_called()
-        self.assertEqual(result["日期"].max(), "2026-07-22")
+        realtime_mock.assert_called_once_with(symbol="中证500指数期货")
+        self.assertEqual(result["日期"].max(), "2026-07-23")
+        self.assertEqual(float(result.iloc[-1]["中证500期货主连_收盘价"]), 7602.6)
+
+    @patch("akshare.futures_zh_realtime")
+    def test_index_futures_history_rejects_unfinished_intraday_quote(self, realtime_mock):
+        class IntradayDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 23, 11, 20)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        raw = pd.DataFrame(
+            {"trade_date": pd.to_datetime(["2026-07-22"]), "close": [7611.0]}
+        )
+        realtime_mock.return_value = pd.DataFrame(
+            [
+                {
+                    "symbol": "IC0",
+                    "trade": 7557.0,
+                    "close": 0.0,
+                    "tradedate": "2026-07-23",
+                    "ticktime": "11:20:00",
+                }
+            ]
+        )
+
+        with patch("services.index_ma20.datetime", IntradayDateTime):
+            result = append_futures_spot_row(object(), raw, "IC0")
+
+        self.assertEqual(result["trade_date"].max(), pd.Timestamp("2026-07-22"))
 
     @patch("services.update_tasks.append_eastmoney_latest_index_row", side_effect=lambda _ak, raw, *_args, **_kwargs: raw)
     def test_short_fallback_does_not_erase_cached_ma20(self, _append_mock):

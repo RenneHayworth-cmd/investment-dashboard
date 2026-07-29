@@ -1004,7 +1004,7 @@ with st.spinner("正在整理持仓数据..."):
                 api_key=api_key,
                 count=int(etf_count),
                 adjust=adjust_map[adjust_option],
-                allow_fetch=False,
+                allow_fetch=True,
                 market_now=market_now,
             )
         else:

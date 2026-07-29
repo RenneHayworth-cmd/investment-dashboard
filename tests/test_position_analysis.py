@@ -20,6 +20,7 @@ from services.position_analysis import (
     build_recent_etf_operation_guidance,
     build_etf_timing_table,
     calculate_etf_timing_snapshot,
+    etf_cache_has_latest_final_close,
     etf_final_close_ready,
     etf_intraday_quote_ready,
     etf_position_decision,
@@ -183,6 +184,30 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertTrue(etf_final_close_ready(ready))
         self.assertEqual(latest_final_etf_trade_date(ready).isoformat(), "2026-07-15")
 
+    def test_etf_cache_freshness_uses_latest_confirmed_close_for_each_market_phase(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+        friday_cache = pd.DataFrame({"日期": [pd.Timestamp("2026-07-24")]})
+        monday_cache = pd.DataFrame({"日期": [pd.Timestamp("2026-07-27")]})
+
+        self.assertTrue(
+            etf_cache_has_latest_final_close(
+                friday_cache,
+                market_now=datetime(2026, 7, 27, 10, 0, tzinfo=timezone),
+            )
+        )
+        self.assertFalse(
+            etf_cache_has_latest_final_close(
+                friday_cache,
+                market_now=datetime(2026, 7, 27, 15, 5, tzinfo=timezone),
+            )
+        )
+        self.assertTrue(
+            etf_cache_has_latest_final_close(
+                monday_cache,
+                market_now=datetime(2026, 7, 27, 15, 5, tzinfo=timezone),
+            )
+        )
+
     def test_etf_intraday_quote_window_excludes_preopen_postclose_and_holidays(self):
         timezone = ZoneInfo("Asia/Shanghai")
 
@@ -321,6 +346,175 @@ class PositionAnalysisTests(unittest.TestCase):
 
         self.assertEqual(filtered["日期"].max(), pd.Timestamp("2026-07-14"))
         self.assertEqual(confirmed_filtered["日期"].max(), pd.Timestamp("2026-07-15"))
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_weekend_load_incrementally_fetches_missing_friday_close(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached_dates = pd.bdate_range(end="2026-07-23", periods=30)
+        cached = pd.DataFrame(
+            {
+                "日期": cached_dates,
+                "收盘价": [1.0] * len(cached_dates),
+                "symbol": "512890.SH",
+                "name": "红利低波ETF华泰柏瑞",
+            }
+        )
+        friday = pd.DataFrame(
+            {
+                "日期": [pd.Timestamp("2026-07-24")],
+                "收盘价": [1.2],
+                "symbol": ["512890.SH"],
+                "name": ["红利低波ETF华泰柏瑞"],
+            }
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-07-23T16:00:00"})
+        fetch_mock.return_value = friday
+
+        item = load_or_fetch_etf(
+            "512890",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=False,
+            save_to_cache=True,
+            market_now=datetime(2026, 7, 26, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        fetch_mock.assert_called_once()
+        saved = save_mock.call_args.kwargs["df"]
+        self.assertEqual(saved["日期"].max(), pd.Timestamp("2026-07-24"))
+        self.assertTrue(saved.loc[saved["日期"] == pd.Timestamp("2026-07-24"), "_final_close_confirmed"].iloc[0])
+        self.assertEqual(item.latest_date, "2026-07-24")
+        self.assertEqual(item.metrics["最新价"], 1.2)
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_weekend_load_does_not_refetch_current_friday_close(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached_dates = pd.bdate_range(end="2026-07-24", periods=30)
+        cached = pd.DataFrame(
+            {
+                "日期": cached_dates,
+                "收盘价": [1.0] * len(cached_dates),
+                "symbol": "512890.SH",
+                "name": "红利低波ETF华泰柏瑞",
+                "_final_close_confirmed": True,
+            }
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-07-24T16:00:00"})
+
+        item = load_or_fetch_etf(
+            "512890",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=False,
+            save_to_cache=True,
+            market_now=datetime(2026, 7, 26, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        fetch_mock.assert_not_called()
+        save_mock.assert_not_called()
+        self.assertEqual(item.latest_date, "2026-07-24")
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_monday_intraday_load_backfills_friday_but_excludes_monday_quote(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached_dates = pd.bdate_range(end="2026-07-23", periods=30)
+        cached = pd.DataFrame(
+            {
+                "日期": cached_dates,
+                "收盘价": [1.0] * len(cached_dates),
+                "symbol": "512890.SH",
+                "name": "红利低波ETF华泰柏瑞",
+            }
+        )
+        latest = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-24", "2026-07-27"]),
+                "收盘价": [1.2, 1.3],
+                "symbol": ["512890.SH", "512890.SH"],
+                "name": ["红利低波ETF华泰柏瑞", "红利低波ETF华泰柏瑞"],
+            }
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-07-23T16:00:00"})
+        fetch_mock.return_value = latest
+
+        item = load_or_fetch_etf(
+            "512890",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=False,
+            save_to_cache=True,
+            market_now=datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        fetch_mock.assert_called_once()
+        saved = save_mock.call_args.kwargs["df"]
+        self.assertEqual(saved["日期"].max(), pd.Timestamp("2026-07-24"))
+        self.assertNotIn(pd.Timestamp("2026-07-27"), set(saved["日期"]))
+        self.assertEqual(item.latest_date, "2026-07-24")
+        self.assertEqual(item.metrics["最新价"], 1.2)
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_load_backfills_every_missing_completed_session(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached_dates = pd.bdate_range(end="2026-07-20", periods=30)
+        cached = pd.DataFrame(
+            {
+                "日期": cached_dates,
+                "收盘价": [1.0] * len(cached_dates),
+                "symbol": "512890.SH",
+                "name": "红利低波ETF华泰柏瑞",
+            }
+        )
+        missing_dates = pd.to_datetime(["2026-07-21", "2026-07-22", "2026-07-23"])
+        latest = pd.DataFrame(
+            {
+                "日期": missing_dates,
+                "收盘价": [1.1, 1.2, 1.3],
+                "symbol": ["512890.SH"] * 3,
+                "name": ["红利低波ETF华泰柏瑞"] * 3,
+            }
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-07-20T16:00:00"})
+        fetch_mock.return_value = latest
+
+        item = load_or_fetch_etf(
+            "512890",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=False,
+            save_to_cache=True,
+            market_now=datetime(2026, 7, 23, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        saved = save_mock.call_args.kwargs["df"]
+        saved_dates = set(pd.to_datetime(saved["日期"]))
+        self.assertTrue(set(missing_dates).issubset(saved_dates))
+        self.assertTrue(saved.loc[saved["日期"].isin(missing_dates), "_final_close_confirmed"].all())
+        self.assertEqual(item.latest_date, "2026-07-23")
 
     @patch("services.position_analysis.save_dataset")
     @patch("services.position_analysis.fetch_tickflow_fund_close")
