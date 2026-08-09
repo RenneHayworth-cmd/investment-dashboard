@@ -186,7 +186,13 @@ def fetch_from_akshare(symbol: str, period: str, count: int) -> pd.DataFrame:
     return df.tail(count).reset_index(drop=True)
 
 
-def fetch_option_from_akshare(symbol: str, period: str, count: int) -> tuple[pd.DataFrame, str, bool]:
+def fetch_option_from_akshare(
+    symbol: str,
+    period: str,
+    count: int,
+    *,
+    prefer_realtime_snapshot: bool = False,
+) -> tuple[pd.DataFrame, str, bool]:
     import akshare as ak
 
     option_symbol = normalize_option_symbol(symbol)
@@ -218,7 +224,11 @@ def fetch_option_from_akshare(symbol: str, period: str, count: int) -> tuple[pd.
         df = daily_func(symbol=option_symbol)
         if df is None or df.empty:
             raise RuntimeError("AkShare 没有获取到期权日线数据，请检查月份、行权价或合约是否存在。")
-        df = append_option_spot_row(df, option_symbol)
+        df = append_option_spot_row(
+            df,
+            option_symbol,
+            replace_current_day=prefer_realtime_snapshot,
+        )
         return df.tail(count).reset_index(drop=True), "AkShare期权日线/实时快照", False
 
     if product == "i":
@@ -230,7 +240,12 @@ def fetch_option_from_akshare(symbol: str, period: str, count: int) -> tuple[pd.
     return df.reset_index(drop=True), "AkShare期权链", True
 
 
-def append_option_spot_row(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+def append_option_spot_row(
+    df: pd.DataFrame,
+    symbol: str,
+    *,
+    replace_current_day: bool = False,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
@@ -249,7 +264,11 @@ def append_option_spot_row(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     if date_col is not None:
         dates = pd.to_datetime(result[date_col], errors="coerce")
         latest_history_date = dates.dropna().max()
-        if pd.notna(latest_history_date) and latest_history_date.normalize() >= today:
+        if (
+            not replace_current_day
+            and pd.notna(latest_history_date)
+            and latest_history_date.normalize() >= today
+        ):
             return result
 
     try:
@@ -421,10 +440,16 @@ def fetch_futures_option_data(
     api_key: str,
     use_free: bool,
     ma_periods: list[int] | tuple[int, ...],
+    prefer_realtime_snapshot: bool = False,
 ) -> FuturesOptionResult:
     if should_fetch_options(raw_symbol, data_type):
         symbol = normalize_option_symbol(raw_symbol)
-        raw_df, source, is_chain = fetch_option_from_akshare(symbol, period, count)
+        raw_df, source, is_chain = fetch_option_from_akshare(
+            symbol,
+            period,
+            count,
+            prefer_realtime_snapshot=prefer_realtime_snapshot,
+        )
         if is_chain:
             return FuturesOptionResult(
                 symbol=symbol,

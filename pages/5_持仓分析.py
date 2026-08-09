@@ -29,13 +29,24 @@ from services.fund_analysis import (
 from services.position_analysis import (
     DEFAULT_ETF_CODES,
     DEFAULT_OPTION_CODES,
-    DEFAULT_SPREAD_CONTRACTS,
+    DEFAULT_SPREAD_GROUPS,
+    ETF_MIDSESSION_TIMING_REFRESH_SECONDS,
+    ETF_MORNING_TIMING_REFRESH_SECONDS,
+    ETF_REALTIME_TIMING_REFRESH_SECONDS,
     PositionItem,
     apply_etf_realtime_quote,
+    apply_etf_realtime_quotes_to_items,
+    apply_etf_realtime_quote_to_timing,
     build_recent_etf_operation_guidance,
     build_etf_timing_table,
+    etf_afternoon_timing_fetch_ready,
     etf_final_close_ready,
     etf_intraday_quote_ready,
+    etf_lunch_timing_fetch_ready,
+    etf_lunch_timing_preview_ready,
+    etf_morning_timing_fetch_ready,
+    etf_morning_timing_preview_ready,
+    etf_realtime_timing_ready,
     fetch_tickflow_etf_quotes,
     filter_current_etf_realtime_quotes,
     latest_final_etf_trade_date,
@@ -45,6 +56,8 @@ from services.position_analysis import (
     load_or_fetch_spread,
     normalize_etf_base_code,
     parse_position_codes,
+    parse_spread_groups,
+    refresh_position_derivative_items,
     remember_runtime_etf_quotes,
 )
 
@@ -66,7 +79,7 @@ st.markdown(
 
 render_page_header(
     "持仓分析",
-    "按指数监控的方式展示个人持仓标的。盘中加载只更新卡片，ETF择时状态在收盘确认后更新。",
+    "按指数监控的方式展示个人持仓标的。早盘每10分钟、盘中每30分钟、尾盘每2分钟更新卡片与择时预判。",
     eyebrow="Positions",
 )
 
@@ -159,7 +172,7 @@ def format_etf_table_value(column: str, value: object) -> str:
         return ""
     if column in {"最新价", "对应均线", "触发收盘价"}:
         return format(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), ".3f")
-    if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)"}:
+    if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)", "上一区间涨幅(%)"}:
         return format(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
     return str(value)
 
@@ -289,12 +302,16 @@ def render_etf_operation_guidance(df: pd.DataFrame) -> None:
     )
 
 
-@st.fragment(run_every="60s")
+@st.fragment(run_every=f"{ETF_REALTIME_TIMING_REFRESH_SECONDS}s")
 def render_etf_timing_section(
     etf_codes: list[str],
     *,
+    position_items: list[PositionItem],
+    show_cache_caption: bool,
     api_key: str,
     count: int,
+    market_count: int,
+    max_workers: int,
     adjust: str | None,
 ) -> None:
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -344,8 +361,382 @@ def render_etf_timing_section(
             ]
         st.session_state[attempt_key] = market_now.replace(tzinfo=None).isoformat()
 
+    timing_items = formal_items
+    active_preview_quotes: dict[str, dict[str, object]] = {}
+    derivative_refresh_due = False
+    realtime_timing_error = ""
+    missing_realtime_codes: list[str] = []
+    morning_preview_key = "position_etf_morning_timing_preview"
+    lunch_preview_key = "position_etf_lunch_timing_preview"
+    preview_date = market_now.date().isoformat()
+    market_now_naive = market_now.replace(tzinfo=None)
+    morning_preview_state = st.session_state.get(morning_preview_key, {})
+    same_morning_date = morning_preview_state.get("trade_date") == preview_date
+    morning_quotes = morning_preview_state.get("quotes", {}) if same_morning_date else {}
+    if etf_morning_timing_fetch_ready(market_now):
+        morning_refresh_band = (
+            "early" if market_now.time() < datetime.strptime("10:00", "%H:%M").time() else "midmorning"
+        )
+        morning_refresh_seconds = (
+            ETF_MORNING_TIMING_REFRESH_SECONDS
+            if morning_refresh_band == "early"
+            else ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+        )
+        last_morning_fetch = pd.to_datetime(
+            morning_preview_state.get("fetched_at"), errors="coerce"
+        )
+        morning_refresh_due = (
+            not same_morning_date
+            or morning_preview_state.get("refresh_band") != morning_refresh_band
+            or pd.isna(last_morning_fetch)
+            or (market_now_naive - last_morning_fetch).total_seconds()
+            >= morning_refresh_seconds
+        )
+        if morning_refresh_due:
+            derivative_refresh_due = True
+            if api_key:
+                previous_quotes = morning_quotes
+                try:
+                    morning_quotes = fetch_tickflow_etf_quotes(
+                        etf_codes,
+                        api_key=api_key,
+                        market_now=market_now,
+                    )
+                    remember_runtime_etf_quotes(morning_quotes)
+                    morning_preview_state = {
+                        "trade_date": preview_date,
+                        "quotes": morning_quotes,
+                        "error": "",
+                        "fetched_at": market_now_naive.isoformat(),
+                        "refresh_band": morning_refresh_band,
+                    }
+                except Exception as exc:
+                    morning_preview_state = {
+                        "trade_date": preview_date,
+                        "quotes": previous_quotes,
+                        "error": str(exc),
+                        "fetched_at": market_now_naive.isoformat(),
+                        "refresh_band": morning_refresh_band,
+                    }
+                st.session_state[morning_preview_key] = morning_preview_state
+            else:
+                realtime_timing_error = "未填写TickFlow API Key"
+
+    if etf_morning_timing_preview_ready(market_now):
+        realtime_timing_error = (
+            realtime_timing_error or morning_preview_state.get("error", "")
+        )
+        if morning_quotes:
+            active_preview_quotes = morning_quotes
+            timing_items = [
+                apply_etf_realtime_quote_to_timing(
+                    item,
+                    morning_quotes.get(normalize_etf_base_code(code), {}),
+                    market_now=market_now,
+                )
+                for code, item in zip(etf_codes, formal_items)
+            ]
+            missing_realtime_codes = [
+                normalize_etf_base_code(code)
+                for code in etf_codes
+                if normalize_etf_base_code(code) not in morning_quotes
+            ]
+
+    lunch_preview_state = st.session_state.get(lunch_preview_key, {})
+    same_lunch_date = lunch_preview_state.get("trade_date") == preview_date
+    lunch_quotes = lunch_preview_state.get("quotes", {}) if same_lunch_date else {}
+    lunch_fetch_ready = etf_lunch_timing_fetch_ready(market_now)
+    afternoon_fetch_ready = etf_afternoon_timing_fetch_ready(market_now)
+    lunch_refresh_due = False
+    lunch_refresh_band = ""
+    if lunch_fetch_ready and not lunch_quotes:
+        lunch_refresh_band = "lunch"
+        last_lunch_attempt = pd.to_datetime(
+            lunch_preview_state.get("fetched_at"), errors="coerce"
+        )
+        lunch_refresh_due = (
+            pd.isna(last_lunch_attempt)
+            or (market_now_naive - last_lunch_attempt).total_seconds() >= 600
+        )
+    elif afternoon_fetch_ready:
+        lunch_refresh_band = "afternoon"
+        last_afternoon_fetch = pd.to_datetime(
+            lunch_preview_state.get("fetched_at"), errors="coerce"
+        )
+        lunch_refresh_due = (
+            not same_lunch_date
+            or lunch_preview_state.get("refresh_band") != lunch_refresh_band
+            or pd.isna(last_afternoon_fetch)
+            or (market_now_naive - last_afternoon_fetch).total_seconds()
+            >= ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+        )
+    if lunch_refresh_due:
+        derivative_refresh_due = True
+        if api_key:
+            previous_quotes = lunch_quotes
+            try:
+                lunch_quotes = fetch_tickflow_etf_quotes(
+                    etf_codes,
+                    api_key=api_key,
+                    market_now=market_now,
+                )
+                remember_runtime_etf_quotes(lunch_quotes)
+                lunch_preview_state = {
+                    "trade_date": preview_date,
+                    "quotes": lunch_quotes,
+                    "error": "",
+                    "fetched_at": market_now_naive.isoformat(),
+                    "refresh_band": lunch_refresh_band,
+                }
+            except Exception as exc:
+                lunch_preview_state = {
+                    "trade_date": preview_date,
+                    "quotes": previous_quotes,
+                    "error": str(exc),
+                    "fetched_at": market_now_naive.isoformat(),
+                    "refresh_band": lunch_refresh_band,
+                }
+            st.session_state[lunch_preview_key] = lunch_preview_state
+        else:
+            realtime_timing_error = "未填写TickFlow API Key"
+
+    if etf_lunch_timing_preview_ready(market_now):
+        realtime_timing_error = (
+            realtime_timing_error or lunch_preview_state.get("error", "")
+        )
+
+    if etf_lunch_timing_preview_ready(market_now) and lunch_quotes:
+        active_preview_quotes = lunch_quotes
+        timing_items = [
+            apply_etf_realtime_quote_to_timing(
+                item,
+                lunch_quotes.get(normalize_etf_base_code(code), {}),
+                market_now=market_now,
+            )
+            for code, item in zip(etf_codes, formal_items)
+        ]
+        missing_realtime_codes = [
+            normalize_etf_base_code(code)
+            for code in etf_codes
+            if normalize_etf_base_code(code) not in lunch_quotes
+        ]
+
+    if etf_realtime_timing_ready(market_now):
+        preview_key = "position_etf_realtime_timing_preview"
+        preview_state = st.session_state.get(preview_key, {})
+        same_preview_date = preview_state.get("trade_date") == preview_date
+        last_preview_fetch = pd.to_datetime(
+            preview_state.get("fetched_at"), errors="coerce"
+        )
+        preview_refresh_due = (
+            not same_preview_date
+            or pd.isna(last_preview_fetch)
+            or (market_now_naive - last_preview_fetch).total_seconds()
+            >= ETF_REALTIME_TIMING_REFRESH_SECONDS
+        )
+        if preview_refresh_due:
+            derivative_refresh_due = True
+            if api_key:
+                previous_quotes = preview_state.get("quotes", {}) if same_preview_date else {}
+                try:
+                    realtime_quotes = fetch_tickflow_etf_quotes(
+                        etf_codes,
+                        api_key=api_key,
+                        market_now=market_now,
+                    )
+                    remember_runtime_etf_quotes(realtime_quotes)
+                    preview_state = {
+                        "trade_date": preview_date,
+                        "quotes": realtime_quotes,
+                        "error": "",
+                        "fetched_at": market_now_naive.isoformat(),
+                    }
+                except Exception as exc:
+                    preview_state = {
+                        "trade_date": preview_date,
+                        "quotes": previous_quotes,
+                        "error": str(exc),
+                        "fetched_at": market_now_naive.isoformat(),
+                    }
+                st.session_state[preview_key] = preview_state
+            else:
+                realtime_timing_error = "未填写TickFlow API Key"
+
+        realtime_quotes = preview_state.get("quotes", {})
+        active_preview_quotes = realtime_quotes
+        realtime_timing_error = realtime_timing_error or preview_state.get("error", "")
+        missing_realtime_codes = [
+            normalize_etf_base_code(code)
+            for code in etf_codes
+            if normalize_etf_base_code(code) not in realtime_quotes
+        ]
+        timing_items = [
+            apply_etf_realtime_quote_to_timing(
+                item,
+                realtime_quotes.get(normalize_etf_base_code(code), {}),
+                market_now=market_now,
+            )
+            for code, item in zip(etf_codes, formal_items)
+        ]
+
+    timing_preview_active = (
+        etf_morning_timing_preview_ready(market_now)
+        or etf_lunch_timing_preview_ready(market_now)
+        or etf_realtime_timing_ready(market_now)
+    )
+    derivative_state_key = "position_derivative_realtime_preview"
+    derivative_state = st.session_state.get(derivative_state_key, {})
+    derivative_preview_version = 2
+    if (
+        timing_preview_active
+        and derivative_state.get("version") != derivative_preview_version
+    ):
+        derivative_refresh_due = True
+    same_derivative_date = derivative_state.get("trade_date") == preview_date
+    derivative_items = derivative_state.get("items", {}) if same_derivative_date else {}
+    derivative_realtime_error = ""
+    if derivative_refresh_due:
+        refreshed_derivatives, derivative_errors = refresh_position_derivative_items(
+            position_items,
+            api_key=api_key,
+            max_workers=max_workers,
+            option_count=market_count,
+        )
+        derivative_items = dict(derivative_items)
+        derivative_items.update(
+            {position_key(item): item for item in refreshed_derivatives}
+        )
+        derivative_realtime_error = " | ".join(derivative_errors)
+        derivative_fetched_at = (
+            market_now_naive.isoformat()
+            if refreshed_derivatives
+            else derivative_state.get("fetched_at", "")
+        )
+        derivative_state = {
+            "version": derivative_preview_version,
+            "trade_date": preview_date,
+            "items": derivative_items,
+            "error": derivative_realtime_error,
+            "fetched_at": derivative_fetched_at,
+        }
+        st.session_state[derivative_state_key] = derivative_state
+        same_derivative_date = True
+    else:
+        derivative_realtime_error = derivative_state.get("error", "")
+    outer_etf_items = {
+        normalize_etf_base_code(item.code): item
+        for item in position_items
+        if item.category == "ETF"
+    }
+    formal_etf_items = {
+        normalize_etf_base_code(item.code): item for item in formal_items
+    }
+    base_card_items: list[PositionItem] = []
+    for item in position_items:
+        if item.category != "ETF":
+            base_card_items.append(item)
+            continue
+        code = normalize_etf_base_code(item.code)
+        outer_item = outer_etf_items.get(code, item)
+        base_item = (
+            outer_item
+            if outer_item.status == "盘中"
+            else formal_etf_items.get(code, outer_item)
+        )
+        base_card_items.append(base_item)
+
+    card_items = apply_etf_realtime_quotes_to_items(
+        base_card_items,
+        active_preview_quotes,
+    )
+    card_items = [
+        derivative_items.get(position_key(item), item)
+        if item.category in {"期货价差", "期权"}
+        else item
+        for item in card_items
+    ]
+
+    if show_cache_caption:
+        quote_times: list[pd.Timestamp] = []
+        quote_groups = [
+            active_preview_quotes,
+            morning_preview_state.get("quotes", {}),
+            lunch_preview_state.get("quotes", {}),
+            st.session_state.get("position_etf_realtime_quotes", {}),
+        ]
+        for quote_group in quote_groups:
+            for quote in quote_group.values():
+                quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+                if pd.isna(quote_time):
+                    continue
+                if quote_time.tzinfo is not None:
+                    quote_time = quote_time.tz_convert("Asia/Shanghai").tz_localize(None)
+                if quote_time.date() == market_now.date():
+                    quote_times.append(quote_time)
+        derivative_update_time = pd.to_datetime(
+            derivative_state.get("fetched_at"), errors="coerce"
+        )
+        if same_derivative_date and not pd.isna(derivative_update_time):
+            quote_times.append(derivative_update_time)
+        realtime_update_text = (
+            max(quote_times).strftime("%Y-%m-%d %H:%M:%S")
+            if quote_times
+            else "-"
+        )
+        st.caption(
+            "当前为缓存视图；9:30-10:00每10分钟，10:00-11:30和13:00-14:50每30分钟，"
+            "午间收盘更新一次，14:50-15:00每2分钟更新卡片与择时预判，"
+            "交易日15:05后才写入ETF日线并正式更新择时表格。"
+            f"本次实时更新时间为：{realtime_update_text}。"
+        )
+
+    render_position_cards(card_items)
+    if derivative_realtime_error:
+        st.warning(
+            "期货价差/期权实时更新部分失败，继续显示上次有效数据："
+            f"{derivative_realtime_error}"
+        )
+
     st.subheader("ETF择时状态")
-    render_etf_timing_table(build_etf_timing_table(formal_items))
+    render_etf_timing_table(build_etf_timing_table(timing_items))
+    if timing_preview_active:
+        if realtime_timing_error:
+            st.warning(
+                "ETF择时实时预判获取失败，继续显示上次预判或正式日线："
+                f"{realtime_timing_error}"
+            )
+        elif missing_realtime_codes:
+            st.warning(
+                "以下ETF未返回实时行情，继续显示正式日线："
+                + "、".join(missing_realtime_codes)
+            )
+        if etf_morning_timing_preview_ready(market_now):
+            if market_now.time() < datetime.strptime("10:00", "%H:%M").time():
+                st.caption(
+                    "交易日9:30-10:00每10分钟更新ETF卡片和择时预判；"
+                    "实时价格不写入缓存。"
+                )
+            else:
+                st.caption(
+                    "交易日10:00-11:30每30分钟更新ETF卡片和择时预判；"
+                    "实时价格不写入缓存。"
+                )
+        elif etf_realtime_timing_ready(market_now):
+            st.caption(
+                "14:50-15:00每2分钟更新一次实时行情并预判择时状态；"
+                "实时价格不写入缓存，也不参与近一周操作指引。"
+            )
+        else:
+            if etf_afternoon_timing_fetch_ready(market_now):
+                st.caption(
+                    "交易日13:00-14:50每30分钟更新ETF卡片和择时预判；"
+                    "实时价格不写入缓存。"
+                )
+            else:
+                st.caption(
+                    "交易日午间收盘后获取一次午间价格并预判择时状态；"
+                    "午间价格不写入缓存，也不参与近一周操作指引。"
+                )
 
     st.subheader("近一周操作指引")
     guidance_df = build_recent_etf_operation_guidance(formal_items, days=7)
@@ -926,7 +1317,12 @@ with st.sidebar:
 
     with st.expander("持仓清单", expanded=False):
         etf_text = st.text_area("ETF持仓", value="\n".join(DEFAULT_ETF_CODES), height=150)
-        spread_text = st.text_area("期货价差", value=" ".join(DEFAULT_SPREAD_CONTRACTS), height=68)
+        spread_text = st.text_area(
+            "期货价差",
+            value="\n".join(" ".join(group) for group in DEFAULT_SPREAD_GROUPS),
+            height=90,
+            help="每行一组价差，第一个合约作为基准合约。",
+        )
         option_text = st.text_area("期权持仓", value="\n".join(DEFAULT_OPTION_CODES), height=110)
 
     with st.expander("高级参数", expanded=False):
@@ -937,7 +1333,7 @@ with st.sidebar:
 
 adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
 etf_codes = parse_position_codes(etf_text)
-spread_contracts = parse_position_codes(spread_text)
+spread_groups = parse_spread_groups(spread_text)
 option_codes = parse_position_codes(option_text)
 allow_fetch = bool(update_clicked)
 refresh_existing = bool(update_clicked and force_refresh)
@@ -945,11 +1341,8 @@ market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
 intraday_market_active = etf_intraday_quote_ready(market_now)
 intraday_quote_mode = bool(update_clicked and intraday_market_active)
 
-if not update_clicked:
-    st.caption("当前为缓存视图；盘中点击加载只更新卡片，交易日15:05后才写入ETF日线并更新择时表格。")
-
 items: list[PositionItem] = []
-progress_total = len(etf_codes) + len(option_codes) + (1 if spread_contracts else 0)
+progress_total = len(etf_codes) + len(option_codes) + len(spread_groups)
 progress_done = 0
 progress_bar = st.progress(0) if update_clicked and progress_total else None
 progress_status = st.empty() if update_clicked and progress_total else None
@@ -1024,7 +1417,7 @@ with st.spinner("正在整理持仓数据..."):
         items.append(card_item)
         update_position_progress(f"ETF {code}")
 
-    if spread_contracts:
+    for spread_contracts in spread_groups:
         items.append(
             load_or_fetch_spread(
                 spread_contracts,
@@ -1075,11 +1468,13 @@ status_cols[1].metric("可用数据", available_count)
 status_cols[2].metric("缺失缓存", missing_count)
 status_cols[3].metric("获取失败", failed_count)
 
-render_position_cards(items)
-
 render_etf_timing_section(
     etf_codes,
+    position_items=items,
+    show_cache_caption=not update_clicked,
     api_key=api_key,
     count=int(etf_count),
+    market_count=int(market_count),
+    max_workers=int(max_workers),
     adjust=adjust_map[adjust_option],
 )

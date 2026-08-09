@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from threading import BoundedSemaphore
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -11,7 +12,15 @@ from services.market_calendar import (
     is_market_holiday,
     is_market_trading_day,
     latest_completed_trade_date,
+    latest_settled_trade_date,
 )
+
+
+YAHOO_CHART_HOSTS = (
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+)
+YAHOO_REQUEST_GATE = BoundedSemaphore(2)
 
 
 INDEX_CONFIG = {
@@ -129,8 +138,8 @@ INDEX_CONFIG = {
         "require_current_quote": True,
     },
     "VIX恐慌指数": {
-        "source": "yahoo",
-        "code": "^VIX",
+        "source": "cboe_vix",
+        "code": "VIX",
         "display_symbol": "VIX",
         "market_group": "美股",
         "require_current_quote": True,
@@ -140,6 +149,7 @@ INDEX_CONFIG = {
         "source": "akshare_global",
         "code": "日经225",
         "yahoo_symbol": "^N225",
+        "eastmoney_quote_secid": "100.N225",
         "display_symbol": "N225",
         "market_group": "日本",
         "require_current_quote": True,
@@ -148,6 +158,8 @@ INDEX_CONFIG = {
         "source": "akshare_global",
         "code": "韩国KOSPI",
         "yahoo_symbol": "^KS11",
+        "eastmoney_quote_secid": "100.KS11",
+        "source_correction_start": "2026-07-22",
         "display_symbol": "KOSPI",
         "market_group": "韩国",
         "require_current_quote": True,
@@ -198,6 +210,7 @@ INDEX_FINAL_HISTORY_SOURCE = "index_final_history"
 INDEX_SOURCE_CORRECTION_SOURCE = "index_source_correction_history"
 INDEX_LONG_HISTORY_BARS = 20000
 INDEX_REPORT_DISPLAY_DAYS = 120
+INDEX_RECENT_GAP_LOOKBACK_DAYS = 14
 CFFEX_FUTURES_MAIN_PRODUCTS = {
     "IC0": "中证500指数期货",
     "IM0": "中证1000股指期货",
@@ -217,6 +230,38 @@ def overlay_finalized_index_rows(
     normalized_finalized = merge_raw_index_data(None, finalized_df)
     combined = pd.concat([normalized_history, normalized_finalized], ignore_index=True)
     return combined.drop_duplicates("trade_date", keep="last").sort_values("trade_date").reset_index(drop=True)
+
+
+def missing_recent_market_trade_dates(
+    history_df: pd.DataFrame | None,
+    market_name: str,
+    target_date,
+    *,
+    lookback_days: int = INDEX_RECENT_GAP_LOOKBACK_DAYS,
+) -> list:
+    """Return completed market sessions missing from a recent local cache window."""
+    market = get_market_window(str(market_name or ""))
+    if market is None or target_date is None:
+        return []
+    target = pd.Timestamp(target_date).date()
+    start = target - timedelta(days=max(int(lookback_days), 1))
+    observed: set = set()
+    if history_df is not None and not history_df.empty and "trade_date" in history_df.columns:
+        observed = set(
+            pd.to_datetime(history_df["trade_date"], errors="coerce")
+            .dropna()
+            .dt.date
+            .tolist()
+        )
+    if observed:
+        start = max(start, min(observed))
+    expected = []
+    current = start
+    while current <= target:
+        if current.weekday() < 5 and not is_market_holiday(market, current):
+            expected.append(current)
+        current += timedelta(days=1)
+    return [day for day in expected if day not in observed]
 
 
 def source_correction_start(index_config: dict | None) -> pd.Timestamp | None:
@@ -342,7 +387,7 @@ def build_export_df(
     result["状态转变时间"] = transition_history["状态转变时间"]
     result["区间涨幅"] = transition_history["区间涨幅"]
 
-    start_date = datetime.now() - timedelta(days=days)
+    start_date = pd.Timestamp(datetime.now()).normalize() - pd.Timedelta(days=days)
     recent_data = result[result["trade_date"] >= start_date].copy()
     if recent_data.empty:
         return None
@@ -381,16 +426,61 @@ def normalize_akshare_index_df(df: pd.DataFrame) -> pd.DataFrame:
     return normalized[["trade_date", "close"]].copy()
 
 
+def fetch_yahoo_chart_payload(
+    symbol: str,
+    params: dict[str, object],
+    *,
+    timeout: float = 10,
+) -> dict:
+    """Fetch a Yahoo chart payload with alternate hosts and proxy paths."""
+    import requests
+
+    errors: list[str] = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for trust_env in (True, False):
+        session = requests.Session()
+        session.trust_env = trust_env
+        denied_hosts = 0
+        try:
+            for host in YAHOO_CHART_HOSTS:
+                try:
+                    with YAHOO_REQUEST_GATE:
+                        response = session.get(
+                            f"https://{host}/v8/finance/chart/{symbol}",
+                            params=params,
+                            headers=headers,
+                            timeout=timeout,
+                        )
+                    if getattr(response, "status_code", None) in {401, 403, 429}:
+                        denied_hosts += 1
+                    response.raise_for_status()
+                    payload = response.json()
+                    result = payload.get("chart", {}).get("result") or []
+                    if result:
+                        return payload
+                    chart_error = payload.get("chart", {}).get("error")
+                    errors.append(f"{host}: {chart_error or '未返回行情数据'}")
+                except Exception as exc:
+                    errors.append(f"{host}: {exc}")
+        finally:
+            session.close()
+
+        # A second proxy mode cannot fix an explicit access denial from both
+        # Yahoo hosts and only doubles the wait and error text.
+        if denied_hosts == len(YAHOO_CHART_HOSTS):
+            break
+
+    detail = " | ".join(errors[-2:]) if errors else "未返回行情数据"
+    raise RuntimeError(f"Yahoo行情请求失败（{symbol}）：{detail}")
+
+
 def fetch_yahoo_latest_index_row(symbol: str) -> pd.DataFrame | None:
     try:
-        import requests
-
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {"range": "10d", "interval": "1d"}
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
+        payload = fetch_yahoo_chart_payload(
+            symbol,
+            {"range": "10d", "interval": "1d"},
+            timeout=10,
+        )
         result = payload.get("chart", {}).get("result", [])
         if not result:
             return None
@@ -989,7 +1079,14 @@ def get_index_data_from_akshare_us(
         raw_df = ak.index_us_stock_sina(symbol=index_code)
         df = normalize_akshare_index_df(raw_df)
         if yahoo_symbol:
-            yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=min(max(days, 60), 365))
+            try:
+                yahoo_df = get_index_data_from_yahoo(
+                    yahoo_symbol,
+                    index_name,
+                    days=min(max(days, 60), 365),
+                )
+            except Exception:
+                yahoo_df = None
             df = merge_newer_index_rows(df, extract_raw_from_export_df(yahoo_df, index_name))
         return build_export_df(df, index_name, days=days)
     except Exception:
@@ -1021,9 +1118,6 @@ def get_index_data_from_akshare_hk(
 
 
 def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
-    import requests
-
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     if days > 365:
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days + 30)
@@ -1034,10 +1128,7 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
         }
     else:
         params = {"range": "1y", "interval": "1d"}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, params=params, headers=headers, timeout=10)
-    response.raise_for_status()
-    payload = response.json()
+    payload = fetch_yahoo_chart_payload(symbol, params, timeout=10)
     result = payload.get("chart", {}).get("result", [])
     if not result:
         return None
@@ -1228,15 +1319,128 @@ def get_index_data_from_akshare_eastmoney_fallback(
     raise RuntimeError(f"东方财富K线获取失败：{last_error}")
 
 
-def get_index_data_from_akshare_global(index_code: str, index_name: str, days: int = 30, yahoo_symbol: str | None = None):
+def fetch_eastmoney_completed_global_row(
+    secid: str,
+    market_name: str,
+    *,
+    now: datetime | None = None,
+) -> pd.DataFrame | None:
+    """Return one EastMoney quote only after it represents a settled close."""
+    import requests
+
+    market = get_market_window(market_name)
+    if market is None:
+        return None
+    market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
+    target_date = latest_settled_trade_date(market, market_now)
+    close_at = datetime.combine(
+        target_date,
+        market.sessions[-1][1],
+        tzinfo=ZoneInfo(market.timezone),
+    )
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://quote.eastmoney.com/",
+        "User-Agent": "Mozilla/5.0",
+    }
+    params = {
+        "secid": secid,
+        "fields": "f43,f57,f58,f86",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "fltt": "2",
+        "invt": "2",
+    }
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        try:
+            for host in ("push2.eastmoney.com", "36.push2.eastmoney.com", "push2delay.eastmoney.com"):
+                try:
+                    response = session.get(
+                        f"https://{host}/api/qt/stock/get",
+                        params=params,
+                        headers=headers,
+                        timeout=3,
+                    )
+                    response.raise_for_status()
+                    quote = response.json().get("data") or {}
+                except Exception:
+                    continue
+                price = pd.to_numeric(quote.get("f43"), errors="coerce")
+                timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
+                if pd.isna(price) or pd.isna(timestamp):
+                    continue
+                timestamp_value = float(timestamp)
+                if timestamp_value > 10_000_000_000:
+                    timestamp_value /= 1000
+                quote_time = datetime.fromtimestamp(timestamp_value, tz=timezone.utc).astimezone(
+                    ZoneInfo(market.timezone)
+                )
+                if quote_time.date() != target_date or quote_time < close_at - timedelta(minutes=1):
+                    continue
+                return pd.DataFrame(
+                    [{"trade_date": pd.Timestamp(target_date), "close": float(price)}]
+                )
+        finally:
+            session.close()
+    return None
+
+
+def get_index_data_from_cboe_vix(index_name: str, days: int = 30) -> pd.DataFrame:
+    """Fetch VIX formal daily closes from CBOE's official history file."""
+    from io import StringIO
+
+    import requests
+
+    url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    errors: list[str] = []
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        try:
+            response = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            response.raise_for_status()
+            raw_df = pd.read_csv(StringIO(response.text))
+            normalized = normalize_akshare_index_df(raw_df.rename(columns={"DATE": "trade_date", "CLOSE": "close"}))
+            normalized["trade_date"] = pd.to_datetime(normalized["trade_date"], errors="coerce")
+            normalized["close"] = pd.to_numeric(normalized["close"], errors="coerce")
+            normalized = normalized.dropna(subset=["trade_date", "close"])
+            if normalized.empty:
+                raise ValueError("CBOE VIX历史文件没有有效日线")
+            return build_export_df(normalized, index_name, days=days)
+        except Exception as exc:
+            errors.append(str(exc).strip() or type(exc).__name__)
+        finally:
+            session.close()
+    raise RuntimeError(f"CBOE VIX日线获取失败：{errors[-1] if errors else '未返回数据'}")
+
+
+def get_index_data_from_akshare_global(
+    index_code: str,
+    index_name: str,
+    days: int = 30,
+    yahoo_symbol: str | None = None,
+    eastmoney_quote_secid: str | None = None,
+    market_name: str = "",
+):
     import akshare as ak
 
     try:
         raw_df = ak.index_global_hist_em(symbol=index_code)
         df = normalize_akshare_index_df(raw_df)
         latest_history_date = pd.to_datetime(df["trade_date"], errors="coerce").max().date()
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-        if yahoo_symbol and (is_sparse_daily_history(df) or latest_history_date < today):
+        market = get_market_window(market_name)
+        market_now = datetime.now(ZoneInfo(market.timezone)) if market is not None else datetime.now(ZoneInfo("Asia/Shanghai"))
+        target_date = latest_settled_trade_date(market, market_now) if market is not None else market_now.date()
+        if eastmoney_quote_secid and latest_history_date < target_date:
+            completed_row = fetch_eastmoney_completed_global_row(
+                eastmoney_quote_secid,
+                market_name,
+                now=market_now,
+            )
+            df = merge_newer_index_rows(df, completed_row)
+            latest_history_date = pd.to_datetime(df["trade_date"], errors="coerce").max().date()
+        if yahoo_symbol and (is_sparse_daily_history(df) or latest_history_date < target_date):
             yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
             if yahoo_df is not None and not yahoo_df.empty:
                 if is_sparse_daily_history(df):
@@ -1254,10 +1458,20 @@ def get_index_data_from_akshare_global(index_code: str, index_name: str, days: i
                     )
         return build_export_df(df, index_name, days=days)
     except Exception:
+        completed_row = None
+        if eastmoney_quote_secid:
+            completed_row = fetch_eastmoney_completed_global_row(
+                eastmoney_quote_secid,
+                market_name,
+            )
         if yahoo_symbol:
             yahoo_df = get_index_data_from_yahoo(yahoo_symbol, index_name, days=days)
             if yahoo_df is not None and not yahoo_df.empty:
-                return yahoo_df
+                yahoo_raw = extract_raw_from_export_df(yahoo_df, index_name)
+                merged = merge_newer_index_rows(yahoo_raw, completed_row)
+                return build_export_df(merged, index_name, days=days)
+        if completed_row is not None and not completed_row.empty:
+            return build_export_df(completed_row, index_name, days=days)
         raise
 
 
@@ -1306,6 +1520,8 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
             index_name,
             days=days,
             yahoo_symbol=index_config.get("yahoo_symbol"),
+            eastmoney_quote_secid=index_config.get("eastmoney_quote_secid"),
+            market_name=str(index_config.get("market_group") or ""),
         )
     if source == "akshare_futures_main":
         return get_index_data_from_akshare_futures_main(code, index_name, days=days)
@@ -1320,6 +1536,8 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
         )
     if source == "yahoo":
         return get_index_data_from_yahoo(code, index_name, days=days)
+    if source == "cboe_vix":
+        return get_index_data_from_cboe_vix(index_name, days=days)
     raise ValueError(f"未知数据源：{source}")
 
 
@@ -1395,6 +1613,11 @@ def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.
     effective_raw = overlay_finalized_index_rows(effective_raw, correction_raw)
     target_date = _latest_completed_date_for_market(market_name)
     cached_latest_date = _latest_raw_date(effective_raw)
+    missing_recent_dates = missing_recent_market_trade_dates(
+        effective_raw,
+        market_name,
+        target_date,
+    )
     correction_start = source_correction_start(index_config)
     correction_latest_date = _latest_raw_date(correction_raw)
     correction_needed = (
@@ -1404,7 +1627,11 @@ def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.
         and (correction_latest_date is None or correction_latest_date < target_date)
     )
     if not is_bootstrap and target_date is not None and cached_latest_date is not None:
-        if cached_latest_date >= target_date and not correction_needed:
+        if (
+            cached_latest_date >= target_date
+            and not correction_needed
+            and not missing_recent_dates
+        ):
             return build_export_df(effective_raw, index_name, days=days)
 
     missing_calendar_days = (
@@ -1434,6 +1661,7 @@ def fetch_index_history(index_name: str, index_config, days: int = 10000) -> pd.
     source_needed = (
         is_bootstrap
         or correction_needed
+        or bool(missing_recent_dates)
         or target_date is None
         or tickflow_latest_date is None
         or tickflow_latest_date < target_date

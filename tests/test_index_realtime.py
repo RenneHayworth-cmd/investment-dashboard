@@ -421,6 +421,26 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertEqual(pending, {"日经225"})
 
     @patch("services.index_realtime.load_dataset")
+    def test_pending_daily_update_detects_recent_interior_gap(self, load_dataset_mock):
+        cached = pd.DataFrame(
+            {
+                "trade_date": pd.to_datetime(
+                    ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-07"]
+                ),
+                "close": [100.0, 101.0, 102.0, 104.0],
+            }
+        )
+        load_dataset_mock.return_value = (cached, {})
+        after_close = datetime(2026, 8, 7, 16, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        pending = find_pending_post_close_index_names(
+            now=after_close,
+            index_names={"日经225", "韩国KOSPI"},
+        )
+
+        self.assertEqual(pending, {"日经225", "韩国KOSPI"})
+
+    @patch("services.index_realtime.load_dataset")
     def test_crude_oil_update_remains_pending_when_source_correction_is_missing(self, load_dataset_mock):
         def load_side_effect(_symbol, source, _data_type):
             if source == "index_final_history":

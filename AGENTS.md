@@ -126,25 +126,56 @@ before a larger handoff or commit.
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
-  spread, and futures option data. It should read local cache on first render
+  spread, and futures option data. Its default spreads are `I2609 - I2705` and
+  `IM2609 - IM2703`, calculated independently with the futures-spread service.
+  On an A-share trading day, fetch one ETF quote batch every 10 minutes from
+  09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
+  lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
+  from 14:50 through 15:00. Each batch updates all ETF cards and the transient
+  timing-table preview for configured timing symbols. Use the same schedule to
+  refresh the two futures-spread cards and four futures-option cards, retaining
+  their last successful transient values when one source fails. These previews
+  remain transient and must not affect formal history or recent operation guidance.
+  It should read local cache on first render
   and fetch after the user clicks the load button. From the A-share open through
   15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
   it may also incrementally backfill missing completed sessions, but must not
-  save the current unfinished quote or use it in the timing table. Before the
+  save the current unfinished quote. During the A-share lunch break, fetch the
+  lunch close once and use it as a transient timing-table preview through
+  14:50. After a successful lunch fetch, do not request it again in the same
+  page session; retry a failed fetch no more often than every 10 minutes. From
+  14:50 through 15:00 on an A-share
+  trading day, the two-minute page fragment should batch real-time quotes every
+  two minutes and use them as a transient timing-table preview. Reruns inside
+  the two-minute interval reuse the latest result. At 15:00 the table returns
+  to the formal daily-close path. The preview must not be cached or included in
+  recent operation guidance. The lunch preview follows the same no-persistence
+  and no-operation-guidance rules. Before the
   open, on non-trading days, and from 15:05 onward, use the daily-history path. While
-  the page is open, a local one-minute fragment check should fetch each missing
+  the page is open, a local two-minute fragment check should fetch each missing
   formal ETF close once after 15:05, mark the current row as close-confirmed,
   append it to cache, and then update the timing table. Earlier cached dates
   remain unchanged; an unconfirmed same-day row left by an older version must
-  not be treated as the formal close. Spread and option updates remain tied to
-  the load button. Its bottom summary table contains ETFs only and follows the index
-  MA summary style. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
-  MA20/0.5% for 159201; MA25/2% for 159655, 159501, and 159967; MA10/1% for 159545; and
-  MA30/1.5% for 518850. Preserve the
+  not be treated as the formal close. For 161128, formal daily history prefers
+  EastMoney/AkShare. When EastMoney is unavailable, Sina exchange history may
+  be used only after its adjustment metadata confirms that unadjusted prices
+  are identical to the requested adjustment basis. If both long-history paths
+  still lag after 15:05, a Sina close snapshot may append the current row only
+  when its trade date matches the latest completed session and its timestamp is
+  at or after the market close. Apply the same incremental cache rules;
+  intraday card quotes remain in the TickFlow batch when available. If TickFlow
+  omits 161128, use its same-day Sina snapshot as an intraday-only fallback.
+  Spread and option updates
+  remain tied to the load button. Its bottom summary table contains ETFs/LOFs only and follows the index
+  MA summary style. Beside the current interval return, show the preceding
+  transition date and the completed return between that transition and the
+  current transition. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
+  MA20/0.5% for 159201; MA25/2% for 159655, 159501, and 159967; MA25/1.5% for
+  161128; MA10/1% for 159545; and MA30/1.5% for 518850. Preserve the
   previous position while price remains inside the threshold band. Treat
   159655 and 159501 as half long-term holding and half MA timing: display a
   bearish timing state as half position rather than empty. Treat 159201,
-  159545, 518850, 513260, 588000, 159915, 510500, and 159967 as pure timing.
+  159545, 518850, 513260, 588000, 159915, 510500, 159967, and 161128 as pure timing.
   Treat
   512890 as a long-term holding: keep it out of the bottom ETF timing table
   while retaining its card and detail view. Use the complete fund
@@ -152,6 +183,11 @@ before a larger handoff or commit.
   digits without `.SH` or `.SZ` in cards, tables, and detail captions. At the
   very bottom, show every position transition reconstructed from formal daily
   closes in the latest seven calendar days; intraday quotes must not affect it.
+- The `实盘记录` page stores actual executions separately from simulated
+  backtests in the local `live_trades` SQLite table. Treat `fee_rate_pct` as a
+  percentage value, calculate position cost with fees included, and use moving
+  average cost for realized P&L. Do not write these personal records into source
+  files or mix them into strategy backtest trades.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -160,6 +196,7 @@ before a larger handoff or commit.
 
 - `app.py`: Streamlit home page.
 - `pages/`: Streamlit pages. Numeric prefixes control sidebar ordering.
+- `services/live_trading.py`: local live-trade ledger and position-cost calculations.
 - `core/`: shared paths, SQLite setup, cache helpers, small common utilities.
 - `services/`: market data fetching and analysis logic.
 - `data/raw/`: generated raw CSV data.

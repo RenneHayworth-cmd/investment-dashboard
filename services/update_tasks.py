@@ -28,6 +28,7 @@ from services.index_ma20 import (
     get_index_raw_from_tickflow,
     merge_by_date,
     merge_raw_index_data,
+    missing_recent_market_trade_dates,
     overlay_finalized_index_rows,
     raw_cache_symbol,
     sanitize_index_report_market_dates,
@@ -145,6 +146,7 @@ def run_index_ma20_update(
                         elif progress_callback:
                             progress_callback(index_name, completed, total, "empty", elapsed_seconds)
                 except Exception as exc:
+                    request_error = str(exc).strip() or type(exc).__name__
                     cached_index_df = extract_cached_index_report(cached_df, index_name)
                     if cached_index_df is not None and not cached_index_df.empty:
                         cached_index_df = refresh_cached_eastmoney_index_report(
@@ -157,24 +159,31 @@ def run_index_ma20_update(
                         status = "success" if current_enough else "cached"
                         if current_enough:
                             persist_confirmed_index_report_row(index_name, index_config, cached_index_df)
-                        message = (
-                            "\u4e1c\u65b9\u8d22\u5bccK\u7ebf\u63a5\u53e3\u5931\u8d25\uff0c\u5df2\u4f7f\u7528\u672c\u5730\u5386\u53f2\u5e8f\u5217 + \u4e1c\u65b9\u8d22\u5bcc\u5217\u8868\u6700\u65b0\u4ef7\u8865\u9f50\u5f53\u5929\u6570\u636e"
-                            if current_enough
-                            else str(exc)
-                        )
+                        if current_enough and index_config.get("source") == "eastmoney_kline":
+                            message = "东方财富K线接口失败，已使用本地历史序列 + 东方财富列表最新价补齐当天数据"
+                        elif current_enough:
+                            message = f"联网获取异常，本地正式日线已达到预期日期：{request_error}"
+                        else:
+                            message = request_error
                         all_data.append(cached_index_df)
                         timings.append(build_timing_row(index_name, index_config, status, elapsed_seconds, message))
                         if index_config.get("require_current_quote") and not current_enough:
-                            errors.append(build_stale_quote_message(index_name, index_config, cached_index_df, "\u5df2\u6cbf\u7528\u672c\u5730\u7f13\u5b58"))
+                            stale_message = build_stale_quote_message(
+                                index_name,
+                                index_config,
+                                cached_index_df,
+                                "已沿用本地缓存",
+                            )
+                            errors.append(f"{stale_message}；请求异常：{request_error}")
                         if progress_callback:
                             progress_callback(index_name, completed, total, status, elapsed_seconds)
                     elif index_config.get("optional"):
-                        timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds, str(exc)))
+                        timings.append(build_timing_row(index_name, index_config, "empty", elapsed_seconds, request_error))
                         if progress_callback:
                             progress_callback(index_name, completed, total, "empty", elapsed_seconds)
                     else:
-                        timings.append(build_timing_row(index_name, index_config, "failed", elapsed_seconds, str(exc)))
-                        errors.append(f"{index_name}: {exc}")
+                        timings.append(build_timing_row(index_name, index_config, "failed", elapsed_seconds, request_error))
+                        errors.append(f"{index_name}: {request_error}")
                         if progress_callback:
                             progress_callback(index_name, completed, total, "failed", elapsed_seconds)
 
@@ -329,7 +338,7 @@ def trim_index_report(
     if report_df is None or report_df.empty or "日期" not in report_df.columns:
         return report_df
 
-    cutoff = datetime.now() - timedelta(days=max(int(days), 1))
+    cutoff = pd.Timestamp(datetime.now()).normalize() - pd.Timedelta(days=max(int(days), 1))
     dates = pd.to_datetime(report_df["日期"], errors="coerce")
     return report_df.loc[dates >= cutoff].reset_index(drop=True)
 
@@ -542,10 +551,13 @@ def latest_index_trade_date(df: pd.DataFrame | None, index_name: str) -> pd.Time
 
 
 def build_stale_quote_message(index_name: str, index_config: dict, df: pd.DataFrame, action_text: str) -> str:
-    source_label = (
-        "东方财富"
-        if index_config.get("source") == "eastmoney_kline"
-        else str(index_config.get("source", "上游数据源"))
+    source_labels = {
+        "eastmoney_kline": "东方财富",
+        "cboe_vix": "CBOE",
+    }
+    source_label = source_labels.get(
+        str(index_config.get("source") or ""),
+        str(index_config.get("source", "上游数据源")),
     )
     latest_date = latest_index_trade_date(df, index_name)
     latest_text = latest_date.strftime("%Y-%m-%d") if latest_date is not None else "未知日期"
@@ -611,6 +623,14 @@ def fetch_index_report(
     )
     effective_history_raw = overlay_finalized_index_rows(cached_history_raw, finalized_raw)
     effective_history_raw = overlay_finalized_index_rows(effective_history_raw, correction_raw)
+    market = next((item for item in MARKET_WINDOWS if item.name == market_name), None)
+    market_now = datetime.now(ZoneInfo(market.timezone)) if market is not None else None
+    target_date = latest_settled_trade_date(market, market_now) if market is not None else None
+    missing_recent_dates = missing_recent_market_trade_dates(
+        effective_history_raw,
+        market_name,
+        target_date,
+    )
     needs_history_bootstrap = effective_history_raw is None or len(effective_history_raw) < INDEX_HISTORY_MIN_ROWS
     source_days = (
         max(int(days), INDEX_HISTORY_BOOTSTRAP_DAYS)
@@ -683,7 +703,7 @@ def fetch_index_report(
         except Exception:
             df = None
 
-    if df is None:
+    if df is None or missing_recent_dates:
         df = fetch_one_index(index_name, index_config, api_key=api_key, days=source_days)
 
     latest_raw = extract_raw_from_export_df(df, index_name)

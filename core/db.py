@@ -61,6 +61,24 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_key TEXT UNIQUE,
+                trade_date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                fee_rate_pct REAL NOT NULL,
+                strategy TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 

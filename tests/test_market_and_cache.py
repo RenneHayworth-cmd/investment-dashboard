@@ -18,8 +18,12 @@ from services.index_ma20 import (
     build_summary,
     fetch_index_history,
     fetch_eastmoney_clist_latest_index_row,
+    fetch_yahoo_chart_payload,
     filter_completed_market_dates,
+    get_index_data_from_akshare_global,
+    get_index_data_from_akshare_us,
     get_index_data_from_akshare_futures_main,
+    get_index_data_from_cboe_vix,
     overlay_finalized_index_rows,
     sanitize_index_report_market_dates,
     supplement_stale_yahoo_history,
@@ -65,6 +69,189 @@ class _FakeSession:
 
 
 class MarketAndCacheTests(unittest.TestCase):
+    @patch("requests.Session")
+    def test_yahoo_chart_retries_alternate_host(self, session_factory):
+        calls = []
+
+        class YahooSession:
+            trust_env = True
+
+            def get(self, url, **_kwargs):
+                calls.append(url)
+                if "query1.finance.yahoo.com" in url:
+                    raise RuntimeError("query1 unavailable")
+                return type(
+                    "YahooResponse",
+                    (),
+                    {
+                        "raise_for_status": lambda self: None,
+                        "json": lambda self: {"chart": {"result": [{"meta": {}}], "error": None}},
+                    },
+                )()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = YahooSession()
+
+        payload = fetch_yahoo_chart_payload("^TEST", {"range": "10d", "interval": "1d"})
+
+        self.assertTrue(payload["chart"]["result"])
+        self.assertEqual(
+            calls,
+            [
+                "https://query1.finance.yahoo.com/v8/finance/chart/^TEST",
+                "https://query2.finance.yahoo.com/v8/finance/chart/^TEST",
+            ],
+        )
+
+    @patch("requests.Session")
+    def test_yahoo_chart_does_not_repeat_both_hosts_after_access_denied(self, session_factory):
+        calls = []
+
+        class DeniedResponse:
+            status_code = 403
+
+            def raise_for_status(self):
+                raise RuntimeError("403 forbidden")
+
+        class YahooSession:
+            trust_env = True
+
+            def get(self, url, **_kwargs):
+                calls.append(url)
+                return DeniedResponse()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = YahooSession()
+
+        with self.assertRaisesRegex(RuntimeError, "Yahoo行情请求失败"):
+            fetch_yahoo_chart_payload("^TEST", {"range": "10d", "interval": "1d"})
+
+        self.assertEqual(len(calls), 2)
+
+    @patch("services.index_ma20.get_index_data_from_yahoo")
+    @patch("services.index_ma20.fetch_eastmoney_completed_global_row")
+    @patch("akshare.index_global_hist_em")
+    def test_global_index_prefers_completed_eastmoney_quote_before_yahoo(
+        self,
+        akshare_mock,
+        eastmoney_mock,
+        yahoo_mock,
+    ):
+        history_dates = pd.bdate_range(end="2026-08-05", periods=30)
+        akshare_mock.return_value = pd.DataFrame(
+            {"日期": history_dates, "收盘": range(71, 101)}
+        )
+        eastmoney_mock.return_value = pd.DataFrame(
+            {"trade_date": pd.to_datetime(["2026-08-06"]), "close": [101.0]}
+        )
+
+        class PostCloseDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 8, 6, 16, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        with patch("services.index_ma20.datetime", PostCloseDateTime):
+            result = get_index_data_from_akshare_global(
+                "日经225",
+                "日经225",
+                days=30,
+                yahoo_symbol="^N225",
+                eastmoney_quote_secid="100.N225",
+                market_name="日本",
+            )
+
+        self.assertEqual(result.iloc[-1]["日经225_收盘价"], 101.0)
+        yahoo_mock.assert_not_called()
+
+    @patch("services.index_ma20.get_index_data_from_yahoo")
+    @patch("services.index_ma20.fetch_eastmoney_completed_global_row")
+    @patch("akshare.index_global_hist_em")
+    def test_global_index_keeps_yahoo_history_when_eastmoney_history_fails(
+        self,
+        akshare_mock,
+        eastmoney_mock,
+        yahoo_mock,
+    ):
+        akshare_mock.side_effect = RuntimeError("history unavailable")
+        eastmoney_mock.return_value = pd.DataFrame(
+            {"trade_date": pd.to_datetime(["2026-08-07"]), "close": [104.0]}
+        )
+        yahoo_mock.return_value = build_export_df(
+            pd.DataFrame(
+                {
+                    "trade_date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                    "close": [101.0, 102.0],
+                }
+            ),
+            "韩国KOSPI",
+            days=30,
+        )
+
+        result = get_index_data_from_akshare_global(
+            "韩国KOSPI",
+            "韩国KOSPI",
+            days=30,
+            yahoo_symbol="^KS11",
+            eastmoney_quote_secid="100.KS11",
+            market_name="韩国",
+        )
+
+        self.assertEqual(result["日期"].astype(str).tolist(), ["2026-08-05", "2026-08-06", "2026-08-07"])
+        self.assertEqual(result.iloc[-1]["韩国KOSPI_收盘价"], 104.0)
+
+    @patch("requests.Session")
+    def test_cboe_vix_history_parses_official_daily_file(self, session_factory):
+        class CboeResponse:
+            text = "DATE,OPEN,HIGH,LOW,CLOSE\n08/04/2026,15,17,14,16.5\n08/05/2026,16,18,15,15.81\n"
+
+            def raise_for_status(self):
+                return None
+
+        class CboeSession:
+            trust_env = False
+
+            def get(self, *_args, **_kwargs):
+                return CboeResponse()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = CboeSession()
+
+        result = get_index_data_from_cboe_vix("VIX恐慌指数", days=30)
+
+        self.assertEqual(result.iloc[-1]["日期"], "2026-08-05")
+        self.assertEqual(result.iloc[-1]["VIX恐慌指数_收盘价"], 15.81)
+
+    @patch("services.index_ma20.get_index_data_from_yahoo", side_effect=RuntimeError("yahoo unavailable"))
+    @patch("akshare.index_us_stock_sina")
+    def test_akshare_us_keeps_primary_history_when_yahoo_supplement_fails(
+        self,
+        akshare_mock,
+        yahoo_mock,
+    ):
+        akshare_mock.return_value = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-07-29", "2026-07-30"]),
+                "收盘": [100.0, 101.0],
+            }
+        )
+
+        result = get_index_data_from_akshare_us(
+            ".TEST",
+            "测试指数",
+            days=10000,
+            yahoo_symbol="^TEST",
+        )
+
+        self.assertEqual(result.iloc[-1]["测试指数_收盘价"], 101.0)
+        yahoo_mock.assert_called_once()
+
     @patch("services.index_ma20.fetch_yahoo_latest_index_row")
     def test_stale_yahoo_history_retries_short_window(self, latest_row_mock):
         history = pd.DataFrame(

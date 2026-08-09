@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
+import json
+import logging
 import re
 from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 from core.cache import load_dataset, save_dataset
 from services.fund_analysis import (
@@ -20,12 +23,14 @@ from services.futures_options_analysis import (
     DATA_TYPE_OPTIONS,
     FUTURES_OPTION_DATA_VERSION,
     add_indicators,
+    append_option_spot_row,
     build_summary as build_futures_option_summary,
     fetch_futures_option_data,
     normalize_option_symbol,
 )
 from services.futures_spread import (
     SPREAD_CALCULATION_VERSION,
+    append_futures_spot_row,
     build_spread_summary,
     calculate_spreads,
     contract_name,
@@ -41,6 +46,9 @@ from services.market_calendar import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 DEFAULT_ETF_CODES = [
     "512890",
     "159201",
@@ -48,15 +56,31 @@ DEFAULT_ETF_CODES = [
     "513260",
     "159655",
     "159501",
+    "161128",
     "518850",
     "588000",
     "159915",
     "510500",
     "159967",
 ]
-DEFAULT_SPREAD_CONTRACTS = ["I2609", "I2701"]
+DEFAULT_SPREAD_CONTRACTS = ["I2609", "I2705"]
+DEFAULT_SPREAD_GROUPS = [
+    DEFAULT_SPREAD_CONTRACTS.copy(),
+    ["IM2609", "IM2703"],
+]
 DEFAULT_OPTION_CODES = ["I2609P730", "I2609P740", "I2609P750", "I2609P760"]
 ETF_FINAL_CLOSE_READY_TIME = datetime_time(15, 5)
+ETF_MORNING_TIMING_START_TIME = datetime_time(9, 30)
+ETF_MORNING_FAST_REFRESH_END_TIME = datetime_time(10, 0)
+ETF_MORNING_TIMING_PREVIEW_END_TIME = datetime_time(11, 30)
+ETF_MORNING_TIMING_REFRESH_SECONDS = 600
+ETF_MIDSESSION_TIMING_REFRESH_SECONDS = 1800
+ETF_LUNCH_TIMING_START_TIME = datetime_time(11, 30)
+ETF_LUNCH_TIMING_FETCH_END_TIME = datetime_time(13, 0)
+ETF_AFTERNOON_TIMING_START_TIME = datetime_time(13, 0)
+ETF_REALTIME_TIMING_START_TIME = datetime_time(14, 50)
+ETF_REALTIME_TIMING_END_TIME = datetime_time(15, 0)
+ETF_REALTIME_TIMING_REFRESH_SECONDS = 120
 
 ETF_DISPLAY_NAMES = {
     "512890": "红利低波ETF华泰柏瑞",
@@ -65,6 +89,7 @@ ETF_DISPLAY_NAMES = {
     "513260": "恒生科技ETF汇添富",
     "159655": "标普500ETF华夏",
     "159501": "纳指ETF嘉实",
+    "161128": "标普信息科技LOF易方达",
     "518850": "黄金ETF华夏",
     "588000": "科创50ETF华夏",
     "159915": "创业板ETF易方达",
@@ -80,6 +105,7 @@ ETF_TIMING_STRATEGIES = {
     "159201": (20, 0.5),
     "159655": (25, 2.0),
     "159501": (25, 2.0),
+    "161128": (25, 1.5),
     "159545": (10, 1.0),
     "159967": (25, 2.0),
     "518850": (30, 1.5),
@@ -88,6 +114,7 @@ ETF_TIMING_TABLE_EXCLUDED_CODES = {"512890"}
 ETF_POSITION_STRATEGIES = {
     "159655": "半仓持有半仓择时",
     "159501": "半仓持有半仓择时",
+    "161128": "纯择时",
     "159201": "纯择时",
     "159545": "纯择时",
     "518850": "纯择时",
@@ -97,6 +124,9 @@ ETF_POSITION_STRATEGIES = {
     "510500": "纯择时",
     "159967": "纯择时",
 }
+ETF_AKSHARE_HISTORY_CODES = {"161128"}
+ETF_SINA_REALTIME_FALLBACK_CODES = {"161128"}
+SINA_REQUEST_TIMEOUT_SECONDS = 15
 _RUNTIME_ETF_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_ETF_QUOTE_CACHE_LOCK = Lock()
 
@@ -148,6 +178,80 @@ def etf_intraday_quote_ready(market_now: datetime | None = None) -> bool:
         market is not None
         and is_market_trading_day(market, market_now)
         and market.sessions[0][0] <= market_now.time() < ETF_FINAL_CLOSE_READY_TIME
+    )
+
+
+def etf_realtime_timing_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_REALTIME_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_REALTIME_TIMING_END_TIME
+    )
+
+
+def etf_morning_timing_fetch_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_MORNING_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_MORNING_TIMING_PREVIEW_END_TIME
+    )
+
+
+def etf_morning_timing_preview_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_MORNING_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_MORNING_TIMING_PREVIEW_END_TIME
+    )
+
+
+def etf_lunch_timing_fetch_ready(market_now: datetime | None = None) -> bool:
+    """Allow one lunch-close quote fetch while the A-share market is paused."""
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_LUNCH_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_LUNCH_TIMING_FETCH_END_TIME
+    )
+
+
+def etf_lunch_timing_preview_ready(market_now: datetime | None = None) -> bool:
+    """Keep the captured lunch-close preview visible until the closing preview starts."""
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_LUNCH_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_REALTIME_TIMING_START_TIME
+    )
+
+
+def etf_afternoon_timing_fetch_ready(market_now: datetime | None = None) -> bool:
+    market = get_market_window("A股")
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    return bool(
+        market is not None
+        and is_market_trading_day(market, market_now)
+        and ETF_AFTERNOON_TIMING_START_TIME
+        <= market_now.time()
+        < ETF_REALTIME_TIMING_START_TIME
     )
 
 
@@ -216,6 +320,18 @@ def fetch_tickflow_etf_quotes(
             "change_pct": None if pd.isna(change_pct) else float(change_pct),
             "quote_time": quote_time,
         }
+
+    for symbol in symbols:
+        base_code = normalize_etf_base_code(symbol)
+        if base_code not in ETF_SINA_REALTIME_FALLBACK_CODES or base_code in quotes:
+            continue
+        try:
+            quotes[base_code] = _fetch_sina_exchange_fund_quote(
+                symbol=symbol,
+                market_now=market_now,
+            )
+        except Exception as exc:
+            logger.warning("%s TickFlow实时行情缺失，新浪备用源也失败：%s", symbol, exc)
 
     if not quotes:
         raise ValueError("TickFlow未返回当天ETF实时行情。")
@@ -287,6 +403,115 @@ def apply_etf_realtime_quote(item: PositionItem, quote: dict[str, object]) -> Po
         cache_time=item.cache_time,
         metrics=metrics,
         dataframe=item.dataframe,
+    )
+
+
+def apply_etf_realtime_quotes_to_items(
+    items: list[PositionItem],
+    quotes: dict[str, dict[str, object]],
+) -> list[PositionItem]:
+    updated_items: list[PositionItem] = []
+    for item in items:
+        if item.category != "ETF":
+            updated_items.append(item)
+            continue
+        quote = quotes.get(normalize_etf_base_code(item.code))
+        updated_items.append(
+            apply_etf_realtime_quote(item, quote) if quote is not None else item
+        )
+    return updated_items
+
+
+def apply_etf_realtime_quote_to_timing(
+    item: PositionItem,
+    quote: dict[str, object],
+    *,
+    market_now: datetime | None = None,
+) -> PositionItem:
+    """Build an intraday timing preview without changing formal history."""
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    is_morning_preview = etf_morning_timing_preview_ready(market_now)
+    is_closing_preview = etf_realtime_timing_ready(market_now)
+    is_lunch_preview = etf_lunch_timing_preview_ready(market_now)
+    if not is_morning_preview and not is_closing_preview and not is_lunch_preview:
+        return item
+
+    base_code = normalize_etf_base_code(item.code)
+    strategy = ETF_TIMING_STRATEGIES.get(base_code)
+    quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+    quote_price = pd.to_numeric(quote.get("price"), errors="coerce")
+    if (
+        strategy is None
+        or pd.isna(quote_time)
+        or quote_time.date() != market_now.date()
+        or pd.isna(quote_price)
+        or float(quote_price) <= 0
+    ):
+        return item
+
+    quoted_item = apply_etf_realtime_quote(item, quote)
+    timing_data = (
+        item.dataframe[["date", "price"]].copy()
+        if item.dataframe is not None
+        and not item.dataframe.empty
+        and {"date", "price"}.issubset(item.dataframe.columns)
+        else pd.DataFrame(columns=["date", "price"])
+    )
+    realtime_date = pd.Timestamp(quote_time.date())
+    if not timing_data.empty:
+        timing_dates = pd.to_datetime(timing_data["date"], errors="coerce")
+        timing_data = timing_data.loc[timing_dates.dt.date != realtime_date.date()].copy()
+    timing_data = pd.concat(
+        [
+            timing_data,
+            pd.DataFrame(
+                {
+                    "date": [realtime_date],
+                    "price": [float(quote_price)],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    timing_snapshot = calculate_etf_timing_snapshot(
+        timing_data,
+        ma_period=int(strategy[0]),
+        threshold_pct=float(strategy[1]),
+    )
+    metrics = dict(quoted_item.metrics)
+    metrics.update(
+        {
+            key: _round_metric(value, 6)
+            if key == "策略均线"
+            else _round_metric(value)
+            if key in {"策略偏离(%)", "策略区间涨幅(%)", "策略上一区间涨幅(%)"}
+            else value
+            for key, value in timing_snapshot.items()
+        }
+    )
+    return PositionItem(
+        category=item.category,
+        code=quoted_item.code,
+        name=quoted_item.name,
+        status=(
+            "实时预判"
+            if is_closing_preview
+            else "午间预判"
+            if is_lunch_preview
+            else "早盘预判"
+        ),
+        source=(
+            "TickFlow实时行情（14:50-15:00择时预判，不写入缓存）"
+            if is_closing_preview
+            else "TickFlow午间收盘行情（择时预判，不写入缓存）"
+            if is_lunch_preview
+            else "TickFlow早盘实时行情（择时预判，不写入缓存）"
+        ),
+        latest_date=realtime_date.strftime("%Y-%m-%d"),
+        cache_time=item.cache_time,
+        metrics=metrics,
+        dataframe=item.dataframe,
+        error=item.error,
     )
 
 
@@ -363,6 +588,9 @@ def calculate_etf_timing_snapshot(
     latest_action = "等待均线"
     transition_date = None
     transition_price = None
+    previous_transition_date = None
+    previous_transition_price = None
+    previous_interval_return_pct = pd.NA
     for _, row in data.iterrows():
         ma_value = pd.to_numeric(row[ma_col], errors="coerce")
         if pd.isna(ma_value):
@@ -376,9 +604,16 @@ def calculate_etf_timing_snapshot(
             else position
         )
         if desired_position != position:
+            previous_transition_date = transition_date
+            previous_transition_price = transition_price
             latest_action = "买入" if desired_position else "卖出"
             transition_date = pd.Timestamp(row["date"])
             transition_price = price
+            previous_interval_return_pct = (
+                (transition_price / previous_transition_price - 1) * 100
+                if previous_transition_price is not None and previous_transition_price != 0
+                else pd.NA
+            )
         else:
             latest_action = "持有" if position else "空仓"
         position = desired_position
@@ -403,6 +638,12 @@ def calculate_etf_timing_snapshot(
         "择时判断": latest_action,
         "状态转换时间": transition_date.strftime("%Y-%m-%d") if transition_date is not None else pd.NA,
         "策略区间涨幅(%)": interval_return_pct,
+        "上一状态转换时间": (
+            previous_transition_date.strftime("%Y-%m-%d")
+            if previous_transition_date is not None
+            else pd.NA
+        ),
+        "策略上一区间涨幅(%)": previous_interval_return_pct,
     }
 
 
@@ -548,6 +789,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
         "择时判断",
         "状态转换时间",
         "区间涨幅(%)",
+        "上一状态转换时间",
+        "上一区间涨幅(%)",
     ]
     rows = []
     for item in items:
@@ -567,6 +810,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
             "择时判断": pd.NA,
             "状态转换时间": pd.NA,
             "区间涨幅(%)": pd.NA,
+            "上一状态转换时间": pd.NA,
+            "上一区间涨幅(%)": pd.NA,
         }
         if base_code in ETF_TIMING_STRATEGIES:
             ma_period, threshold_pct = ETF_TIMING_STRATEGIES[base_code]
@@ -584,6 +829,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
                     ),
                     "状态转换时间": item.metrics.get("状态转换时间", pd.NA),
                     "区间涨幅(%)": item.metrics.get("策略区间涨幅(%)", pd.NA),
+                    "上一状态转换时间": item.metrics.get("上一状态转换时间", pd.NA),
+                    "上一区间涨幅(%)": item.metrics.get("策略上一区间涨幅(%)", pd.NA),
                 }
             )
         rows.append(row)
@@ -598,6 +845,26 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
 
 def parse_position_codes(text: str) -> list[str]:
     return parse_contracts(text)
+
+
+def parse_spread_groups(text: str) -> list[list[str]]:
+    groups: list[list[str]] = []
+    for line in str(text or "").replace(";", "\n").splitlines():
+        contracts = parse_position_codes(line)
+        if contracts:
+            groups.append(contracts)
+    return groups
+
+
+def format_spread_position_name(base_contract: str, other_contract: str) -> str:
+    base_contract = base_contract.strip().upper()
+    other_contract = other_contract.strip().upper()
+    if not other_contract:
+        return contract_name(base_contract)
+    product_match = re.search(r"\(([^()]*)\)$", contract_name(base_contract))
+    product_name = product_match.group(1) if product_match else ""
+    suffix = f" ({product_name})" if product_name else ""
+    return f"{base_contract} - {other_contract}{suffix}"
 
 
 def format_cache_time(value: str | None) -> str:
@@ -634,6 +901,40 @@ def _merge_by_date(old_df: pd.DataFrame | None, new_df: pd.DataFrame, date_colum
     return (
         pd.concat([normalized_old, unseen], ignore_index=True)
         .sort_values(date_column)
+        .reset_index(drop=True)
+    )
+
+
+def _merge_current_day_refresh(
+    old_df: pd.DataFrame | None,
+    new_df: pd.DataFrame,
+    date_column: str,
+) -> pd.DataFrame:
+    merged = _merge_by_date(old_df, new_df, date_column)
+    if new_df is None or new_df.empty or date_column not in new_df.columns:
+        return merged
+
+    today = pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+    refreshed = new_df.copy()
+    refreshed[date_column] = pd.to_datetime(refreshed[date_column], errors="coerce")
+    today_rows = refreshed[refreshed[date_column].dt.normalize() == today]
+    if today_rows.empty:
+        return merged
+
+    merged_dates = pd.to_datetime(merged[date_column], errors="coerce")
+    historical = merged[merged_dates.dt.normalize() != today]
+    cached_today = merged[merged_dates.dt.normalize() == today]
+    combined_today = (
+        today_rows.sort_values(date_column)
+        .drop_duplicates(date_column, keep="last")
+        .set_index(date_column)
+        .combine_first(cached_today.set_index(date_column))
+        .reset_index()
+    )
+    return (
+        pd.concat([historical, combined_today], ignore_index=True)
+        .sort_values(date_column)
+        .drop_duplicates(date_column, keep="last")
         .reset_index(drop=True)
     )
 
@@ -729,6 +1030,369 @@ def _missing_item(category: str, code: str, name: str = "") -> PositionItem:
     )
 
 
+def _fetch_eastmoney_exchange_fund_close(
+    *,
+    symbol: str,
+    count: int,
+    adjust: str | None,
+) -> pd.DataFrame:
+    import akshare as ak
+
+    base_code = normalize_etf_base_code(symbol)
+    end_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    calendar_days = max(int(count) * 2, 365)
+    start_date = end_date - timedelta(days=calendar_days)
+    adjust_value = {
+        "forward": "qfq",
+        "backward": "hfq",
+        None: "",
+    }.get(adjust, "")
+    raw = ak.fund_etf_hist_em(
+        symbol=base_code,
+        period="daily",
+        start_date=start_date.strftime("%Y%m%d"),
+        end_date=end_date.strftime("%Y%m%d"),
+        adjust=adjust_value,
+    )
+    if raw is None or raw.empty:
+        raise ValueError(f"东方财富未返回 {base_code} 的场内日线数据。")
+    if not {"日期", "收盘"}.issubset(raw.columns):
+        raise ValueError(f"东方财富返回列无法识别：{list(raw.columns)}")
+
+    columns = ["日期", "收盘"]
+    if "开盘" in raw.columns:
+        columns.insert(1, "开盘")
+    result = raw[columns].copy()
+    result.columns = (
+        ["日期", "开盘价", "收盘价"]
+        if "开盘" in raw.columns
+        else ["日期", "收盘价"]
+    )
+    result["日期"] = pd.to_datetime(result["日期"], errors="coerce")
+    if "开盘价" in result.columns:
+        result["开盘价"] = pd.to_numeric(result["开盘价"], errors="coerce")
+    result["收盘价"] = pd.to_numeric(result["收盘价"], errors="coerce")
+    result = result.dropna(subset=["日期", "收盘价"])
+    result = (
+        result.sort_values("日期")
+        .drop_duplicates("日期")
+        .tail(int(count))
+        .reset_index(drop=True)
+    )
+    result["symbol"] = symbol
+    result["name"] = display_etf_name(base_code, symbol)
+    return result
+
+
+def _sina_exchange_symbol(symbol: str) -> str:
+    base_code = normalize_etf_base_code(symbol)
+    exchange = "sh" if str(symbol).strip().upper().endswith(".SH") else "sz"
+    return f"{exchange}{base_code}"
+
+
+def _request_sina_realtime_snapshot(sina_symbol: str):
+    url = f"https://hq.sinajs.cn/list={sina_symbol}"
+    request_kwargs = {
+        "headers": {
+            "Referer": "https://finance.sina.com.cn/",
+            "User-Agent": "Mozilla/5.0",
+        },
+        "timeout": SINA_REQUEST_TIMEOUT_SECONDS,
+    }
+    try:
+        return requests.get(url, **request_kwargs)
+    except requests.exceptions.ProxyError:
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.get(url, **request_kwargs)
+
+
+def _fetch_sina_exchange_fund_quote(
+    *,
+    symbol: str,
+    market_now: datetime | None = None,
+) -> dict[str, object]:
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    base_code = normalize_etf_base_code(symbol)
+    sina_symbol = _sina_exchange_symbol(symbol)
+    response = _request_sina_realtime_snapshot(sina_symbol)
+    response.raise_for_status()
+    payload = response.content.decode("gb18030", errors="replace")
+    match = re.search(
+        rf'var\s+hq_str_{re.escape(sina_symbol)}="([^"]*)"',
+        payload,
+    )
+    fields = match.group(1).split(",") if match else []
+    if len(fields) < 32:
+        raise ValueError(f"新浪财经未返回 {base_code} 的可识别实时快照。")
+
+    latest_price = pd.to_numeric(fields[3], errors="coerce")
+    previous_close = pd.to_numeric(fields[2], errors="coerce")
+    quote_timestamp = pd.to_datetime(
+        f"{fields[30]} {fields[31]}",
+        errors="coerce",
+    )
+    if (
+        pd.isna(latest_price)
+        or float(latest_price) <= 0
+        or pd.isna(quote_timestamp)
+    ):
+        raise ValueError(f"新浪财经返回的 {base_code} 实时快照无效。")
+    if quote_timestamp.date() != market_now.date():
+        raise ValueError(
+            f"新浪财经 {base_code} 实时快照日期为 {quote_timestamp:%Y-%m-%d}，"
+            f"当前日期为 {market_now:%Y-%m-%d}。"
+        )
+
+    quote_time = quote_timestamp.tz_localize("Asia/Shanghai").to_pydatetime()
+    change_pct = None
+    if not pd.isna(previous_close) and float(previous_close) > 0:
+        change_pct = (float(latest_price) / float(previous_close) - 1) * 100
+    return {
+        "symbol": symbol.strip().upper(),
+        "price": float(latest_price),
+        "previous_close": (
+            None if pd.isna(previous_close) else float(previous_close)
+        ),
+        "change_pct": change_pct,
+        "quote_time": quote_time,
+    }
+
+
+def _ensure_sina_adjustment_is_identity(sina_symbol: str, adjust: str | None) -> None:
+    if adjust not in {"forward", "backward"}:
+        return
+
+    adjustment_name = "qfq" if adjust == "forward" else "hfq"
+    response = requests.get(
+        f"https://finance.sina.com.cn/realstock/company/{sina_symbol}/{adjustment_name}.js",
+        timeout=SINA_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    _prefix, separator, remainder = response.text.partition("=")
+    payload_text = remainder.splitlines()[0].strip().rstrip(";") if separator else ""
+    if not payload_text:
+        raise ValueError("新浪备用源未返回可识别的复权因子。")
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("新浪备用源复权因子格式无法识别。") from exc
+
+    factor_rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(factor_rows, list) or not factor_rows:
+        raise ValueError("新浪备用源未返回复权因子。")
+    for row in factor_rows:
+        try:
+            factor = float(row.get("f", 1))
+            split = float(row.get("s", 1))
+            dividend = float(row.get("u", 0))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("新浪备用源复权因子字段无法识别。") from exc
+        if (
+            abs(factor - 1.0) > 1e-12
+            or abs(split - 1.0) > 1e-12
+            or abs(dividend) > 1e-12
+        ):
+            raise ValueError("新浪备用源存在复权事件，不能用未复权日线替代当前复权口径。")
+
+
+def _fetch_sina_exchange_fund_close(
+    *,
+    symbol: str,
+    count: int,
+    adjust: str | None,
+) -> pd.DataFrame:
+    from akshare.stock.cons import hk_js_decode
+    import py_mini_racer
+
+    base_code = normalize_etf_base_code(symbol)
+    sina_symbol = _sina_exchange_symbol(symbol)
+    _ensure_sina_adjustment_is_identity(sina_symbol, adjust)
+
+    response = requests.get(
+        f"https://finance.sina.com.cn/realstock/company/{sina_symbol}/hisdata_klc2/klc_kl.js",
+        timeout=SINA_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    _prefix, separator, remainder = response.text.partition("=")
+    encoded = remainder.split(";", 1)[0].replace('"', "").strip() if separator else ""
+    if not encoded:
+        raise ValueError(f"新浪财经未返回 {base_code} 的场内日线数据。")
+
+    decoder = py_mini_racer.MiniRacer()
+    decoder.eval(hk_js_decode)
+    decoded_rows = decoder.call("d", encoded)
+    raw = pd.DataFrame(decoded_rows)
+    required_columns = {"date", "close"}
+    if raw.empty or not required_columns.issubset(raw.columns):
+        raise ValueError(f"新浪财经返回列无法识别：{list(raw.columns)}")
+
+    columns = ["date", "close"]
+    if "open" in raw.columns:
+        columns.insert(1, "open")
+    result = raw[columns].copy()
+    result.columns = (
+        ["日期", "开盘价", "收盘价"]
+        if "open" in raw.columns
+        else ["日期", "收盘价"]
+    )
+    result["日期"] = pd.to_datetime(
+        result["日期"], errors="coerce", utc=True
+    ).dt.tz_localize(None)
+    if "开盘价" in result.columns:
+        result["开盘价"] = pd.to_numeric(result["开盘价"], errors="coerce")
+    result["收盘价"] = pd.to_numeric(result["收盘价"], errors="coerce")
+    today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date())
+    result = result.dropna(subset=["日期", "收盘价"])
+    result = (
+        result[result["日期"] <= today]
+        .sort_values("日期")
+        .drop_duplicates("日期")
+        .tail(int(count))
+        .reset_index(drop=True)
+    )
+    if result.empty:
+        raise ValueError(f"新浪财经未返回 {base_code} 的有效场内日线数据。")
+    result["symbol"] = symbol
+    result["name"] = display_etf_name(base_code, symbol)
+    return result
+
+
+def _fetch_sina_exchange_fund_final_close(
+    *,
+    symbol: str,
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not etf_final_close_ready(market_now):
+        raise ValueError("A股当日正式收盘价需在交易日15:05后确认。")
+
+    base_code = normalize_etf_base_code(symbol)
+    sina_symbol = _sina_exchange_symbol(symbol)
+    response = _request_sina_realtime_snapshot(sina_symbol)
+    response.raise_for_status()
+    payload = response.content.decode("gb18030", errors="replace")
+    match = re.search(
+        rf'var\s+hq_str_{re.escape(sina_symbol)}="([^"]*)"',
+        payload,
+    )
+    fields = match.group(1).split(",") if match else []
+    if len(fields) < 32:
+        raise ValueError(f"新浪财经未返回 {base_code} 的可识别收盘快照。")
+
+    open_price = pd.to_numeric(fields[1], errors="coerce")
+    close_price = pd.to_numeric(fields[3], errors="coerce")
+    quote_timestamp = pd.to_datetime(
+        f"{fields[30]} {fields[31]}",
+        errors="coerce",
+    )
+    if pd.isna(close_price) or float(close_price) <= 0 or pd.isna(quote_timestamp):
+        raise ValueError(f"新浪财经返回的 {base_code} 收盘快照无效。")
+
+    target_date = latest_final_etf_trade_date(market_now)
+    market = get_market_window("A股")
+    session_close = market.sessions[-1][1] if market is not None else datetime_time(15, 0)
+    if quote_timestamp.date() != target_date:
+        raise ValueError(
+            f"新浪财经 {base_code} 收盘快照日期为 {quote_timestamp:%Y-%m-%d}，"
+            f"最新完成交易日应为 {target_date:%Y-%m-%d}。"
+        )
+    if quote_timestamp.time() < session_close:
+        raise ValueError(
+            f"新浪财经 {base_code} 快照时间为 {quote_timestamp:%H:%M:%S}，尚未收盘。"
+        )
+
+    return pd.DataFrame(
+        {
+            "日期": [quote_timestamp.normalize()],
+            "开盘价": [None if pd.isna(open_price) else float(open_price)],
+            "收盘价": [float(close_price)],
+            "symbol": [symbol],
+            "name": [display_etf_name(base_code, symbol)],
+            "_final_close_confirmed": [True],
+        }
+    )
+
+
+def _append_sina_final_close(
+    history: pd.DataFrame,
+    *,
+    symbol: str,
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    result = history.copy()
+    result.attrs.update(history.attrs)
+    if result.empty or "日期" not in result.columns or not etf_final_close_ready(market_now):
+        return result
+
+    target_date = latest_final_etf_trade_date(market_now)
+    history_dates = pd.to_datetime(result["日期"], errors="coerce")
+    if history_dates.dt.date.eq(target_date).any():
+        return result
+
+    try:
+        final_close = _fetch_sina_exchange_fund_final_close(
+            symbol=symbol,
+            market_now=market_now,
+        )
+    except Exception as exc:
+        warning = f"新浪当日收盘快照获取失败：{exc}"
+        result.attrs["position_history_warning"] = warning
+        logger.warning("%s %s", symbol, warning)
+        return result
+
+    history_attrs = dict(result.attrs)
+    result = _merge_by_date(result, final_close, "日期")
+    result.attrs.update(history_attrs)
+    history_source = str(result.attrs.get("position_history_source") or "").strip()
+    if history_source and "新浪收盘快照" not in history_source:
+        result.attrs["position_history_source"] = f"{history_source} + 新浪收盘快照"
+    return result
+
+
+def _fetch_exchange_fund_close(
+    *,
+    symbol: str,
+    count: int,
+    adjust: str | None,
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    eastmoney_error = ""
+    try:
+        result = _fetch_eastmoney_exchange_fund_close(
+            symbol=symbol,
+            count=count,
+            adjust=adjust,
+        )
+        result.attrs["position_history_source"] = "东方财富/AkShare"
+        return _append_sina_final_close(
+            result,
+            symbol=symbol,
+            market_now=market_now,
+        )
+    except Exception as exc:
+        eastmoney_error = str(exc)
+        logger.warning("%s 东方财富场内日线获取失败，尝试新浪备用源：%s", symbol, exc)
+
+    try:
+        result = _fetch_sina_exchange_fund_close(
+            symbol=symbol,
+            count=count,
+            adjust=adjust,
+        )
+        result.attrs["position_history_source"] = "新浪财经备用源"
+        return _append_sina_final_close(
+            result,
+            symbol=symbol,
+            market_now=market_now,
+        )
+    except Exception as sina_exc:
+        raise RuntimeError(
+            f"东方财富场内日线获取失败：{eastmoney_error}；新浪备用源也失败：{sina_exc}"
+        ) from sina_exc
+
+
 def load_or_fetch_etf(
     code: str,
     *,
@@ -752,9 +1416,17 @@ def load_or_fetch_etf(
     except Exception as exc:
         return PositionItem("ETF", raw_code, display_etf_name(base_code, raw_code), "失败", error=str(exc))
 
+    use_akshare_history = base_code in ETF_AKSHARE_HISTORY_CODES
+    cache_source = "akshare" if use_akshare_history else "tickflow"
+    fetch_source = "东方财富/AkShare" if use_akshare_history else "TickFlow"
     cache_symbol = f"fund_close_{symbol}_{adjust or 'none'}"
     period = f"{int(count)}_1d"
-    cached_df, cache_meta = _load_dataset_if_ready(cache_symbol, "tickflow", "fund_close_raw", period=period)
+    cached_df, cache_meta = _load_dataset_if_ready(
+        cache_symbol,
+        cache_source,
+        "fund_close_raw",
+        period=period,
+    )
     cached_df = filter_final_etf_rows(
         cached_df,
         market_now=market_now,
@@ -768,7 +1440,7 @@ def load_or_fetch_etf(
     should_refresh = force_refresh or (allow_fetch and not cache_is_current)
     used_cache = cached_df is not None and not should_refresh
     source_df = cached_df.copy() if used_cache else None
-    source = "本地缓存" if used_cache else "TickFlow"
+    source = "本地缓存" if used_cache else fetch_source
     status = "缓存"
     error = ""
 
@@ -778,24 +1450,48 @@ def load_or_fetch_etf(
         try:
             if cached_df is not None:
                 incremental_count = min(max(120, int(count) // 20), int(count))
-                latest_df = fetch_tickflow_fund_close(
-                    symbol=symbol,
-                    api_key=api_key,
-                    count=incremental_count,
-                    adjust=adjust,
+                latest_df = (
+                    _fetch_exchange_fund_close(
+                        symbol=symbol,
+                        count=incremental_count,
+                        adjust=adjust,
+                        market_now=market_now,
+                    )
+                    if use_akshare_history
+                    else fetch_tickflow_fund_close(
+                        symbol=symbol,
+                        api_key=api_key,
+                        count=incremental_count,
+                        adjust=adjust,
+                    )
                 )
+                if use_akshare_history:
+                    source = str(latest_df.attrs.get("position_history_source") or fetch_source)
+                    error = str(latest_df.attrs.get("position_history_warning") or "")
                 if not allow_unfinished_session:
                     latest_df = filter_final_etf_rows(latest_df, market_now=market_now)
                     latest_df["_final_close_confirmed"] = True
                 source_df = _merge_by_date(cached_df, latest_df, "日期")
                 status = "已增量更新"
             else:
-                source_df = fetch_tickflow_fund_close(
-                    symbol=symbol,
-                    api_key=api_key,
-                    count=int(count),
-                    adjust=adjust,
+                source_df = (
+                    _fetch_exchange_fund_close(
+                        symbol=symbol,
+                        count=int(count),
+                        adjust=adjust,
+                        market_now=market_now,
+                    )
+                    if use_akshare_history
+                    else fetch_tickflow_fund_close(
+                        symbol=symbol,
+                        api_key=api_key,
+                        count=int(count),
+                        adjust=adjust,
+                    )
                 )
+                if use_akshare_history:
+                    source = str(source_df.attrs.get("position_history_source") or fetch_source)
+                    error = str(source_df.attrs.get("position_history_warning") or "")
                 if not allow_unfinished_session:
                     source_df = filter_final_etf_rows(source_df, market_now=market_now)
                     source_df["_final_close_confirmed"] = True
@@ -804,7 +1500,7 @@ def load_or_fetch_etf(
                 save_dataset(
                     symbol=cache_symbol,
                     name=f"{symbol} 场内基金/股票原始收盘价",
-                    source="tickflow",
+                    source=cache_source,
                     data_type="fund_close_raw",
                     period=period,
                     df=source_df,
@@ -816,7 +1512,7 @@ def load_or_fetch_etf(
                     raw_code,
                     display_etf_name(base_code, symbol),
                     "失败",
-                    source="TickFlow",
+                    source=fetch_source,
                     error=str(exc),
                 )
             source_df = cached_df.copy()
@@ -865,7 +1561,7 @@ def load_or_fetch_etf(
                 key: _round_metric(value, 6)
                 if key == "策略均线"
                 else _round_metric(value)
-                if key in {"策略偏离(%)", "策略区间涨幅(%)"}
+                if key in {"策略偏离(%)", "策略区间涨幅(%)", "策略上一区间涨幅(%)"}
                 else value
                 for key, value in timing_snapshot.items()
             }
@@ -897,12 +1593,23 @@ def load_or_fetch_spread(
     allow_fetch: bool = True,
     force_refresh: bool = False,
     save_to_cache: bool = True,
+    realtime_preview: bool = False,
 ) -> PositionItem:
     contracts = [contract.strip().upper() for contract in contracts if contract.strip()]
     if len(contracts) < 2:
         return PositionItem("期货价差", " ".join(contracts), "期货价差", "失败", error="至少需要两个合约。")
 
     base_contract = (base_contract or contracts[0]).strip().upper()
+    configured_other_contract = next((contract for contract in contracts if contract != base_contract), "")
+    configured_code = (
+        f"{base_contract} - {configured_other_contract}"
+        if configured_other_contract
+        else base_contract
+    )
+    configured_name = format_spread_position_name(
+        base_contract,
+        configured_other_contract,
+    )
     cache_symbol = f"futures_spread_{base_contract}"
     cached_df, cache_meta = _load_dataset_if_ready(cache_symbol, "akshare", "futures_spread")
     cache_ready = _spread_cache_matches_contracts(cached_df, contracts, base_contract)
@@ -916,13 +1623,41 @@ def load_or_fetch_spread(
         spread_df["date"] = pd.to_datetime(spread_df["date"], errors="coerce")
     else:
         if not allow_fetch:
-            code = f"{base_contract} - {'/'.join(contract for contract in contracts if contract != base_contract)}"
-            return _missing_item("期货价差", code, "期货价差")
+            return _missing_item("期货价差", configured_code, configured_name)
         try:
-            data, errors = fetch_contracts(contracts, max_workers=max_workers, api_key=api_key)
+            if realtime_preview and cached_df is not None and cache_ready:
+                data = {}
+                errors = []
+                today = pd.Timestamp.now(tz="Asia/Shanghai").date()
+                for contract in contracts:
+                    close_col = f"{contract}_close"
+                    contract_df = cached_df[["date", close_col]].rename(
+                        columns={close_col: "close"}
+                    )
+                    contract_df = append_futures_spot_row(
+                        contract_df,
+                        contract,
+                        replace_current_day=True,
+                    )
+                    latest_contract_date = pd.to_datetime(
+                        contract_df["date"], errors="coerce"
+                    ).max()
+                    if (
+                        pd.isna(latest_contract_date)
+                        or latest_contract_date.date() != today
+                    ):
+                        raise RuntimeError(f"{contract} 实时源未返回今日行情")
+                    data[contract] = contract_df
+            else:
+                data, errors = fetch_contracts(
+                    contracts,
+                    max_workers=max_workers,
+                    api_key=api_key,
+                    prefer_realtime_snapshot=realtime_preview,
+                )
             latest_spread_df = calculate_spreads(data, base_contract)
             spread_df = (
-                _merge_by_date(cached_df, latest_spread_df, "date")
+                _merge_current_day_refresh(cached_df, latest_spread_df, "date")
                 if cached_df is not None and cache_ready
                 else latest_spread_df
             )
@@ -940,7 +1675,14 @@ def load_or_fetch_spread(
                 )
         except Exception as exc:
             if cached_df is None or not cache_ready:
-                return PositionItem("期货价差", base_contract, "期货价差", "失败", source="TickFlow/AkShare", error=str(exc))
+                return PositionItem(
+                    "期货价差",
+                    configured_code,
+                    configured_name,
+                    "失败",
+                    source="TickFlow/AkShare",
+                    error=str(exc),
+                )
             spread_df = cached_df.copy()
             spread_df["date"] = pd.to_datetime(spread_df["date"], errors="coerce")
             source = "本地缓存（刷新失败）"
@@ -950,7 +1692,14 @@ def load_or_fetch_spread(
     available_contracts = [contract for contract in contracts if f"{contract}_close" in spread_df.columns]
     summary_df = build_spread_summary(spread_df, available_contracts, base_contract)
     if summary_df.empty:
-        return PositionItem("期货价差", base_contract, "期货价差", "失败", source=source, error="没有可展示的价差统计。")
+        return PositionItem(
+            "期货价差",
+            configured_code,
+            configured_name,
+            "失败",
+            source=source,
+            error="没有可展示的价差统计。",
+        )
 
     other_contract = next((contract for contract in available_contracts if contract != base_contract), "")
     spread_col = f"spread_{base_contract}_vs_{other_contract}"
@@ -982,7 +1731,7 @@ def load_or_fetch_spread(
     return PositionItem(
         category="期货价差",
         code=code,
-        name=f"{contract_name(base_contract)} - {contract_name(other_contract)}" if other_contract else contract_name(base_contract),
+        name=format_spread_position_name(base_contract, other_contract),
         status=status,
         source=source,
         latest_date=latest_date,
@@ -1006,6 +1755,7 @@ def load_or_fetch_option(
     allow_fetch: bool = True,
     force_refresh: bool = False,
     save_to_cache: bool = True,
+    realtime_preview: bool = False,
 ) -> PositionItem:
     raw_code = code.strip()
     cache_candidates = _futures_option_cache_candidates(raw_code, period, int(count))
@@ -1028,24 +1778,36 @@ def load_or_fetch_option(
         if not allow_fetch:
             return _missing_item("期权", raw_code, normalize_option_symbol(raw_code))
         try:
-            result = fetch_futures_option_data(
-                raw_symbol=raw_code,
-                data_type=DATA_TYPE_OPTIONS,
-                period=period,
-                count=int(count),
-                api_key="",
-                use_free=True,
-                ma_periods=ma_periods,
-            )
-            latest_result_df = result.dataframe.copy()
+            if realtime_preview and cached_df is not None:
+                latest_result_df = append_option_spot_row(
+                    cached_df,
+                    raw_code,
+                    replace_current_day=True,
+                )
+                result_source = "AkShare期权实时快照"
+                result_is_chain = False
+            else:
+                result = fetch_futures_option_data(
+                    raw_symbol=raw_code,
+                    data_type=DATA_TYPE_OPTIONS,
+                    period=period,
+                    count=int(count),
+                    api_key="",
+                    use_free=True,
+                    ma_periods=ma_periods,
+                    prefer_realtime_snapshot=realtime_preview,
+                )
+                latest_result_df = result.dataframe.copy()
+                result_source = result.source
+                result_is_chain = result.is_chain
             result_df = (
-                _merge_by_date(cached_df, latest_result_df, "date")
+                _merge_current_day_refresh(cached_df, latest_result_df, "date")
                 if cached_df is not None
                 else latest_result_df
             )
-            if not result.is_chain and "_data_version" not in result_df.columns:
+            if not result_is_chain and "_data_version" not in result_df.columns:
                 result_df["_data_version"] = FUTURES_OPTION_DATA_VERSION
-            source = result.source
+            source = result_source
             status = "已增量更新" if cached_df is not None else "已更新"
             error = ""
         except Exception as exc:
@@ -1101,3 +1863,52 @@ def load_or_fetch_option(
         dataframe=result_df,
         error=error,
     )
+
+
+def refresh_position_derivative_items(
+    items: list[PositionItem],
+    *,
+    api_key: str = "",
+    max_workers: int = 2,
+    option_count: int = 500,
+) -> tuple[list[PositionItem], list[str]]:
+    refreshed: list[PositionItem] = []
+    errors: list[str] = []
+    for item in items:
+        if item.category == "期货价差":
+            contracts = [part.strip() for part in item.code.split(" - ") if part.strip()]
+            if len(contracts) < 2:
+                errors.append(f"{item.name}: 无法识别价差合约")
+                continue
+            latest = load_or_fetch_spread(
+                contracts,
+                base_contract=contracts[0],
+                api_key=api_key,
+                max_workers=max_workers,
+                allow_fetch=True,
+                force_refresh=True,
+                save_to_cache=False,
+                realtime_preview=True,
+            )
+        elif item.category == "期权":
+            latest = load_or_fetch_option(
+                item.code,
+                count=option_count,
+                allow_fetch=True,
+                force_refresh=True,
+                save_to_cache=False,
+                realtime_preview=True,
+            )
+        else:
+            continue
+
+        if latest.status == "失败" or "刷新失败" in latest.source:
+            errors.append(f"{item.name}: {latest.error or latest.source}")
+            continue
+        latest_date = pd.to_datetime(latest.latest_date, errors="coerce")
+        today = pd.Timestamp.now(tz="Asia/Shanghai").date()
+        if pd.isna(latest_date) or latest_date.date() != today:
+            errors.append(f"{item.name}: 实时源未返回今日行情")
+            continue
+        refreshed.append(latest)
+    return refreshed, errors

@@ -13,6 +13,8 @@ from services.index_ma20 import (
     INDEX_CONFIG,
     INDEX_FINAL_HISTORY_SOURCE,
     INDEX_SOURCE_CORRECTION_SOURCE,
+    fetch_yahoo_chart_payload,
+    missing_recent_market_trade_dates,
     raw_cache_symbol,
     source_correction_start,
 )
@@ -440,6 +442,13 @@ def find_pending_post_close_index_names(
         if pd.isna(latest_date) or latest_date.date() < target_date:
             pending.add(index_name)
             continue
+        if missing_recent_market_trade_dates(
+            finalized_raw,
+            str(config.get("market_group") or ""),
+            target_date,
+        ):
+            pending.add(index_name)
+            continue
         correction_start = source_correction_start(config)
         if correction_start is None or target_date < correction_start.date():
             continue
@@ -521,17 +530,13 @@ def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | N
 
 
 def _fetch_yahoo_quote(index_name: str, symbol: str) -> dict[str, object] | None:
-    import requests
-
     try:
-        response = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            params={"range": "1d", "interval": "1m"},
-            headers={"User-Agent": "Mozilla/5.0"},
+        payload = fetch_yahoo_chart_payload(
+            symbol,
+            {"range": "1d", "interval": "1m"},
             timeout=8,
         )
-        response.raise_for_status()
-        results = response.json().get("chart", {}).get("result") or []
+        results = payload.get("chart", {}).get("result") or []
         if not results:
             return None
         meta = results[0].get("meta") or {}
