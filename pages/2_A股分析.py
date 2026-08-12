@@ -112,6 +112,20 @@ with st.sidebar:
 source_df = None
 result = None
 cache_source = "eastmoney"
+analysis_state_key = "a_share_analysis_source"
+analysis_state = st.session_state.get(analysis_state_key, {})
+fresh_analysis = False
+
+
+def restore_analysis_source(mode: str, identity: tuple[object, ...]):
+    if analysis_state.get("mode") != mode or analysis_state.get("identity") != identity:
+        return None
+    saved = analysis_state.get("source_df")
+    if saved is None or saved.empty:
+        return None
+    return saved.copy(), str(analysis_state.get("fund_name") or ""), str(
+        analysis_state.get("cache_source") or ""
+    )
 
 if input_mode == "场外基金":
     with st.form("fund_code_form"):
@@ -124,11 +138,24 @@ if input_mode == "场外基金":
             max_workers = st.number_input("并发数", min_value=1, max_value=12, value=8, step=1)
         submitted = st.form_submit_button("拉取并分析", type="primary")
 
+    input_identity = ("场外基金", fund_code.strip(), bool(full_history))
     if not submitted:
-        st.info("输入场外基金 6 位代码后点击「拉取并分析」。场外基金使用东方财富累计净值。")
-        st.stop()
+        restored = restore_analysis_source(input_mode, input_identity)
+        if restored is None:
+            st.info("输入场外基金 6 位代码后点击「拉取并分析」。场外基金使用东方财富累计净值。")
+            st.stop()
+        source_df, fund_name, cache_source = restored
+        _, nav_df = normalize_nav_dataframe(source_df, fallback_name=fund_name)
+        result = analyze_fund_nav(
+            nav_df,
+            fund_name=fund_name,
+            ma_periods=ma_periods,
+            rsi_period=int(rsi_period),
+            base_date=base_date.strftime("%Y-%m-%d"),
+        )
 
-    try:
+    if submitted:
+      try:
         fund_code = fund_code.strip()
         raw_symbol = f"fund_nav_{fund_code}_{'full' if full_history else 'latest'}"
         cached_df, cache_meta = _load_cache(
@@ -176,9 +203,10 @@ if input_mode == "场外基金":
             rsi_period=int(rsi_period),
             base_date=base_date.strftime("%Y-%m-%d"),
         )
-    except Exception as exc:
-        st.error(f"分析失败：{exc}")
-        st.stop()
+        fresh_analysis = True
+      except Exception as exc:
+          st.error(f"分析失败：{exc}")
+          st.stop()
 elif input_mode == "场内基金/股票":
     with st.form("exchange_fund_form"):
         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
@@ -192,12 +220,25 @@ elif input_mode == "场内基金/股票":
             api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         submitted = st.form_submit_button("拉取并分析", type="primary")
 
+    input_identity = ("场内基金/股票", fund_code.strip(), int(count), adjust_option)
     if not submitted:
-        st.info("输入场内基金或股票代码后点击「拉取并分析」。场内数据使用 TickFlow 日收盘价。")
-        st.stop()
+        restored = restore_analysis_source(input_mode, input_identity)
+        if restored is None:
+            st.info("输入场内基金或股票代码后点击「拉取并分析」。场内数据使用 TickFlow 日收盘价。")
+            st.stop()
+        source_df, fund_name, cache_source = restored
+        _, nav_df = normalize_nav_dataframe(source_df, fallback_name=fund_name)
+        result = analyze_fund_nav(
+            nav_df,
+            fund_name=fund_name,
+            ma_periods=ma_periods,
+            rsi_period=int(rsi_period),
+            base_date=base_date.strftime("%Y-%m-%d"),
+        )
 
     adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
-    try:
+    if submitted:
+      try:
         symbol = infer_tickflow_symbol(fund_code)
         adjust_value = adjust_map[adjust_option]
         raw_symbol = f"fund_close_{symbol}_{adjust_value or 'none'}"
@@ -251,9 +292,10 @@ elif input_mode == "场内基金/股票":
             base_date=base_date.strftime("%Y-%m-%d"),
         )
         cache_source = "tickflow"
-    except Exception as exc:
-        st.error(f"分析失败：{exc}")
-        st.stop()
+        fresh_analysis = True
+      except Exception as exc:
+          st.error(f"分析失败：{exc}")
+          st.stop()
 else:
     uploaded = st.file_uploader("上传 CSV / Excel 净值文件", type=["csv", "xlsx", "xls"])
     cache_source = "upload"
@@ -274,11 +316,22 @@ else:
             rsi_period=int(rsi_period),
             base_date=base_date.strftime("%Y-%m-%d"),
         )
+        input_identity = ("上传文件", uploaded.name, len(raw), hash(raw))
+        fresh_analysis = True
     except Exception as exc:
         st.error(f"分析失败：{exc}")
         st.stop()
 
-if save_to_cache:
+if fresh_analysis:
+    st.session_state[analysis_state_key] = {
+        "mode": input_mode,
+        "identity": input_identity,
+        "source_df": source_df.copy(),
+        "fund_name": fund_name,
+        "cache_source": cache_source,
+    }
+
+if save_to_cache and fresh_analysis:
     save_dataset(
         symbol=f"fund_analysis_{fund_name}",
         name=f"{fund_name} A股分析",

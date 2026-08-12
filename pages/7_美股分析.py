@@ -110,9 +110,28 @@ with st.form("us_stock_form"):
         api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     submitted = st.form_submit_button("拉取并分析", type="primary")
 
+analysis_state_key = "us_stock_analysis_source"
+analysis_state = st.session_state.get(analysis_state_key, {})
+input_identity = (symbol_text.strip().upper(), int(count), adjust_option)
+fresh_analysis = False
+
 if not submitted:
-    st.info("输入美股代码后点击「拉取并分析」。可输入 AAPL、MSFT、SPMO、COWZ 等。")
-    st.stop()
+    saved_source = analysis_state.get("source_df")
+    if analysis_state.get("identity") != input_identity or saved_source is None or saved_source.empty:
+        st.info("输入美股代码后点击「拉取并分析」。可输入 AAPL、MSFT、SPMO、COWZ 等。")
+        st.stop()
+    source_df = saved_source.copy()
+    symbol = str(analysis_state.get("symbol") or "")
+    stock_name, nav_df = normalize_nav_dataframe(source_df, fallback_name=symbol)
+    if stock_name == symbol:
+        stock_name = f"{symbol} 美股"
+    result = analyze_fund_nav(
+        nav_df,
+        fund_name=stock_name,
+        ma_periods=ma_periods,
+        rsi_period=int(rsi_period),
+        base_date=base_date.strftime("%Y-%m-%d"),
+    )
 
 symbols = parse_us_symbols(symbol_text)
 if not symbols:
@@ -122,7 +141,8 @@ if len(symbols) > 1:
     st.warning("当前页面一次分析一个标的；已使用第一个代码。")
 
 adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
-try:
+if submitted:
+ try:
     symbol = infer_us_symbol(symbols[0])
     adjust_value = adjust_map[adjust_option]
     raw_symbol = f"us_daily_{symbol}_{adjust_value or 'none'}"
@@ -171,11 +191,19 @@ try:
         rsi_period=int(rsi_period),
         base_date=base_date.strftime("%Y-%m-%d"),
     )
-except Exception as exc:
-    st.error(f"分析失败：{exc}")
-    st.stop()
+    fresh_analysis = True
+ except Exception as exc:
+     st.error(f"分析失败：{exc}")
+     st.stop()
 
-if save_to_cache:
+if fresh_analysis:
+    st.session_state[analysis_state_key] = {
+        "identity": input_identity,
+        "source_df": source_df.copy(),
+        "symbol": symbol,
+    }
+
+if save_to_cache and fresh_analysis:
     save_dataset(
         symbol=f"us_analysis_{result.fund_name}",
         name=f"{result.fund_name} 美股分析",

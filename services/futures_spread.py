@@ -3,8 +3,16 @@ from __future__ import annotations
 import calendar
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from services.market_calendar import (
+    get_market_window,
+    is_market_trading_day,
+    latest_settled_trade_date,
+)
 
 
 CONTRACT_PREFIXES = {
@@ -194,8 +202,43 @@ def infer_tickflow_futures_symbol(contract: str) -> str:
     return f"{code_prefix}{month}.{exchange}"
 
 
-def _today_china() -> pd.Timestamp:
-    return pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+def _china_now(market_now: datetime | None = None) -> datetime:
+    if market_now is None:
+        return datetime.now(ZoneInfo("Asia/Shanghai"))
+    if market_now.tzinfo is None:
+        return market_now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return market_now.astimezone(ZoneInfo("Asia/Shanghai"))
+
+
+def _today_china(market_now: datetime | None = None) -> pd.Timestamp:
+    return pd.Timestamp(_china_now(market_now).date())
+
+
+def completed_futures_daily_cutoff(market_now: datetime | None = None) -> pd.Timestamp:
+    market = get_market_window("A股")
+    now = _china_now(market_now)
+    if market is None:
+        return pd.Timestamp(now.date()) - pd.Timedelta(days=1)
+    return pd.Timestamp(
+        latest_settled_trade_date(
+            market,
+            now,
+            settlement_delay=timedelta(minutes=5),
+        )
+    )
+
+
+def filter_completed_futures_daily(
+    df: pd.DataFrame,
+    *,
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty or "date" not in df.columns:
+        return df
+    result = df.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce")
+    cutoff = completed_futures_daily_cutoff(market_now)
+    return result[result["date"].dt.normalize() <= cutoff].reset_index(drop=True)
 
 
 def _spot_market_for_contract(contract: str) -> str:
@@ -211,14 +254,17 @@ def append_futures_spot_row(
     contract: str,
     *,
     replace_current_day: bool = False,
+    market_now: datetime | None = None,
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
     result = df.copy()
     result["date"] = pd.to_datetime(result["date"], errors="coerce")
-    today = _today_china()
-    if today.weekday() >= 5:
+    now = _china_now(market_now)
+    today = _today_china(now)
+    market = get_market_window("A股")
+    if market is None or not is_market_trading_day(market, now):
         return result
 
     latest_history_date = result["date"].dropna().max()
@@ -307,6 +353,7 @@ def fetch_futures_daily(
     api_key: str = "",
     *,
     prefer_realtime_snapshot: bool = False,
+    market_now: datetime | None = None,
 ) -> pd.DataFrame:
     tickflow_df = None
     tickflow_error = None
@@ -319,35 +366,40 @@ def fetch_futures_daily(
         akshare_df = fetch_futures_daily_from_akshare(contract)
     except Exception:
         if tickflow_df is not None:
-            return append_futures_spot_row(
-                tickflow_df,
-                contract,
-                replace_current_day=prefer_realtime_snapshot,
-            )
+            selected = tickflow_df
+            if prefer_realtime_snapshot:
+                return append_futures_spot_row(
+                    selected,
+                    contract,
+                    replace_current_day=True,
+                    market_now=market_now,
+                )
+            return filter_completed_futures_daily(selected, market_now=market_now)
         if tickflow_error is not None:
             raise tickflow_error
         raise
 
     if tickflow_df is None:
-        return append_futures_spot_row(
-            akshare_df,
-            contract,
-            replace_current_day=prefer_realtime_snapshot,
+        selected = akshare_df
+    else:
+        tickflow_latest = tickflow_df["date"].max()
+        akshare_latest = akshare_df["date"].max()
+        selected = (
+            akshare_df
+            if pd.notna(akshare_latest)
+            and pd.notna(tickflow_latest)
+            and akshare_latest > tickflow_latest
+            else tickflow_df
         )
 
-    tickflow_latest = tickflow_df["date"].max()
-    akshare_latest = akshare_df["date"].max()
-    if pd.notna(akshare_latest) and pd.notna(tickflow_latest) and akshare_latest > tickflow_latest:
+    if prefer_realtime_snapshot:
         return append_futures_spot_row(
-            akshare_df,
+            selected,
             contract,
-            replace_current_day=prefer_realtime_snapshot,
+            replace_current_day=True,
+            market_now=market_now,
         )
-    return append_futures_spot_row(
-        tickflow_df,
-        contract,
-        replace_current_day=prefer_realtime_snapshot,
-    )
+    return filter_completed_futures_daily(selected, market_now=market_now)
 
 
 def fetch_contracts(
@@ -356,6 +408,7 @@ def fetch_contracts(
     api_key: str = "",
     *,
     prefer_realtime_snapshot: bool = False,
+    market_now: datetime | None = None,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     data: dict[str, pd.DataFrame] = {}
     errors: list[str] = []
@@ -368,6 +421,7 @@ def fetch_contracts(
                 contract,
                 api_key=api_key,
                 prefer_realtime_snapshot=prefer_realtime_snapshot,
+                market_now=market_now,
             ): contract
             for contract in contracts
         }

@@ -24,6 +24,7 @@ from services.index_ma20 import (
     get_index_data_from_akshare_us,
     get_index_data_from_akshare_futures_main,
     get_index_data_from_cboe_vix,
+    missing_recent_market_trade_dates,
     overlay_finalized_index_rows,
     sanitize_index_report_market_dates,
     supplement_stale_yahoo_history,
@@ -40,7 +41,44 @@ from services.update_tasks import (
     persist_confirmed_index_report_row,
     refresh_cached_eastmoney_index_report,
     sync_index_long_history,
+    verify_updated_index_data,
 )
+
+
+class IndexUpdateVerificationTests(unittest.TestCase):
+    @patch("services.update_tasks.filter_completed_market_dates", side_effect=lambda data, _market: data)
+    @patch("services.update_tasks._verification_report")
+    @patch("services.update_tasks.load_dataset")
+    def test_verification_compares_same_target_date_without_overwriting(
+        self,
+        load_mock,
+        verification_report_mock,
+        _filter_mock,
+    ):
+        load_mock.return_value = (
+            pd.DataFrame({"trade_date": ["2026-08-10"], "close": [3600.0]}),
+            {},
+        )
+        verification_report_mock.return_value = (
+            pd.DataFrame(
+                {
+                    "日期": ["2026-08-10"],
+                    "上证指数_收盘价": [3603.6],
+                }
+            ),
+            "AkShare A股日线",
+        )
+
+        result = verify_updated_index_data(
+            {"上证指数"},
+            {"上证指数": "2026-08-10"},
+            api_key="test-key",
+            max_workers=1,
+        )
+
+        self.assertEqual(result.iloc[0]["复核结果"], "一致")
+        self.assertAlmostEqual(result.iloc[0]["偏差(%)"], 0.1)
+        self.assertEqual(result.iloc[0]["复核源"], "AkShare A股日线")
 
 
 class _FakeResponse:
@@ -366,6 +404,36 @@ class MarketAndCacheTests(unittest.TestCase):
         market_now = datetime(2026, 7, 13, 10, 0, tzinfo=ZoneInfo(market.timezone))
 
         self.assertEqual(str(latest_completed_trade_date(market, market_now)), "2026-07-10")
+
+    def test_recent_gap_check_uses_latest_twenty_trading_sessions(self):
+        market = get_market_window("A股")
+        target = pd.Timestamp("2026-10-09")
+        expected = []
+        current = target
+        while len(expected) < 20:
+            market_now = datetime.combine(
+                current.date(),
+                datetime.min.time(),
+                tzinfo=ZoneInfo(market.timezone),
+            )
+            if is_market_trading_day(market, market_now):
+                expected.append(current.date())
+            current -= pd.Timedelta(days=1)
+        expected.reverse()
+        complete = pd.DataFrame({"trade_date": pd.to_datetime(expected), "close": range(20)})
+
+        self.assertEqual(
+            missing_recent_market_trade_dates(complete, "A股", target),
+            [],
+        )
+
+        missing_session = expected[5]
+        incomplete = complete[complete["trade_date"].dt.date != missing_session]
+        self.assertEqual(
+            missing_recent_market_trade_dates(incomplete, "A股", target),
+            [missing_session],
+        )
+        self.assertGreater((target.date() - expected[0]).days, 20)
 
     def test_long_history_filter_excludes_current_open_session(self):
         class OpenSessionDateTime(datetime):
@@ -716,10 +784,23 @@ class MarketAndCacheTests(unittest.TestCase):
         self.assertEqual(still_above["测试指数_区间涨幅(%)"], 10.0)
 
     def test_index_detail_reads_long_history_cache_without_network(self):
+        market = get_market_window("美股")
+        dates = []
+        current = pd.Timestamp("2026-07-10")
+        while len(dates) < 20:
+            market_now = datetime.combine(
+                current.date(),
+                datetime.min.time(),
+                tzinfo=ZoneInfo(market.timezone),
+            )
+            if is_market_trading_day(market, market_now):
+                dates.append(current)
+            current -= pd.Timedelta(days=1)
+        dates.reverse()
         long_cached = pd.DataFrame(
             {
-                "trade_date": pd.to_datetime(["2026-07-09", "2026-07-10"]),
-                "close": [100.0, 101.0],
+                "trade_date": pd.to_datetime(dates),
+                "close": range(100, 120),
             }
         )
         config = {"source": "yahoo", "code": "^TEST", "market_group": "美股"}
@@ -738,7 +819,7 @@ class MarketAndCacheTests(unittest.TestCase):
         ):
             result = fetch_index_history("测试指数", config, days=10000)
 
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(result), 20)
         fetch_mock.assert_not_called()
         save_mock.assert_not_called()
 
@@ -756,7 +837,6 @@ class MarketAndCacheTests(unittest.TestCase):
                 "close": [466.6, 478.0, 516.0],
             }
         )
-        fetched = build_export_df(eastmoney_raw, "原油主连", days=30)
         config = INDEX_CONFIG["原油主连"]
 
         class ClosedSessionDateTime(datetime):
@@ -777,9 +857,10 @@ class MarketAndCacheTests(unittest.TestCase):
         with (
             patch("core.cache.load_dataset", side_effect=load_side_effect),
             patch("core.cache.save_dataset") as save_mock,
-            patch("services.index_ma20.fetch_index_from_source", return_value=fetched) as fetch_mock,
+            patch("services.index_ma20.fetch_index_from_source") as fetch_mock,
             patch("services.index_ma20.datetime", ClosedSessionDateTime),
         ):
+            fetch_mock.return_value = build_export_df(eastmoney_raw, "原油主连", days=30)
             result = fetch_index_history("原油主连", config, days=10000)
 
         fetch_mock.assert_called_once_with("原油主连", config, days=30)
@@ -940,14 +1021,22 @@ class MarketAndCacheTests(unittest.TestCase):
         )
         latest_raw = pd.DataFrame(
             {
-                "trade_date": pd.to_datetime(["2026-07-11", "2026-07-12"]),
+                "trade_date": pd.to_datetime(["2026-07-13", "2026-07-14"]),
                 "close": [400, 401],
             }
         )
         load_dataset_mock.return_value = (cached_raw, {})
-        fetch_mock.return_value = build_export_df(latest_raw, "微盘股", days=30)
 
-        result = fetch_index_report("微盘股", {"source": "eastmoney_kline", "code": "90.BK1158"}, "", 30)
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 14, 16, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        with patch("services.index_ma20.datetime", FixedDateTime):
+            fetch_mock.return_value = build_export_df(latest_raw, "微盘股", days=30)
+
+            result = fetch_index_report("微盘股", {"source": "eastmoney_kline", "code": "90.BK1158"}, "", 30)
 
         fetch_mock.assert_called_once_with(
             "微盘股",
@@ -1121,9 +1210,15 @@ class MarketAndCacheTests(unittest.TestCase):
             return None, None
 
         load_dataset_mock.side_effect = load_side_effect
-        fetch_mock.return_value = build_export_df(eastmoney_raw, "原油主连", days=30)
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 14, 16, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
 
-        result = fetch_index_report("原油主连", INDEX_CONFIG["原油主连"], "", 30)
+        with patch("services.index_ma20.datetime", FixedDateTime):
+            fetch_mock.return_value = build_export_df(eastmoney_raw, "原油主连", days=30)
+            result = fetch_index_report("原油主连", INDEX_CONFIG["原油主连"], "", 30)
 
         corrected = result.set_index("日期")["原油主连_收盘价"]
         self.assertEqual(corrected.loc["2026-07-10"], 466.6)
@@ -1211,13 +1306,22 @@ class MarketAndCacheTests(unittest.TestCase):
         )
         fetch_mock.return_value = build_export_df(latest_raw, "微盘股", days=1000)
 
-        result = fetch_index_report(
-            "微盘股",
-            {"source": "eastmoney_kline", "code": "90.BK1158"},
-            "",
-            30,
-            cached_report=cached_report,
-        )
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = datetime(2026, 7, 14, 16, 0)
+                return value.replace(tzinfo=tz) if tz is not None else value
+
+        with patch("services.index_ma20.datetime", FixedDateTime), patch(
+            "services.update_tasks.datetime", FixedDateTime
+        ):
+            result = fetch_index_report(
+                "微盘股",
+                {"source": "eastmoney_kline", "code": "90.BK1158"},
+                "",
+                30,
+                cached_report=cached_report,
+            )
 
         saved_raw = save_mock.call_args.kwargs["df"]
         self.assertEqual(len(saved_raw), 42)

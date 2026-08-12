@@ -57,7 +57,7 @@ st.markdown(
 
 render_page_header("指数监控", "跟踪主要指数、跨市场指数和期货主连相对 MA20 的位置与趋势。", eyebrow="Index Monitor")
 
-INDEX_UPDATE_WORKERS = 8
+INDEX_UPDATE_WORKERS = 4
 MA20_TABLE_EXCLUDED_INDEXES = {"VIX恐慌指数"}
 
 if "index_update_notice" not in st.session_state:
@@ -383,6 +383,11 @@ def centered_table(df: pd.DataFrame) -> None:
             border-collapse: collapse;
             font-size: 0.92rem;
         }}
+        .centered-summary-table-scroll {{
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }}
         .centered-summary-table th,
         .centered-summary-table td {{
             text-align: center;
@@ -395,10 +400,12 @@ def centered_table(df: pd.DataFrame) -> None:
             background: rgba(49, 51, 63, 0.04);
         }}
         </style>
+        <div class="centered-summary-table-scroll">
         <table class="centered-summary-table">
             <thead><tr>{headers}</tr></thead>
             <tbody>{''.join(rows)}</tbody>
         </table>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -500,7 +507,7 @@ def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
         else:
             status = "待更新"
             status_class = "stale"
-        display_day = market_now.date() if status == "休市" else latest_day
+        display_day = latest_day
 
         items.append(
             {

@@ -210,7 +210,7 @@ INDEX_FINAL_HISTORY_SOURCE = "index_final_history"
 INDEX_SOURCE_CORRECTION_SOURCE = "index_source_correction_history"
 INDEX_LONG_HISTORY_BARS = 20000
 INDEX_REPORT_DISPLAY_DAYS = 120
-INDEX_RECENT_GAP_LOOKBACK_DAYS = 14
+INDEX_RECENT_GAP_LOOKBACK_SESSIONS = 20
 CFFEX_FUTURES_MAIN_PRODUCTS = {
     "IC0": "中证500指数期货",
     "IM0": "中证1000股指期货",
@@ -237,14 +237,13 @@ def missing_recent_market_trade_dates(
     market_name: str,
     target_date,
     *,
-    lookback_days: int = INDEX_RECENT_GAP_LOOKBACK_DAYS,
+    lookback_sessions: int = INDEX_RECENT_GAP_LOOKBACK_SESSIONS,
 ) -> list:
-    """Return completed market sessions missing from a recent local cache window."""
+    """Return missing sessions among the latest completed market trading days."""
     market = get_market_window(str(market_name or ""))
     if market is None or target_date is None:
         return []
     target = pd.Timestamp(target_date).date()
-    start = target - timedelta(days=max(int(lookback_days), 1))
     observed: set = set()
     if history_df is not None and not history_df.empty and "trade_date" in history_df.columns:
         observed = set(
@@ -253,14 +252,14 @@ def missing_recent_market_trade_dates(
             .dt.date
             .tolist()
         )
-    if observed:
-        start = max(start, min(observed))
     expected = []
-    current = start
-    while current <= target:
+    current = target
+    required_sessions = max(int(lookback_sessions), 1)
+    while len(expected) < required_sessions:
         if current.weekday() < 5 and not is_market_holiday(market, current):
             expected.append(current)
-        current += timedelta(days=1)
+        current -= timedelta(days=1)
+    expected.reverse()
     return [day for day in expected if day not in observed]
 
 

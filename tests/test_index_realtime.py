@@ -14,6 +14,7 @@ from services.index_realtime import (
     _infer_main_contract_symbol,
     _market_is_open,
     apply_realtime_quotes_to_summary,
+    build_pending_index_update_preview,
     daily_update_eligible_index_names,
     fetch_futures_main_contract_names,
     format_index_display_name,
@@ -28,6 +29,30 @@ from services.index_realtime import (
 
 
 class IndexRealtimeTests(unittest.TestCase):
+    @patch("services.index_realtime.missing_recent_market_trade_dates", return_value=[])
+    @patch("services.index_realtime.load_dataset")
+    @patch("services.index_realtime._daily_update_target")
+    @patch("services.index_realtime.find_pending_post_close_index_names", return_value={"上证指数"})
+    def test_pending_update_preview_is_built_from_cache_only(
+        self,
+        _pending_mock,
+        target_mock,
+        load_mock,
+        _missing_mock,
+    ):
+        target_mock.return_value = pd.Timestamp("2026-08-10").date()
+        load_mock.return_value = (
+            pd.DataFrame({"trade_date": ["2026-08-08"], "close": [3600.0]}),
+            {},
+        )
+
+        preview = build_pending_index_update_preview(tickflow_enabled=True)
+
+        self.assertEqual(preview.iloc[0]["指数"], "上证指数")
+        self.assertEqual(preview.iloc[0]["目标交易日"], "2026-08-10")
+        self.assertEqual(preview.iloc[0]["主更新源"], "TickFlow 日线")
+        self.assertEqual(preview.iloc[0]["复核源"], "AkShare A股日线")
+
     def test_new_indexes_are_in_requested_card_order(self):
         names = list(INDEX_CONFIG)
 
@@ -45,7 +70,9 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertNotIn("盘中卡片每10分钟自动刷新", page_source)
         self.assertIn('[data-stale="true"]', page_source)
         self.assertIn("opacity: 1 !important", page_source)
-        self.assertIn('display_day = market_now.date() if status == "休市" else latest_day', page_source)
+        self.assertIn("INDEX_UPDATE_WORKERS = 4", page_source)
+        self.assertIn("display_day = latest_day", page_source)
+        self.assertIn('class="centered-summary-table-scroll"', page_source)
 
     def test_manual_lunch_quote_is_requested_only_once_for_mainland_instruments(self):
         lunch_time = datetime(2026, 7, 15, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -404,8 +431,9 @@ class IndexRealtimeTests(unittest.TestCase):
 
         self.assertEqual(pending, {"沪深300", "恒生科技", "日经225", "韩国KOSPI"})
 
+    @patch("services.index_realtime.missing_recent_market_trade_dates", return_value=[])
     @patch("services.index_realtime.load_dataset")
-    def test_pending_daily_update_uses_finalized_cache_date(self, load_dataset_mock):
+    def test_pending_daily_update_uses_finalized_cache_date(self, load_dataset_mock, _gap_mock):
         def load_side_effect(symbol, _source, _data_type):
             latest = "2026-07-13" if "日经225" in symbol else "2026-07-14"
             return pd.DataFrame({"trade_date": [latest], "close": [100.0]}), {}
@@ -469,6 +497,18 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertTrue(_futures_market_is_open("AU0", now=after_iron_ore_close))
         self.assertFalse(_futures_market_is_open("I0", now=section_break))
         self.assertFalse(_futures_market_is_open("I0", now=closed_time))
+
+    def test_futures_friday_night_continues_into_saturday(self):
+        friday_night = datetime(2026, 7, 17, 23, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        saturday_early = datetime(2026, 7, 18, 1, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        self.assertTrue(_futures_market_is_open("AU0", now=friday_night))
+        self.assertTrue(_futures_market_is_open("AU0", now=saturday_early))
+        self.assertFalse(_futures_market_is_open("IC0", now=saturday_early))
+
+    def test_futures_early_session_rejects_holiday_previous_day(self):
+        holiday_early = datetime(2026, 10, 2, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertFalse(_futures_market_is_open("AU0", now=holiday_early))
 
     @patch("services.index_realtime._fetch_futures_quote")
     @patch("services.index_realtime._fetch_yahoo_quote")

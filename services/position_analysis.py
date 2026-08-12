@@ -62,6 +62,9 @@ DEFAULT_ETF_CODES = [
     "159915",
     "510500",
     "159967",
+    "159552",
+    "513310",
+    "513880",
 ]
 DEFAULT_SPREAD_CONTRACTS = ["I2609", "I2705"]
 DEFAULT_SPREAD_GROUPS = [
@@ -95,6 +98,9 @@ ETF_DISPLAY_NAMES = {
     "159915": "创业板ETF易方达",
     "510500": "中证500ETF南方",
     "159967": "创业板成长ETF华夏",
+    "159552": "中证2000增强ETF招商",
+    "513310": "中韩半导体ETF华泰柏瑞",
+    "513880": "日经225ETF华安",
 }
 
 ETF_TIMING_STRATEGIES = {
@@ -109,8 +115,35 @@ ETF_TIMING_STRATEGIES = {
     "159545": (10, 1.0),
     "159967": (25, 2.0),
     "518850": (30, 1.5),
+    "159552": (10, 2.5),
+    "513310": (15, 0.5),
+    "513880": (10, 2.0),
 }
 ETF_TIMING_TABLE_EXCLUDED_CODES = {"512890"}
+ETF_PORTFOLIO_WEIGHTS_PCT = {
+    "159201": 5,
+    "159545": 10,
+    "159655": 10,
+    "159501": 15,
+    "518850": 10,
+    "510500": 10,
+    "159967": 10,
+    "159552": 10,
+    "513310": 10,
+    "513880": 10,
+}
+ETF_512890_TRANSFER_SOURCE_CODES = {
+    "588000",
+    "159915",
+    "510500",
+    "159967",
+    "159552",
+}
+ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES = (
+    "510500",
+    "159967",
+    "159552",
+)
 ETF_POSITION_STRATEGIES = {
     "159655": "半仓持有半仓择时",
     "159501": "半仓持有半仓择时",
@@ -123,6 +156,9 @@ ETF_POSITION_STRATEGIES = {
     "159915": "纯择时",
     "510500": "纯择时",
     "159967": "纯择时",
+    "159552": "纯择时",
+    "513310": "纯择时",
+    "513880": "纯择时",
 }
 ETF_AKSHARE_HISTORY_CODES = {"161128"}
 ETF_SINA_REALTIME_FALLBACK_CODES = {"161128"}
@@ -358,10 +394,18 @@ def filter_current_etf_realtime_quotes(
     quotes: dict[str, dict[str, object]] | None,
     *,
     market_now: datetime | None = None,
+    retain_after_close: bool = False,
 ) -> dict[str, dict[str, object]]:
-    """Keep session quotes only during their same-day intraday display window."""
+    """Keep same-day quotes intraday, optionally until the formal close is ready."""
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
-    if not etf_intraday_quote_ready(market_now):
+    market = get_market_window("A股")
+    after_close_retention = bool(
+        retain_after_close
+        and market is not None
+        and is_market_trading_day(market, market_now)
+        and market_now.time() >= ETF_FINAL_CLOSE_READY_TIME
+    )
+    if not etf_intraday_quote_ready(market_now) and not after_close_retention:
         return {}
 
     current: dict[str, dict[str, object]] = {}
@@ -427,13 +471,23 @@ def apply_etf_realtime_quote_to_timing(
     quote: dict[str, object],
     *,
     market_now: datetime | None = None,
+    allow_close_retention: bool = False,
 ) -> PositionItem:
     """Build an intraday timing preview without changing formal history."""
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     is_morning_preview = etf_morning_timing_preview_ready(market_now)
     is_closing_preview = etf_realtime_timing_ready(market_now)
     is_lunch_preview = etf_lunch_timing_preview_ready(market_now)
-    if not is_morning_preview and not is_closing_preview and not is_lunch_preview:
+    is_close_retention = bool(
+        allow_close_retention
+        and market_now.time() >= ETF_REALTIME_TIMING_END_TIME
+    )
+    if (
+        not is_morning_preview
+        and not is_closing_preview
+        and not is_lunch_preview
+        and not is_close_retention
+    ):
         return item
 
     base_code = normalize_etf_base_code(item.code)
@@ -494,14 +548,18 @@ def apply_etf_realtime_quote_to_timing(
         code=quoted_item.code,
         name=quoted_item.name,
         status=(
-            "实时预判"
+            "收盘待确认"
+            if is_close_retention
+            else "实时预判"
             if is_closing_preview
             else "午间预判"
             if is_lunch_preview
             else "早盘预判"
         ),
         source=(
-            "TickFlow实时行情（14:50-15:00择时预判，不写入缓存）"
+            "TickFlow当天最后行情（待正式收盘确认，不写入缓存）"
+            if is_close_retention
+            else "TickFlow实时行情（14:50-15:00择时预判，不写入缓存）"
             if is_closing_preview
             else "TickFlow午间收盘行情（择时预判，不写入缓存）"
             if is_lunch_preview
@@ -709,6 +767,200 @@ def calculate_etf_timing_transitions(
     return pd.DataFrame(rows, columns=columns)
 
 
+def _calculate_etf_timing_position_series(
+    df: pd.DataFrame | None,
+    *,
+    ma_period: int,
+    threshold_pct: float,
+) -> pd.Series:
+    if df is None or df.empty or not {"date", "price"}.issubset(df.columns):
+        return pd.Series(dtype="int64")
+    data = df[["date", "price"]].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    data["price"] = pd.to_numeric(data["price"], errors="coerce")
+    data = (
+        data.dropna(subset=["date", "price"])
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    if data.empty:
+        return pd.Series(dtype="int64")
+
+    ma_values = data["price"].rolling(window=int(ma_period)).mean()
+    threshold = float(threshold_pct) / 100
+    position = 0
+    dates: list[pd.Timestamp] = []
+    positions: list[int] = []
+    for row_index, row in data.iterrows():
+        ma_value = pd.to_numeric(ma_values.iloc[row_index], errors="coerce")
+        if pd.isna(ma_value):
+            continue
+        price = float(row["price"])
+        if price > float(ma_value) * (1 + threshold):
+            position = 1
+        elif price < float(ma_value) * (1 - threshold):
+            position = 0
+        dates.append(pd.Timestamp(row["date"]))
+        positions.append(position)
+    return pd.Series(positions, index=pd.DatetimeIndex(dates), dtype="int64")
+
+
+def _timing_action_position(value: object) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    action = str(value)
+    if action in {"买入", "持有", "加至满仓"}:
+        return 1
+    if action in {"卖出", "空仓", "降至半仓", "等待均线"}:
+        return 0
+    return None
+
+
+def calculate_512890_parking_snapshot(items: list[PositionItem]) -> dict[str, object]:
+    etf_items = {
+        normalize_etf_base_code(item.code): item
+        for item in items
+        if item.category == "ETF"
+    }
+    parking_item = etf_items.get("512890")
+    if parking_item is None:
+        return {}
+
+    source_series: dict[str, pd.Series] = {}
+    current_source_positions: dict[str, int] = {}
+    latest_date_candidates: list[pd.Timestamp] = []
+    for code in ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES:
+        item = etf_items.get(code)
+        strategy = ETF_TIMING_STRATEGIES.get(code)
+        if item is None or strategy is None:
+            continue
+        series = _calculate_etf_timing_position_series(
+            item.dataframe,
+            ma_period=int(strategy[0]),
+            threshold_pct=float(strategy[1]),
+        )
+        if not series.empty:
+            source_series[code] = series
+        current_position = _timing_action_position(item.metrics.get("择时判断"))
+        if current_position is None and not series.empty:
+            current_position = int(series.iloc[-1])
+        if current_position is not None:
+            current_source_positions[code] = current_position
+        latest_date = pd.to_datetime(item.latest_date, errors="coerce")
+        if pd.notna(latest_date):
+            latest_date_candidates.append(pd.Timestamp(latest_date).normalize())
+
+    parking_prices = pd.Series(dtype="float64")
+    if parking_item.dataframe is not None and {"date", "price"}.issubset(
+        parking_item.dataframe.columns
+    ):
+        parking_history = parking_item.dataframe[["date", "price"]].copy()
+        parking_history["date"] = pd.to_datetime(
+            parking_history["date"], errors="coerce"
+        ).dt.normalize()
+        parking_history["price"] = pd.to_numeric(parking_history["price"], errors="coerce")
+        parking_history = (
+            parking_history.dropna(subset=["date", "price"])
+            .sort_values("date")
+            .drop_duplicates(subset=["date"], keep="last")
+        )
+        parking_prices = parking_history.set_index("date")["price"]
+    parking_latest_date = pd.to_datetime(parking_item.latest_date, errors="coerce")
+    if pd.notna(parking_latest_date):
+        latest_date_candidates.append(pd.Timestamp(parking_latest_date).normalize())
+
+    transitions: list[dict[str, object]] = []
+    formal_latest_state = 0
+    formal_latest_date = pd.NaT
+    if len(source_series) == len(ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES):
+        first_common_ready_date = max(series.index.min() for series in source_series.values())
+        combined_positions = pd.concat(source_series, axis=1).sort_index()
+        combined_positions = combined_positions.loc[first_common_ready_date:].ffill().dropna()
+        if not combined_positions.empty:
+            parking_states = combined_positions.eq(0).any(axis=1).astype(int)
+            previous_state = 0
+            for transition_date, parking_state in parking_states.items():
+                state = int(parking_state)
+                if state != previous_state:
+                    transition_price = pd.to_numeric(
+                        parking_prices.get(pd.Timestamp(transition_date)), errors="coerce"
+                    )
+                    transitions.append(
+                        {
+                            "date": pd.Timestamp(transition_date),
+                            "state": state,
+                            "price": transition_price,
+                        }
+                    )
+                previous_state = state
+            formal_latest_state = int(parking_states.iloc[-1])
+            formal_latest_date = pd.Timestamp(parking_states.index[-1])
+
+    all_current_states_ready = len(current_source_positions) == len(
+        ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES
+    )
+    empty_source_count = (
+        sum(position == 0 for position in current_source_positions.values())
+        if all_current_states_ready
+        else None
+    )
+    current_state = int(empty_source_count > 0) if empty_source_count is not None else None
+    current_date = max(latest_date_candidates) if latest_date_candidates else formal_latest_date
+    latest_price = pd.to_numeric(parking_item.metrics.get("最新价"), errors="coerce")
+    if pd.isna(latest_price) and not parking_prices.empty:
+        latest_price = float(parking_prices.iloc[-1])
+
+    if (
+        current_state is not None
+        and pd.notna(current_date)
+        and (pd.isna(formal_latest_date) or current_date > formal_latest_date)
+        and current_state != formal_latest_state
+    ):
+        transitions.append(
+            {
+                "date": pd.Timestamp(current_date),
+                "state": current_state,
+                "price": latest_price,
+            }
+        )
+
+    latest_transition = transitions[-1] if transitions else None
+    previous_transition = transitions[-2] if len(transitions) >= 2 else None
+    interval_return_pct = pd.NA
+    previous_interval_return_pct = pd.NA
+    if latest_transition is not None:
+        transition_price = pd.to_numeric(latest_transition["price"], errors="coerce")
+        if pd.notna(latest_price) and pd.notna(transition_price) and float(transition_price) != 0:
+            interval_return_pct = (float(latest_price) / float(transition_price) - 1) * 100
+    if latest_transition is not None and previous_transition is not None:
+        transition_price = pd.to_numeric(latest_transition["price"], errors="coerce")
+        previous_price = pd.to_numeric(previous_transition["price"], errors="coerce")
+        if pd.notna(transition_price) and pd.notna(previous_price) and float(previous_price) != 0:
+            previous_interval_return_pct = (
+                float(transition_price) / float(previous_price) - 1
+            ) * 100
+
+    return {
+        "组合权重比例": f"{empty_source_count * 10}%" if empty_source_count is not None else "-",
+        "择时判断": (
+            "持有" if current_state == 1 else "空仓" if current_state == 0 else "-"
+        ),
+        "状态转换时间": (
+            pd.Timestamp(latest_transition["date"]).strftime("%Y-%m-%d")
+            if latest_transition is not None
+            else "-"
+        ),
+        "策略区间涨幅(%)": interval_return_pct,
+        "上一状态转换时间": (
+            pd.Timestamp(previous_transition["date"]).strftime("%Y-%m-%d")
+            if previous_transition is not None
+            else "-"
+        ),
+        "策略上一区间涨幅(%)": previous_interval_return_pct,
+    }
+
+
 def build_recent_etf_operation_guidance(
     items: list[PositionItem],
     *,
@@ -728,6 +980,29 @@ def build_recent_etf_operation_guidance(
     end_date = max(latest_dates).normalize()
     start_date = end_date - pd.Timedelta(days=max(int(days), 1) - 1)
     rows = []
+    parking_item = next(
+        (
+            item
+            for item in items
+            if item.category == "ETF" and normalize_etf_base_code(item.code) == "512890"
+        ),
+        None,
+    )
+    parking_prices = pd.Series(dtype="float64")
+    if parking_item is not None and parking_item.dataframe is not None:
+        parking_history = parking_item.dataframe.copy()
+        if {"date", "price"}.issubset(parking_history.columns):
+            parking_history["date"] = pd.to_datetime(
+                parking_history["date"], errors="coerce"
+            ).dt.normalize()
+            parking_history["price"] = pd.to_numeric(parking_history["price"], errors="coerce")
+            parking_history = (
+                parking_history.dropna(subset=["date", "price"])
+                .sort_values("date")
+                .drop_duplicates(subset=["date"], keep="last")
+            )
+            parking_prices = parking_history.set_index("date")["price"]
+    parking_buys: dict[pd.Timestamp, set[str]] = {}
     for item in items:
         if item.category != "ETF":
             continue
@@ -770,6 +1045,28 @@ def build_recent_etf_operation_guidance(
                     "触发收盘价": round(float(transition["收盘价"]), 3),
                 }
             )
+            if (
+                raw_action == "卖出"
+                and base_code in ETF_512890_TRANSFER_SOURCE_CODES
+                and ETF_PORTFOLIO_WEIGHTS_PCT.get(base_code, 0) > 0
+            ):
+                transition_date = pd.Timestamp(transition["日期"]).normalize()
+                parking_buys.setdefault(transition_date, set()).add(base_code)
+    for transition_date, source_codes in parking_buys.items():
+        parking_price = pd.to_numeric(parking_prices.get(transition_date), errors="coerce")
+        rows.append(
+            {
+                "日期": transition_date.strftime("%Y-%m-%d"),
+                "ETF名称": ETF_DISPLAY_NAMES["512890"],
+                "代码": "512890",
+                "策略参数": f"承接{'、'.join(sorted(source_codes))}空仓资金",
+                "操作指引": "买入",
+                "操作后仓位": "持有",
+                "触发收盘价": (
+                    round(float(parking_price), 3) if pd.notna(parking_price) else pd.NA
+                ),
+            }
+        )
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns).sort_values(
@@ -781,6 +1078,7 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
     columns = [
         "ETF名称",
         "代码",
+        "组合权重比例",
         "最新价",
         "当日涨跌幅(%)",
         "策略参数",
@@ -793,26 +1091,43 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
         "上一区间涨幅(%)",
     ]
     rows = []
+    parking_snapshot = calculate_512890_parking_snapshot(items)
     for item in items:
         if item.category != "ETF":
             continue
         base_code = normalize_etf_base_code(item.code)
-        if base_code in ETF_TIMING_TABLE_EXCLUDED_CODES:
-            continue
+        is_parking_etf = base_code == "512890"
         row = {
             "ETF名称": display_etf_name(base_code, item.name),
             "代码": base_code,
+            "组合权重比例": (
+                parking_snapshot.get("组合权重比例", "-")
+                if is_parking_etf
+                else f"{ETF_PORTFOLIO_WEIGHTS_PCT.get(base_code, 0):g}%"
+            ),
             "最新价": item.metrics.get("最新价"),
             "当日涨跌幅(%)": item.metrics.get("日涨跌(%)"),
-            "策略参数": pd.NA,
-            "对应均线": pd.NA,
-            "偏离率(%)": pd.NA,
-            "择时判断": pd.NA,
-            "状态转换时间": pd.NA,
-            "区间涨幅(%)": pd.NA,
-            "上一状态转换时间": pd.NA,
-            "上一区间涨幅(%)": pd.NA,
+            "策略参数": "-" if is_parking_etf else pd.NA,
+            "对应均线": "-" if is_parking_etf else pd.NA,
+            "偏离率(%)": "-" if is_parking_etf else pd.NA,
+            "择时判断": "-" if is_parking_etf else pd.NA,
+            "状态转换时间": "-" if is_parking_etf else pd.NA,
+            "区间涨幅(%)": "-" if is_parking_etf else pd.NA,
+            "上一状态转换时间": "-" if is_parking_etf else pd.NA,
+            "上一区间涨幅(%)": "-" if is_parking_etf else pd.NA,
         }
+        if is_parking_etf:
+            row.update(
+                {
+                    "择时判断": parking_snapshot.get("择时判断", "-"),
+                    "状态转换时间": parking_snapshot.get("状态转换时间", "-"),
+                    "区间涨幅(%)": parking_snapshot.get("策略区间涨幅(%)", pd.NA),
+                    "上一状态转换时间": parking_snapshot.get("上一状态转换时间", "-"),
+                    "上一区间涨幅(%)": parking_snapshot.get(
+                        "策略上一区间涨幅(%)", pd.NA
+                    ),
+                }
+            )
         if base_code in ETF_TIMING_STRATEGIES:
             ma_period, threshold_pct = ETF_TIMING_STRATEGIES[base_code]
             row.update(
@@ -1594,6 +1909,7 @@ def load_or_fetch_spread(
     force_refresh: bool = False,
     save_to_cache: bool = True,
     realtime_preview: bool = False,
+    market_now: datetime | None = None,
 ) -> PositionItem:
     contracts = [contract.strip().upper() for contract in contracts if contract.strip()]
     if len(contracts) < 2:
@@ -1638,6 +1954,7 @@ def load_or_fetch_spread(
                         contract_df,
                         contract,
                         replace_current_day=True,
+                        market_now=market_now,
                     )
                     latest_contract_date = pd.to_datetime(
                         contract_df["date"], errors="coerce"
@@ -1654,6 +1971,7 @@ def load_or_fetch_spread(
                     max_workers=max_workers,
                     api_key=api_key,
                     prefer_realtime_snapshot=realtime_preview,
+                    market_now=market_now,
                 )
             latest_spread_df = calculate_spreads(data, base_contract)
             spread_df = (
@@ -1665,7 +1983,7 @@ def load_or_fetch_spread(
             status = "已增量更新" if cached_df is not None and cache_ready else "已更新"
             if errors:
                 error = " | ".join(errors)
-            if save_to_cache:
+            if save_to_cache and not realtime_preview:
                 save_dataset(
                     symbol=cache_symbol,
                     name=f"{contract_name(base_contract)} 期货价差",
@@ -1756,6 +2074,7 @@ def load_or_fetch_option(
     force_refresh: bool = False,
     save_to_cache: bool = True,
     realtime_preview: bool = False,
+    market_now: datetime | None = None,
 ) -> PositionItem:
     raw_code = code.strip()
     cache_candidates = _futures_option_cache_candidates(raw_code, period, int(count))
@@ -1783,6 +2102,7 @@ def load_or_fetch_option(
                     cached_df,
                     raw_code,
                     replace_current_day=True,
+                    market_now=market_now,
                 )
                 result_source = "AkShare期权实时快照"
                 result_is_chain = False
@@ -1796,6 +2116,7 @@ def load_or_fetch_option(
                     use_free=True,
                     ma_periods=ma_periods,
                     prefer_realtime_snapshot=realtime_preview,
+                    market_now=market_now,
                 )
                 latest_result_df = result.dataframe.copy()
                 result_source = result.source
@@ -1837,7 +2158,7 @@ def load_or_fetch_option(
         "最新成交量": _round_metric(summary.get("最新成交量"), 0),
         "最新持仓量": _round_metric(summary.get("最新持仓量"), 0),
     }
-    if status != "缓存" and save_to_cache:
+    if status != "缓存" and save_to_cache and not realtime_preview:
         save_dataset(
             symbol=_futures_option_cache_key(raw_code, DATA_TYPE_OPTIONS, period, int(count)),
             name=f"{normalize_option_symbol(raw_code)} 期货期权数据",
@@ -1871,6 +2192,7 @@ def refresh_position_derivative_items(
     api_key: str = "",
     max_workers: int = 2,
     option_count: int = 500,
+    market_now: datetime | None = None,
 ) -> tuple[list[PositionItem], list[str]]:
     refreshed: list[PositionItem] = []
     errors: list[str] = []
@@ -1889,6 +2211,7 @@ def refresh_position_derivative_items(
                 force_refresh=True,
                 save_to_cache=False,
                 realtime_preview=True,
+                market_now=market_now,
             )
         elif item.category == "期权":
             latest = load_or_fetch_option(
@@ -1898,6 +2221,7 @@ def refresh_position_derivative_items(
                 force_refresh=True,
                 save_to_cache=False,
                 realtime_preview=True,
+                market_now=market_now,
             )
         else:
             continue
@@ -1906,7 +2230,7 @@ def refresh_position_derivative_items(
             errors.append(f"{item.name}: {latest.error or latest.source}")
             continue
         latest_date = pd.to_datetime(latest.latest_date, errors="coerce")
-        today = pd.Timestamp.now(tz="Asia/Shanghai").date()
+        today = (market_now or datetime.now(ZoneInfo("Asia/Shanghai"))).date()
         if pd.isna(latest_date) or latest_date.date() != today:
             errors.append(f"{item.name}: 实时源未返回今日行情")
             continue

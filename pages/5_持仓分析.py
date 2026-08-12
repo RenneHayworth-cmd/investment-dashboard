@@ -1,7 +1,7 @@
 import html
 import os
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -32,6 +32,7 @@ from services.position_analysis import (
     DEFAULT_SPREAD_GROUPS,
     ETF_MIDSESSION_TIMING_REFRESH_SECONDS,
     ETF_MORNING_TIMING_REFRESH_SECONDS,
+    ETF_REALTIME_TIMING_END_TIME,
     ETF_REALTIME_TIMING_REFRESH_SECONDS,
     PositionItem,
     apply_etf_realtime_quote,
@@ -170,11 +171,23 @@ def build_overview_table(items: list[PositionItem]) -> pd.DataFrame:
 def format_etf_table_value(column: str, value: object) -> str:
     if value is None or pd.isna(value):
         return ""
-    if column in {"最新价", "对应均线", "触发收盘价"}:
-        return format(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), ".3f")
-    if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)", "上一区间涨幅(%)"}:
-        return format(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
-    return str(value)
+    text = str(value).strip()
+    if text == "-":
+        return text
+    try:
+        if column in {"最新价", "对应均线", "触发收盘价"}:
+            return format(
+                Decimal(text).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP),
+                ".3f",
+            )
+        if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)", "上一区间涨幅(%)"}:
+            return format(
+                Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                ".2f",
+            )
+    except (InvalidOperation, ValueError):
+        return text
+    return text
 
 
 def render_etf_timing_table(df: pd.DataFrame) -> None:
@@ -182,6 +195,7 @@ def render_etf_timing_table(df: pd.DataFrame) -> None:
         st.info("当前没有可展示的 ETF 汇总数据。")
         return
     headers = "".join(f"<th>{html.escape(str(column))}</th>" for column in df.columns)
+    timing_column_index = df.columns.get_loc("择时判断") + 1
     rows = []
     for _, row in df.iterrows():
         timing_action = str(row.get("择时判断", ""))
@@ -205,6 +219,11 @@ def render_etf_timing_table(df: pd.DataFrame) -> None:
             border-collapse: collapse;
             font-size: 0.92rem;
         }}
+        .position-etf-summary-table-scroll {{
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }}
         .position-etf-summary-table th,
         .position-etf-summary-table td {{
             text-align: center;
@@ -223,20 +242,22 @@ def render_etf_timing_table(df: pd.DataFrame) -> None:
             background: rgba(220, 252, 231, 0.78);
         }}
         .position-etf-summary-table tr.timing-buy td:first-child,
-        .position-etf-summary-table tr.timing-buy td:nth-child(8) {{
+        .position-etf-summary-table tr.timing-buy td:nth-child({timing_column_index}) {{
             color: rgb(190, 18, 60);
             font-weight: 700;
         }}
         .position-etf-summary-table tr.timing-sell td:first-child,
-        .position-etf-summary-table tr.timing-sell td:nth-child(8) {{
+        .position-etf-summary-table tr.timing-sell td:nth-child({timing_column_index}) {{
             color: rgb(22, 101, 52);
             font-weight: 700;
         }}
         </style>
+        <div class="position-etf-summary-table-scroll">
         <table class="position-etf-summary-table">
             <thead><tr>{headers}</tr></thead>
             <tbody>{''.join(rows)}</tbody>
         </table>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -267,6 +288,11 @@ def render_etf_operation_guidance(df: pd.DataFrame) -> None:
             border-collapse: collapse;
             font-size: 0.92rem;
         }}
+        .position-operation-guidance-table-scroll {{
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }}
         .position-operation-guidance-table th,
         .position-operation-guidance-table td {{
             text-align: center;
@@ -293,10 +319,12 @@ def render_etf_operation_guidance(df: pd.DataFrame) -> None:
             font-weight: 700;
         }}
         </style>
+        <div class="position-operation-guidance-table-scroll">
         <table class="position-operation-guidance-table">
             <thead><tr>{headers}</tr></thead>
             <tbody>{''.join(rows)}</tbody>
         </table>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -313,6 +341,8 @@ def render_etf_timing_section(
     market_count: int,
     max_workers: int,
     adjust: str | None,
+    updates_enabled: bool,
+    save_to_cache: bool,
 ) -> None:
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     formal_items = [
@@ -337,7 +367,8 @@ def render_etf_timing_section(
     last_attempt = pd.to_datetime(st.session_state.get(attempt_key), errors="coerce")
     retry_ready = pd.isna(last_attempt) or (market_now.replace(tzinfo=None) - last_attempt).total_seconds() >= 600
     if (
-        etf_final_close_ready(market_now)
+        updates_enabled
+        and etf_final_close_ready(market_now)
         and stale_codes
         and retry_ready
     ):
@@ -350,7 +381,7 @@ def render_etf_timing_section(
                     adjust=adjust,
                     allow_fetch=True,
                     force_refresh=True,
-                    save_to_cache=True,
+                    save_to_cache=save_to_cache,
                     market_now=market_now,
                 )
                 for code in stale_codes
@@ -361,8 +392,20 @@ def render_etf_timing_section(
             ]
         st.session_state[attempt_key] = market_now.replace(tzinfo=None).isoformat()
 
+    formal_close_missing = any(
+        pd.isna(item_date := pd.to_datetime(item.latest_date, errors="coerce"))
+        or item_date.date() < target_date
+        for item in formal_items
+    )
+
     timing_items = formal_items
-    active_preview_quotes: dict[str, dict[str, object]] = {}
+    active_preview_quotes = filter_current_etf_realtime_quotes(
+        load_runtime_etf_quotes(),
+        market_now=market_now,
+        retain_after_close=True,
+    )
+    if etf_final_close_ready(market_now) and not formal_close_missing:
+        active_preview_quotes = {}
     derivative_refresh_due = False
     realtime_timing_error = ""
     missing_realtime_codes: list[str] = []
@@ -373,7 +416,7 @@ def render_etf_timing_section(
     morning_preview_state = st.session_state.get(morning_preview_key, {})
     same_morning_date = morning_preview_state.get("trade_date") == preview_date
     morning_quotes = morning_preview_state.get("quotes", {}) if same_morning_date else {}
-    if etf_morning_timing_fetch_ready(market_now):
+    if updates_enabled and etf_morning_timing_fetch_ready(market_now):
         morning_refresh_band = (
             "early" if market_now.time() < datetime.strptime("10:00", "%H:%M").time() else "midmorning"
         )
@@ -449,7 +492,7 @@ def render_etf_timing_section(
     afternoon_fetch_ready = etf_afternoon_timing_fetch_ready(market_now)
     lunch_refresh_due = False
     lunch_refresh_band = ""
-    if lunch_fetch_ready and not lunch_quotes:
+    if updates_enabled and lunch_fetch_ready and not lunch_quotes:
         lunch_refresh_band = "lunch"
         last_lunch_attempt = pd.to_datetime(
             lunch_preview_state.get("fetched_at"), errors="coerce"
@@ -458,7 +501,7 @@ def render_etf_timing_section(
             pd.isna(last_lunch_attempt)
             or (market_now_naive - last_lunch_attempt).total_seconds() >= 600
         )
-    elif afternoon_fetch_ready:
+    elif updates_enabled and afternoon_fetch_ready:
         lunch_refresh_band = "afternoon"
         last_afternoon_fetch = pd.to_datetime(
             lunch_preview_state.get("fetched_at"), errors="coerce"
@@ -521,7 +564,7 @@ def render_etf_timing_section(
             if normalize_etf_base_code(code) not in lunch_quotes
         ]
 
-    if etf_realtime_timing_ready(market_now):
+    if updates_enabled and etf_realtime_timing_ready(market_now):
         preview_key = "position_etf_realtime_timing_preview"
         preview_state = st.session_state.get(preview_key, {})
         same_preview_date = preview_state.get("trade_date") == preview_date
@@ -563,7 +606,8 @@ def render_etf_timing_section(
                 realtime_timing_error = "未填写TickFlow API Key"
 
         realtime_quotes = preview_state.get("quotes", {})
-        active_preview_quotes = realtime_quotes
+        if realtime_quotes:
+            active_preview_quotes = realtime_quotes
         realtime_timing_error = realtime_timing_error or preview_state.get("error", "")
         missing_realtime_codes = [
             normalize_etf_base_code(code)
@@ -573,16 +617,37 @@ def render_etf_timing_section(
         timing_items = [
             apply_etf_realtime_quote_to_timing(
                 item,
-                realtime_quotes.get(normalize_etf_base_code(code), {}),
+                active_preview_quotes.get(normalize_etf_base_code(code), {}),
                 market_now=market_now,
             )
             for code, item in zip(etf_codes, formal_items)
         ]
 
+    timing_preview_window = bool(
+        etf_intraday_quote_ready(market_now)
+        or (etf_final_close_ready(market_now) and formal_close_missing)
+    )
+    if timing_preview_window and active_preview_quotes:
+        timing_items = [
+            apply_etf_realtime_quote_to_timing(
+                item,
+                active_preview_quotes.get(normalize_etf_base_code(code), {}),
+                market_now=market_now,
+                allow_close_retention=(
+                    market_now.time() >= ETF_REALTIME_TIMING_END_TIME
+                ),
+            )
+            for code, item in zip(etf_codes, formal_items)
+        ]
+        missing_realtime_codes = [
+            normalize_etf_base_code(code)
+            for code in etf_codes
+            if normalize_etf_base_code(code) not in active_preview_quotes
+        ]
+
     timing_preview_active = (
-        etf_morning_timing_preview_ready(market_now)
-        or etf_lunch_timing_preview_ready(market_now)
-        or etf_realtime_timing_ready(market_now)
+        updates_enabled
+        and timing_preview_window
     )
     derivative_state_key = "position_derivative_realtime_preview"
     derivative_state = st.session_state.get(derivative_state_key, {})
@@ -601,6 +666,7 @@ def render_etf_timing_section(
             api_key=api_key,
             max_workers=max_workers,
             option_count=market_count,
+            market_now=market_now,
         )
         derivative_items = dict(derivative_items)
         derivative_items.update(
@@ -639,7 +705,9 @@ def render_etf_timing_section(
         code = normalize_etf_base_code(item.code)
         outer_item = outer_etf_items.get(code, item)
         base_item = (
-            outer_item
+            formal_etf_items.get(code, outer_item)
+            if etf_final_close_ready(market_now) and not formal_close_missing
+            else outer_item
             if outer_item.status == "盘中"
             else formal_etf_items.get(code, outer_item)
         )
@@ -1336,6 +1404,11 @@ etf_codes = parse_position_codes(etf_text)
 spread_groups = parse_spread_groups(spread_text)
 option_codes = parse_position_codes(option_text)
 allow_fetch = bool(update_clicked)
+if "position_updates_enabled" not in st.session_state:
+    st.session_state.position_updates_enabled = False
+if update_clicked:
+    st.session_state.position_updates_enabled = True
+updates_enabled = bool(st.session_state.position_updates_enabled)
 refresh_existing = bool(update_clicked and force_refresh)
 market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
 intraday_market_active = etf_intraday_quote_ready(market_now)
@@ -1398,6 +1471,8 @@ with st.spinner("正在整理持仓数据..."):
                 count=int(etf_count),
                 adjust=adjust_map[adjust_option],
                 allow_fetch=True,
+                force_refresh=refresh_existing,
+                save_to_cache=save_to_cache,
                 market_now=market_now,
             )
         else:
@@ -1427,6 +1502,7 @@ with st.spinner("正在整理持仓数据..."):
                 allow_fetch=allow_fetch,
                 force_refresh=refresh_existing,
                 save_to_cache=save_to_cache,
+                market_now=market_now,
             )
         )
         update_position_progress(f"期货价差 {' - '.join(spread_contracts)}")
@@ -1439,6 +1515,7 @@ with st.spinner("正在整理持仓数据..."):
                 allow_fetch=allow_fetch,
                 force_refresh=refresh_existing,
                 save_to_cache=save_to_cache,
+                market_now=market_now,
             )
         )
         update_position_progress(f"期权 {code}")
@@ -1477,4 +1554,6 @@ render_etf_timing_section(
     market_count=int(market_count),
     max_workers=int(max_workers),
     adjust=adjust_map[adjust_option],
+    updates_enabled=updates_enabled,
+    save_to_cache=save_to_cache,
 )

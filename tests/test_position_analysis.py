@@ -1,5 +1,7 @@
+import ast
 import unittest
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,10 +13,12 @@ import requests
 from services.futures_options_analysis import (
     FUTURES_OPTION_DATA_VERSION,
     append_option_spot_row,
+    fetch_option_from_akshare,
 )
 from services.futures_spread import (
     SPREAD_CALCULATION_VERSION,
     append_futures_spot_row,
+    fetch_futures_daily,
 )
 from services.position_analysis import (
     DEFAULT_ETF_CODES,
@@ -23,6 +27,7 @@ from services.position_analysis import (
     ETF_DISPLAY_NAMES,
     ETF_MIDSESSION_TIMING_REFRESH_SECONDS,
     ETF_MORNING_TIMING_REFRESH_SECONDS,
+    ETF_PORTFOLIO_WEIGHTS_PCT,
     ETF_POSITION_STRATEGIES,
     ETF_REALTIME_TIMING_REFRESH_SECONDS,
     ETF_TIMING_STRATEGIES,
@@ -38,6 +43,7 @@ from services.position_analysis import (
     apply_etf_realtime_quote_to_timing,
     build_recent_etf_operation_guidance,
     build_etf_timing_table,
+    calculate_512890_parking_snapshot,
     calculate_etf_timing_snapshot,
     etf_afternoon_timing_fetch_ready,
     etf_cache_has_latest_final_close,
@@ -134,6 +140,14 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertIn('morning_refresh_band = (', page_source)
         self.assertIn('lunch_refresh_band = "afternoon"', page_source)
         self.assertIn("apply_etf_realtime_quotes_to_items", page_source)
+        self.assertIn(
+            "active_preview_quotes = filter_current_etf_realtime_quotes(",
+            page_source,
+        )
+        self.assertIn("retain_after_close=True", page_source)
+        self.assertIn("and formal_close_missing", page_source)
+        self.assertIn("allow_close_retention=(", page_source)
+        self.assertIn("if timing_preview_window and active_preview_quotes:", page_source)
         self.assertIn("refresh_position_derivative_items", page_source)
         self.assertIn('derivative_state_key = "position_derivative_realtime_preview"', page_source)
         self.assertIn("derivative_preview_version = 2", page_source)
@@ -146,6 +160,34 @@ class PositionAnalysisTests(unittest.TestCase):
         )
         self.assertIn("build_recent_etf_operation_guidance(formal_items, days=7)", page_source)
         self.assertNotIn("近一月操作指引", page_source)
+
+    def test_etf_table_formatter_accepts_dash_in_numeric_columns(self):
+        page_path = Path(__file__).parents[1] / "pages" / "5_持仓分析.py"
+        page_tree = ast.parse(page_path.read_text(encoding="utf-8"))
+        formatter_node = next(
+            node
+            for node in page_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "format_etf_table_value"
+        )
+        namespace = {
+            "Decimal": Decimal,
+            "InvalidOperation": InvalidOperation,
+            "ROUND_HALF_UP": ROUND_HALF_UP,
+            "pd": pd,
+        }
+        exec(
+            compile(
+                ast.Module(body=[formatter_node], type_ignores=[]),
+                filename=str(page_path),
+                mode="exec",
+            ),
+            namespace,
+        )
+        formatter = namespace["format_etf_table_value"]
+
+        self.assertEqual(formatter("对应均线", "-"), "-")
+        self.assertEqual(formatter("最新价", 1.9), "1.900")
+        self.assertEqual(formatter("当日涨跌幅(%)", 1.234), "1.23")
 
     def test_recent_operation_guidance_lists_pure_and_half_position_transitions(self):
         data = pd.DataFrame(
@@ -171,6 +213,31 @@ class PositionAnalysisTests(unittest.TestCase):
         half_rows = result[result["代码"] == "159501"]
         self.assertEqual(set(half_rows["操作后仓位"]), {"持有", "半仓"})
         self.assertEqual(result["日期"].min(), "2026-07-04")
+
+    def test_recent_operation_guidance_adds_512890_buy_for_active_transfer_source(self):
+        source_data = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-07-01", periods=7, freq="D"),
+                "price": [100.0, 100.0, 100.0, 104.0, 103.0, 100.0, 100.0],
+            }
+        )
+        parking_data = pd.DataFrame(
+            {
+                "date": pd.date_range("2026-07-01", periods=7, freq="D"),
+                "price": [1.10, 1.11, 1.12, 1.13, 1.14, 1.15, 1.16],
+            }
+        )
+        source = PositionItem("ETF", "510500.SH", "中证500ETF南方", "缓存", dataframe=source_data)
+        parking = PositionItem("ETF", "512890.SH", "红利低波ETF华泰柏瑞", "缓存", dataframe=parking_data)
+
+        with patch.dict(ETF_TIMING_STRATEGIES, {"510500": (3, 1.0)}, clear=True):
+            result = build_recent_etf_operation_guidance([source, parking], days=4)
+
+        parking_rows = result[result["代码"] == "512890"]
+        self.assertEqual(len(parking_rows), 1)
+        self.assertEqual(parking_rows.iloc[0]["操作指引"], "买入")
+        self.assertEqual(parking_rows.iloc[0]["策略参数"], "承接510500空仓资金")
+        self.assertEqual(parking_rows.iloc[0]["触发收盘价"], 1.15)
 
     def test_half_timing_position_decisions_keep_the_base_half(self):
         self.assertEqual(ETF_POSITION_STRATEGIES["159501"], "半仓持有半仓择时")
@@ -220,9 +287,15 @@ class PositionAnalysisTests(unittest.TestCase):
             quotes,
             market_now=datetime(2026, 7, 21, 15, 5, tzinfo=timezone),
         )
+        retained_after_close = filter_current_etf_realtime_quotes(
+            quotes,
+            market_now=datetime(2026, 7, 21, 15, 5, tzinfo=timezone),
+            retain_after_close=True,
+        )
 
         self.assertEqual(set(intraday), {"159201"})
         self.assertEqual(after_close, {})
+        self.assertEqual(set(retained_after_close), {"159201"})
 
     def test_position_page_stays_clear_while_data_is_loading(self):
         page_source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
@@ -249,6 +322,9 @@ class PositionAnalysisTests(unittest.TestCase):
                 "159915",
                 "510500",
                 "159967",
+                "159552",
+                "513310",
+                "513880",
             ],
         )
         self.assertEqual(ETF_TIMING_STRATEGIES["510500"], (15, 1.0))
@@ -257,11 +333,20 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(ETF_TIMING_STRATEGIES["159967"], (25, 2.0))
         self.assertEqual(ETF_TIMING_STRATEGIES["518850"], (30, 1.5))
         self.assertEqual(ETF_TIMING_STRATEGIES["161128"], (25, 1.5))
+        self.assertEqual(ETF_TIMING_STRATEGIES["159552"], (10, 2.5))
+        self.assertEqual(ETF_TIMING_STRATEGIES["513310"], (15, 0.5))
+        self.assertEqual(ETF_TIMING_STRATEGIES["513880"], (10, 2.0))
         self.assertEqual(ETF_POSITION_STRATEGIES["161128"], "纯择时")
+        self.assertEqual(ETF_POSITION_STRATEGIES["159552"], "纯择时")
+        self.assertEqual(ETF_POSITION_STRATEGIES["513310"], "纯择时")
+        self.assertEqual(ETF_POSITION_STRATEGIES["513880"], "纯择时")
         self.assertNotIn("512890", ETF_TIMING_STRATEGIES)
         self.assertEqual(ETF_DISPLAY_NAMES["159915"], "创业板ETF易方达")
         self.assertEqual(ETF_DISPLAY_NAMES["161128"], "标普信息科技LOF易方达")
         self.assertEqual(ETF_DISPLAY_NAMES["159967"], "创业板成长ETF华夏")
+        self.assertEqual(ETF_DISPLAY_NAMES["159552"], "中证2000增强ETF招商")
+        self.assertEqual(ETF_DISPLAY_NAMES["513310"], "中韩半导体ETF华泰柏瑞")
+        self.assertEqual(ETF_DISPLAY_NAMES["513880"], "日经225ETF华安")
         self.assertEqual(set(ETF_DISPLAY_NAMES), set(DEFAULT_ETF_CODES))
 
     def test_timing_snapshot_retains_state_inside_band_and_marks_transitions(self):
@@ -397,7 +482,7 @@ class PositionAnalysisTests(unittest.TestCase):
             len(call.kwargs["symbols"])
             for call in tickflow_mock.return_value.quotes.get.call_args_list
         ]
-        self.assertEqual(request_sizes, [5, 5, 2])
+        self.assertEqual(request_sizes, [5, 5, 5])
         self.assertEqual(set(quotes), set(DEFAULT_ETF_CODES))
 
     @patch("services.position_analysis._fetch_sina_exchange_fund_quote")
@@ -626,7 +711,7 @@ class PositionAnalysisTests(unittest.TestCase):
         )
         load_mock.return_value = (cached, {"last_update_time": prior_day.isoformat()})
 
-        def add_spot(df, contract, *, replace_current_day=False):
+        def add_spot(df, contract, *, replace_current_day=False, market_now=None):
             price = 719.0 if contract == "I2609" else 698.0
             return pd.concat(
                 [df, pd.DataFrame({"date": [today], "close": [price]})],
@@ -692,6 +777,99 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(item.latest_date, today.strftime("%Y-%m-%d"))
         self.assertEqual(item.metrics["最新收盘"], 17.5)
         self.assertEqual(item.metrics["最新持仓量"], 7000.0)
+
+    @patch("services.futures_spread.append_futures_spot_row")
+    @patch("services.futures_spread.fetch_futures_daily_from_akshare")
+    @patch("services.futures_spread.fetch_futures_daily_from_tickflow")
+    def test_formal_futures_daily_does_not_append_intraday_snapshot(
+        self, tickflow_mock, akshare_mock, spot_mock
+    ):
+        history = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-06", "2026-08-07", "2026-08-10"]), "close": [700, 705, 710]}
+        )
+        tickflow_mock.return_value = history
+        akshare_mock.return_value = history
+        market_now = datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        result = fetch_futures_daily("I2609", market_now=market_now)
+
+        spot_mock.assert_not_called()
+        self.assertEqual(result["date"].max(), pd.Timestamp("2026-08-07"))
+
+    @patch("services.futures_options_analysis.append_option_spot_row")
+    def test_formal_option_daily_does_not_append_intraday_snapshot(self, spot_mock):
+        history = pd.DataFrame(
+            {"date": ["2026-08-07", "2026-08-10"], "close": [16.0, 17.0]}
+        )
+        fake_akshare = SimpleNamespace(
+            option_commodity_hist_sina=lambda symbol: history,
+        )
+        market_now = datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with patch.dict("sys.modules", {"akshare": fake_akshare}):
+            result, source, is_chain = fetch_option_from_akshare(
+                "i2609P730", "1d", 500, market_now=market_now
+            )
+
+        spot_mock.assert_not_called()
+        self.assertEqual(result["date"].max(), pd.Timestamp("2026-08-07"))
+        self.assertEqual(source, "AkShare期权日线")
+        self.assertFalse(is_chain)
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_contracts")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_realtime_spread_preview_never_saves_even_if_requested(
+        self, load_mock, fetch_mock, save_mock
+    ):
+        load_mock.return_value = (None, None)
+        today = pd.Timestamp("2026-08-10")
+        fetch_mock.return_value = (
+            {
+                "I2609": pd.DataFrame({"date": [today], "close": [719.0]}),
+                "I2705": pd.DataFrame({"date": [today], "close": [698.0]}),
+            },
+            [],
+        )
+
+        load_or_fetch_spread(
+            ["I2609", "I2705"],
+            force_refresh=True,
+            save_to_cache=True,
+            realtime_preview=True,
+            market_now=datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        save_mock.assert_not_called()
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_futures_option_data")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_realtime_option_preview_never_saves_even_if_requested(
+        self, load_mock, fetch_mock, save_mock
+    ):
+        load_mock.return_value = (None, None)
+        today = pd.Timestamp("2026-08-10")
+        fetch_mock.return_value = SimpleNamespace(
+            dataframe=pd.DataFrame({"date": [today], "close": [17.5]}),
+            source="AkShare期权实时快照",
+            is_chain=False,
+        )
+
+        load_or_fetch_option(
+            "I2609P730",
+            force_refresh=True,
+            save_to_cache=True,
+            realtime_preview=True,
+            market_now=datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        save_mock.assert_not_called()
+
+    def test_holdings_page_gates_fragment_network_until_load(self):
+        page_source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
+        self.assertIn('st.session_state.position_updates_enabled = False', page_source)
+        self.assertIn('updates_enabled and etf_morning_timing_fetch_ready', page_source)
+        self.assertIn('save_to_cache=save_to_cache', page_source)
 
     @patch("services.position_analysis.load_or_fetch_spread")
     def test_derivative_realtime_refresh_reports_failure(self, spread_mock):
@@ -992,6 +1170,22 @@ class PositionAnalysisTests(unittest.TestCase):
             market_now=datetime(2026, 7, 15, 15, 0, tzinfo=timezone),
         )
         self.assertIs(after_close, cached_item)
+
+        with patch.dict(ETF_TIMING_STRATEGIES, {"513260": (3, 1.0)}, clear=True):
+            retained_after_close = apply_etf_realtime_quote_to_timing(
+                cached_item,
+                {
+                    "symbol": "513260.SH",
+                    "price": 100.0,
+                    "quote_time": datetime(2026, 7, 15, 15, 0, tzinfo=timezone),
+                },
+                market_now=datetime(2026, 7, 15, 15, 0, tzinfo=timezone),
+                allow_close_retention=True,
+            )
+        self.assertEqual(retained_after_close.status, "收盘待确认")
+        self.assertEqual(retained_after_close.metrics["最新价"], 100.0)
+        self.assertEqual(retained_after_close.metrics["择时判断"], "卖出")
+        self.assertTrue(retained_after_close.dataframe.equals(cached_data))
 
     def test_unconfirmed_same_day_cache_is_excluded_after_1505(self):
         market_now = datetime(2026, 7, 15, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -1551,7 +1745,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
         self.assertAlmostEqual(item.metrics["策略均线"], 1.90292, places=6)
 
-    def test_etf_timing_table_excludes_derivatives_and_long_term_etf(self):
+    def test_etf_timing_table_excludes_derivatives_and_includes_parking_etf(self):
         items = [
             PositionItem(
                 "ETF",
@@ -1598,7 +1792,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
         table = build_etf_timing_table(items)
 
-        self.assertEqual(table["代码"].tolist(), ["513260", "518850"])
+        self.assertEqual(table["代码"].tolist(), ["513260", "518850", "512890"])
         self.assertEqual(table.iloc[0]["ETF名称"], "恒生科技ETF汇添富")
         self.assertEqual(
             table.columns.tolist()[-4:],
@@ -1606,18 +1800,160 @@ class PositionAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(table.iloc[0]["上一状态转换时间"], "2026-06-18")
         self.assertEqual(table.iloc[0]["上一区间涨幅(%)"], -2.5)
-        self.assertNotIn("512890", table["代码"].tolist())
+        self.assertEqual(
+            table.loc[table["代码"] == "512890", "ETF名称"].iloc[0],
+            "红利低波ETF华泰柏瑞",
+        )
+        self.assertEqual(table.loc[table["代码"] == "512890", "组合权重比例"].iloc[0], "-")
+        self.assertEqual(table.loc[table["代码"] == "512890", "择时判断"].iloc[0], "-")
         self.assertEqual(table.iloc[1]["策略参数"], "MA30 / 1.5%")
         self.assertNotIn("期货价差", table.to_string())
 
+    def test_etf_timing_table_uses_current_portfolio_weights(self):
+        items = [
+            PositionItem("ETF", code, ETF_DISPLAY_NAMES[code], "缓存")
+            for code in DEFAULT_ETF_CODES
+        ]
+
+        table = build_etf_timing_table(items).set_index("代码")
+
+        self.assertEqual(sum(ETF_PORTFOLIO_WEIGHTS_PCT.values()), 100)
+        self.assertEqual(table.loc["159201", "组合权重比例"], "5%")
+        self.assertEqual(table.loc["159501", "组合权重比例"], "15%")
+        self.assertEqual(table.loc["513260", "组合权重比例"], "0%")
+        self.assertEqual(table.loc["159915", "组合权重比例"], "0%")
+
+    def test_512890_parking_snapshot_uses_only_aggregate_position_transitions(self):
+        dates = pd.date_range("2026-07-01", periods=6, freq="D")
+
+        def source_item(code, prices):
+            return PositionItem(
+                "ETF",
+                code,
+                ETF_DISPLAY_NAMES[code],
+                "缓存",
+                dataframe=pd.DataFrame({"date": dates, "price": prices}),
+            )
+
+        items = [
+            PositionItem(
+                "ETF",
+                "512890",
+                ETF_DISPLAY_NAMES["512890"],
+                "缓存",
+                metrics={"最新价": 1.5, "日涨跌(%)": 0.2},
+                dataframe=pd.DataFrame(
+                    {"date": dates, "price": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]}
+                ),
+            ),
+            source_item("510500", [10.0, 11.0, 9.0, 9.0, 9.0, 9.0]),
+            source_item("159967", [10.0, 11.0, 12.0, 10.0, 12.0, 13.0]),
+            source_item("159552", [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]),
+        ]
+        patched_strategies = {
+            "510500": (2, 0.0),
+            "159967": (2, 0.0),
+            "159552": (2, 0.0),
+        }
+
+        with patch.dict(ETF_TIMING_STRATEGIES, patched_strategies, clear=True):
+            snapshot = calculate_512890_parking_snapshot(items)
+            table = build_etf_timing_table(items).set_index("代码")
+
+        self.assertEqual(snapshot["组合权重比例"], "10%")
+        self.assertEqual(snapshot["择时判断"], "持有")
+        self.assertEqual(snapshot["状态转换时间"], "2026-07-03")
+        self.assertEqual(snapshot["上一状态转换时间"], "-")
+        self.assertAlmostEqual(snapshot["策略区间涨幅(%)"], 25.0)
+        self.assertEqual(table.loc["512890", "ETF名称"], "红利低波ETF华泰柏瑞")
+        self.assertEqual(table.loc["512890", "组合权重比例"], "10%")
+        self.assertEqual(table.loc["512890", "状态转换时间"], "2026-07-03")
+
+    def test_512890_parking_snapshot_calculates_current_and_previous_intervals(self):
+        dates = pd.date_range("2026-07-01", periods=6, freq="D")
+
+        def source_item(code, prices):
+            return PositionItem(
+                "ETF",
+                code,
+                ETF_DISPLAY_NAMES[code],
+                "缓存",
+                dataframe=pd.DataFrame({"date": dates, "price": prices}),
+            )
+
+        items = [
+            PositionItem(
+                "ETF",
+                "512890",
+                ETF_DISPLAY_NAMES["512890"],
+                "缓存",
+                metrics={"最新价": 1.5},
+                dataframe=pd.DataFrame(
+                    {"date": dates, "price": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]}
+                ),
+            ),
+            source_item("510500", [10.0, 11.0, 9.0, 9.0, 11.0, 11.0]),
+            source_item("159967", [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]),
+            source_item("159552", [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]),
+        ]
+
+        with patch.dict(
+            ETF_TIMING_STRATEGIES,
+            {"510500": (2, 0.0), "159967": (2, 0.0), "159552": (2, 0.0)},
+            clear=True,
+        ):
+            snapshot = calculate_512890_parking_snapshot(items)
+
+        self.assertEqual(snapshot["组合权重比例"], "0%")
+        self.assertEqual(snapshot["择时判断"], "空仓")
+        self.assertEqual(snapshot["状态转换时间"], "2026-07-05")
+        self.assertEqual(snapshot["上一状态转换时间"], "2026-07-03")
+        self.assertAlmostEqual(snapshot["策略区间涨幅(%)"], (1.5 / 1.4 - 1) * 100)
+        self.assertAlmostEqual(snapshot["策略上一区间涨幅(%)"], (1.4 / 1.2 - 1) * 100)
+
+    def test_512890_parking_weight_counts_each_empty_transfer_source(self):
+        for empty_count, expected_weight in ((0, "0%"), (1, "10%"), (2, "20%"), (3, "30%")):
+            source_items = []
+            for index, code in enumerate(("510500", "159967", "159552")):
+                source_items.append(
+                    PositionItem(
+                        "ETF",
+                        code,
+                        ETF_DISPLAY_NAMES[code],
+                        "盘中",
+                        latest_date="2026-07-07",
+                        metrics={"择时判断": "空仓" if index < empty_count else "持有"},
+                    )
+                )
+            parking = PositionItem(
+                "ETF",
+                "512890",
+                ETF_DISPLAY_NAMES["512890"],
+                "盘中",
+                latest_date="2026-07-07",
+                metrics={"最新价": 1.6},
+            )
+
+            snapshot = calculate_512890_parking_snapshot([parking, *source_items])
+
+            self.assertEqual(snapshot["组合权重比例"], expected_weight)
+            self.assertEqual(snapshot["择时判断"], "持有" if empty_count else "空仓")
+
     def test_missing_timed_etf_still_shows_configured_strategy(self):
         table = build_etf_timing_table(
-            [PositionItem("ETF", "510500", "510500.SH", "无缓存")]
+            [
+                PositionItem("ETF", "510500", "510500.SH", "无缓存"),
+                PositionItem("ETF", "513310", "513310.SH", "无缓存"),
+                PositionItem("ETF", "513880", "513880.SH", "无缓存"),
+            ]
         )
 
         self.assertEqual(table.iloc[0]["ETF名称"], "中证500ETF南方")
         self.assertEqual(table.iloc[0]["策略参数"], "MA15 / 1.0%")
         self.assertTrue(pd.isna(table.iloc[0]["对应均线"]))
+        by_code = table.set_index("代码")
+        self.assertEqual(by_code.loc["513310", "策略参数"], "MA15 / 0.5%")
+        self.assertEqual(by_code.loc["513880", "策略参数"], "MA10 / 2.0%")
 
     def test_merge_by_date_keeps_existing_same_day_value(self):
         cached = pd.DataFrame(

@@ -4,3 +4,5 @@ plotly
 akshare
 requests
 tickflow[all]>=0.1.17
+openpyxl>=3.1
+xlrd>=2.0

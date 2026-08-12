@@ -66,7 +66,13 @@ before a larger handoff or commit.
   across all historical rows.
   Detail views retain their separate cache-first incremental history behavior.
 - The `任务与数据` page provides manual index updates, dataset metadata, and job
-  records. Do not add a background-loop toggle or auto-started updater.
+  records. Its manual update only fills missing completed-session formal data
+  after checking the latest 20 market trading sessions, and does not fetch
+  intraday card quotes. First show a cache-only preview and require a second
+  confirmation before fetching. After updating, compare the saved target-date
+  close with an independent daily source where one is available; show unavailable
+  or discrepant checks without replacing the formal cache. Do not add a
+  background-loop toggle or auto-started updater.
 - Iron ore price alerts run independently through
   `scripts/monitor_iron_ore_price.py`; do not tie them to a Streamlit page loop.
   The default threshold is 730 yuan/ton. Notify ordinary WeChat through
@@ -137,7 +143,10 @@ before a larger handoff or commit.
   their last successful transient values when one source fails. These previews
   remain transient and must not affect formal history or recent operation guidance.
   It should read local cache on first render
-  and fetch after the user clicks the load button. From the A-share open through
+  and fetch after the user clicks the load button. Its timed fragments remain
+  network-disabled until that click within the page session. The save checkbox
+  controls all formal ETF, spread, and option cache writes; every intraday
+  preview remains non-persistent regardless of that checkbox. From the A-share open through
   15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
   it may also incrementally backfill missing completed sessions, but must not
   save the current unfinished quote. During the A-share lunch break, fetch the
@@ -147,8 +156,11 @@ before a larger handoff or commit.
   14:50 through 15:00 on an A-share
   trading day, the two-minute page fragment should batch real-time quotes every
   two minutes and use them as a transient timing-table preview. Reruns inside
-  the two-minute interval reuse the latest result. At 15:00 the table returns
-  to the formal daily-close path. The preview must not be cached or included in
+  the two-minute interval reuse the latest result. At 15:00 stop polling but
+  retain the last successful same-day quote in cards and the timing preview.
+  At 15:05 switch to the formal daily close only after it has been confirmed;
+  if formal data is still missing, keep the transient quote instead of falling
+  back to the previous close. The preview must not be cached or included in
   recent operation guidance. The lunch preview follows the same no-persistence
   and no-operation-guidance rules. Before the
   open, on non-trading days, and from 15:05 onward, use the daily-history path. While
@@ -171,14 +183,23 @@ before a larger handoff or commit.
   transition date and the completed return between that transition and the
   current transition. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
   MA20/0.5% for 159201; MA25/2% for 159655, 159501, and 159967; MA25/1.5% for
-  161128; MA10/1% for 159545; and MA30/1.5% for 518850. Preserve the
+  161128; MA10/1% for 159545; MA30/1.5% for 518850; MA10/2.5% for 159552;
+  MA15/0.5% for 513310; and MA10/2% for 513880. Preserve the
   previous position while price remains inside the threshold band. Treat
   159655 and 159501 as half long-term holding and half MA timing: display a
   bearish timing state as half position rather than empty. Treat 159201,
-  159545, 518850, 513260, 588000, 159915, 510500, 159967, and 161128 as pure timing.
-  Treat
-  512890 as a long-term holding: keep it out of the bottom ETF timing table
-  while retaining its card and detail view. Use the complete fund
+  159545, 518850, 513260, 588000, 159915, 510500, 159967, 161128, 159552,
+  513310, and 513880 as pure timing.
+  Treat 512890 as a parking ETF without its own MA signal. Its active transfer
+  sources are 510500, 159967, and 159552, each contributing 10% when its timing
+  state is empty. Include 512890 in the bottom table with its full fund name,
+  code, latest price, daily change, dynamic 0%-30% weight, and aggregate state:
+  hold when any source is empty, otherwise empty. Aggregate state-transition
+  dates change only on 0% to nonzero or nonzero to 0%; intermediate transfers
+  change weight without starting a new interval. Calculate current and previous
+  interval returns from 512890 prices at those aggregate transitions. When an
+  actively weighted parking-source ETF exits on a formal close, include the
+  corresponding 512890 buy in recent operation guidance. Use the complete fund
   names stored in the fixed ETF display-name mapping, and show ETF codes as six
   digits without `.SH` or `.SZ` in cards, tables, and detail captions. At the
   very bottom, show every position transition reconstructed from formal daily
@@ -187,7 +208,72 @@ before a larger handoff or commit.
   backtests in the local `live_trades` SQLite table. Treat `fee_rate_pct` as a
   percentage value, calculate position cost with fees included, and use moving
   average cost for realized P&L. Do not write these personal records into source
-  files or mix them into strategy backtest trades.
+  files or mix them into strategy backtest trades. Rebuild its daily close P&L
+  curve from `live_trades` and unadjusted formal close histories: show market
+  value, remaining cost, realized/unrealized/total P&L, and total P&L divided by
+  cumulative buy cost. Whenever the page is open, backfill a missing latest
+  completed session, including before the open and on weekends or market
+  holidays; only the current trading day's close remains unavailable until
+  15:05. Check every two minutes and retry failed network updates no more often
+  than every ten minutes. Recheck immediately when the completed-session target
+  changes. Do not value a day until every then-held symbol has a formal close
+  covering that date; derived daily P&L rows need not be persisted.
+  Show close-fetch failures prominently above the current-position table,
+  including the affected symbol and source error, while retaining the local
+  cache and the ten-minute retry behavior.
+  The current-position table also shows the latest formal close, market value,
+  and each symbol's daily and cumulative P&L as compact amount/rate cells from
+  the same formal-close histories. Show each open symbol's market-value weight
+  immediately after cumulative P&L; calculate it against the total displayed
+  open-position market value, excluding unrecorded cash. Daily P&L is the change
+  in cumulative P&L since the previous valuation; include same-day added buy
+  cost in the daily-return denominator.
+  At the page bottom, show a per-symbol historical P&L table covering both open
+  and fully closed symbols. Use buy cash amounts including buy fees, sell cash
+  proceeds after sell fees, moving-average cost for realized P&L, and the latest
+  formal close for unrealized P&L on open positions. A closed symbol's total P&L
+  remains its final realized P&L and must not disappear from this table. Append
+  a total row for monetary fields and recalculate the total return against total
+  cumulative buy cost; do not sum share quantities across different ETFs. Keep
+  the total row's trade-date and valuation-date cells blank, center the table,
+  and style the total row like the current-position total row.
+- The `期货实盘` page is separate from ETF `实盘记录`. Read broker monthly
+  statements from `FUTURES_STATEMENT_DIR` or the default local OneDrive
+  directory without modifying them. Match only broker statement filenames and
+  support both `.xls` and `.xlsx`; derived statistics workbooks are not input.
+  The latest successful statement supplies official account data and month-end
+  futures/options positions, while every statement supplies the immutable
+  execution history. Keep statement imports, account snapshots, positions,
+  executions, and formal daily close/settlement prices in dedicated SQLite tables rather than
+  `live_trades`.
+  Show official quantity, post-month-end manual change, and estimated quantity
+  separately. Manual futures/options trades must be later than the latest
+  statement end, use explicit buy/sell and open/close fields, reject closing
+  more than the available long or short position, and remain the only deletable
+  execution source. When a later statement arrives, reconcile a manual trade by
+  broker execution ID first; otherwise take it over only on a unique exact
+  date/contract/side/price/quantity/time match. Leave ambiguous matches marked
+  `待核对` and exclude only confirmed takeovers from calculations. Broker option
+  details do not contain reliable open/close or close-P&L fields; retain
+  `未提供`, and derive option realized/unrealized totals from signed premium cash
+  flow plus the official remaining-position basis instead of inventing an
+  open/close flag.
+  Render cached data first, then once per page session backfill current contracts
+  through the latest completed futures trading day; retain old formal data and
+  surface each failed contract/source. Never persist an unfinished current-day
+  quote. Produce a daily account valuation only when every active contract has
+  a formal close for the same date. Keep close-based cumulative net P&L and the
+  broker-style `全部盈亏（盯市）` separate: the latter requires same-date settlement
+  prices for every active contract, deducts execution fees, and excludes account-level
+  declaration fees. The current-position and historical-P&L
+  tables must cover futures and options separately or together, retain fully
+  closed contracts, and avoid summing hand counts across unlike contracts.
+  Account cumulative fees use the official monthly fee totals plus unmatched
+  manual fees. Parse explicitly labeled declaration fees from the statement's
+  other-funds detail, include them in the official fee total, and show them as
+  a fee component rather than an unexplained reconciliation difference. Keep
+  any remaining unexplained difference visible instead of assigning it to a
+  contract.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -197,6 +283,7 @@ before a larger handoff or commit.
 - `app.py`: Streamlit home page.
 - `pages/`: Streamlit pages. Numeric prefixes control sidebar ordering.
 - `services/live_trading.py`: local live-trade ledger and position-cost calculations.
+- `services/futures_live_trading.py`: read-only broker statement import, futures/options manual trades, position projection, and P&L calculations.
 - `core/`: shared paths, SQLite setup, cache helpers, small common utilities.
 - `services/`: market data fetching and analysis logic.
 - `data/raw/`: generated raw CSV data.

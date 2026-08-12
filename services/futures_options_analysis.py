@@ -3,8 +3,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from services.futures_spread import filter_completed_futures_daily
+from services.market_calendar import get_market_window, is_market_trading_day
 
 
 DATA_TYPE_AUTO = "自动"
@@ -145,8 +149,16 @@ def normalize_option_symbol(symbol: str) -> str:
     return f"{product}{month}"
 
 
-def _today_china() -> pd.Timestamp:
-    return pd.Timestamp.now(tz="Asia/Shanghai").normalize().tz_localize(None)
+def _china_now(market_now: datetime | None = None) -> datetime:
+    if market_now is None:
+        return datetime.now(ZoneInfo("Asia/Shanghai"))
+    if market_now.tzinfo is None:
+        return market_now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return market_now.astimezone(ZoneInfo("Asia/Shanghai"))
+
+
+def _today_china(market_now: datetime | None = None) -> pd.Timestamp:
+    return pd.Timestamp(_china_now(market_now).date())
 
 
 def is_option_symbol(symbol: str) -> bool:
@@ -192,6 +204,7 @@ def fetch_option_from_akshare(
     count: int,
     *,
     prefer_realtime_snapshot: bool = False,
+    market_now: datetime | None = None,
 ) -> tuple[pd.DataFrame, str, bool]:
     import akshare as ak
 
@@ -224,12 +237,22 @@ def fetch_option_from_akshare(
         df = daily_func(symbol=option_symbol)
         if df is None or df.empty:
             raise RuntimeError("AkShare 没有获取到期权日线数据，请检查月份、行权价或合约是否存在。")
-        df = append_option_spot_row(
-            df,
-            option_symbol,
-            replace_current_day=prefer_realtime_snapshot,
-        )
-        return df.tail(count).reset_index(drop=True), "AkShare期权日线/实时快照", False
+        normalized = normalize_market_dataframe(df)
+        if prefer_realtime_snapshot:
+            normalized = append_option_spot_row(
+                normalized,
+                option_symbol,
+                replace_current_day=True,
+                market_now=market_now,
+            )
+            source = "AkShare期权日线/实时快照"
+        else:
+            normalized = filter_completed_futures_daily(
+                normalized,
+                market_now=market_now,
+            )
+            source = "AkShare期权日线"
+        return normalized.tail(count).reset_index(drop=True), source, False
 
     if product == "i":
         df = ak.option_commodity_contract_table_sina(symbol="铁矿石期权", contract=option_symbol)
@@ -245,6 +268,7 @@ def append_option_spot_row(
     symbol: str,
     *,
     replace_current_day: bool = False,
+    market_now: datetime | None = None,
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -255,8 +279,10 @@ def append_option_spot_row(
         return df
 
     product, month, option_type, strike = match.groups()
-    today = _today_china()
-    if today.weekday() >= 5:
+    now = _china_now(market_now)
+    today = _today_china(now)
+    market = get_market_window("A股")
+    if market is None or not is_market_trading_day(market, now):
         return df
 
     result = df.copy()
@@ -441,6 +467,7 @@ def fetch_futures_option_data(
     use_free: bool,
     ma_periods: list[int] | tuple[int, ...],
     prefer_realtime_snapshot: bool = False,
+    market_now: datetime | None = None,
 ) -> FuturesOptionResult:
     if should_fetch_options(raw_symbol, data_type):
         symbol = normalize_option_symbol(raw_symbol)
@@ -449,6 +476,7 @@ def fetch_futures_option_data(
             period,
             count,
             prefer_realtime_snapshot=prefer_realtime_snapshot,
+            market_now=market_now,
         )
         if is_chain:
             return FuturesOptionResult(

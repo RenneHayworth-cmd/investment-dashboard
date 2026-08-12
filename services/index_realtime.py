@@ -119,6 +119,17 @@ FUTURES_TRADING_SESSIONS = {
 }
 
 POST_CLOSE_DAILY_DELAY = timedelta(minutes=10)
+INDEX_SOURCE_LABELS = {
+    "akshare_cn": "AkShare A股日线",
+    "akshare_cni": "国证官方日线",
+    "akshare_csindex": "中证官方日线",
+    "akshare_us": "AkShare 美股日线",
+    "akshare_hk": "AkShare 港股日线",
+    "akshare_global": "AkShare 全球指数日线",
+    "akshare_futures_main": "AkShare 期货主连日线",
+    "eastmoney_kline": "东方财富日线",
+    "cboe_vix": "CBOE 官方日线",
+}
 _RUNTIME_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_QUOTE_CACHE_LOCK = Lock()
 
@@ -363,11 +374,17 @@ def _market_is_open(market_name: str, now: datetime | None = None) -> bool:
 def _futures_market_is_open(symbol: str, now: datetime | None = None) -> bool:
     market_now = now.astimezone(ZoneInfo("Asia/Shanghai")) if now else datetime.now(ZoneInfo("Asia/Shanghai"))
     market = get_market_window("A股")
-    if market is None or not is_market_trading_day(market, market_now):
+    if market is None:
         return False
     current = market_now.time()
     sessions = FUTURES_TRADING_SESSIONS.get(symbol.upper(), ())
-    if current <= time(2, 30) and (market_now - pd.Timedelta(days=1)).weekday() >= 5:
+    if not sessions:
+        return False
+    if current <= time(2, 30):
+        previous_night = market_now - timedelta(days=1)
+        if not is_market_trading_day(market, previous_night):
+            return False
+    elif not is_market_trading_day(market, market_now):
         return False
     return any(start <= current <= end for start, end in sessions)
 
@@ -463,6 +480,95 @@ def find_pending_post_close_index_names(
         if pd.isna(correction_latest) or correction_latest.date() < target_date:
             pending.add(index_name)
     return pending
+
+
+def index_update_source_labels(index_name: str, *, tickflow_enabled: bool = True) -> tuple[str, str]:
+    """Describe the normal update source and an independent verification source."""
+    config = INDEX_CONFIG.get(index_name, {})
+    uses_tickflow = bool(tickflow_enabled and config.get("tickflow_symbol"))
+    primary = "TickFlow 日线" if uses_tickflow else INDEX_SOURCE_LABELS.get(
+        str(config.get("source") or ""),
+        str(config.get("source") or "未知来源"),
+    )
+    if uses_tickflow:
+        verifier = INDEX_SOURCE_LABELS.get(str(config.get("source") or ""), "独立公开日线")
+    elif config.get("yahoo_symbol"):
+        verifier = "Yahoo Finance 日线"
+    elif index_name == "VIX恐慌指数":
+        verifier = "Yahoo Finance 日线"
+    elif index_name == "恒生科技":
+        verifier = "Yahoo Finance 日线"
+    else:
+        verifier = "暂无独立日线复核源"
+    return primary, verifier
+
+
+def build_pending_index_update_preview(
+    *,
+    now: datetime | None = None,
+    index_names: set[str] | None = None,
+    tickflow_enabled: bool = True,
+) -> pd.DataFrame:
+    """Build a cache-only update preview without requesting market data."""
+    pending = find_pending_post_close_index_names(now=now, index_names=index_names)
+    rows: list[dict[str, object]] = []
+    for index_name, config in INDEX_CONFIG.items():
+        if index_name not in pending:
+            continue
+        target_date = _daily_update_target(index_name, now=now)
+        finalized_raw, _ = load_dataset(
+            raw_cache_symbol(index_name, config),
+            INDEX_FINAL_HISTORY_SOURCE,
+            "index_daily_raw",
+        )
+        latest_date = pd.NaT
+        if finalized_raw is not None and not finalized_raw.empty and "trade_date" in finalized_raw.columns:
+            latest_date = pd.to_datetime(finalized_raw["trade_date"], errors="coerce").max()
+        missing_dates = (
+            missing_recent_market_trade_dates(
+                finalized_raw,
+                str(config.get("market_group") or ""),
+                target_date,
+            )
+            if target_date is not None
+            else []
+        )
+        correction_start = source_correction_start(config)
+        correction_missing = False
+        if correction_start is not None and target_date is not None and target_date >= correction_start.date():
+            correction_raw, _ = load_dataset(
+                raw_cache_symbol(index_name, config),
+                INDEX_SOURCE_CORRECTION_SOURCE,
+                "index_daily_raw",
+            )
+            correction_latest = pd.NaT
+            if correction_raw is not None and not correction_raw.empty and "trade_date" in correction_raw.columns:
+                correction_latest = pd.to_datetime(correction_raw["trade_date"], errors="coerce").max()
+            correction_missing = pd.isna(correction_latest) or correction_latest.date() < target_date
+        primary_source, verification_source = index_update_source_labels(
+            index_name,
+            tickflow_enabled=tickflow_enabled,
+        )
+        reasons = []
+        if pd.isna(latest_date) or (target_date is not None and latest_date.date() < target_date):
+            reasons.append("最新正式日未补齐")
+        if missing_dates:
+            reasons.append("最近20个交易日有缺口")
+        if correction_missing:
+            reasons.append("来源校正待补齐")
+        rows.append(
+            {
+                "指数": index_name,
+                "市场": str(config.get("market_group") or ""),
+                "当前正式日": "无" if pd.isna(latest_date) else latest_date.date().isoformat(),
+                "目标交易日": "" if target_date is None else target_date.isoformat(),
+                "缺失交易日": "、".join(day.isoformat() for day in missing_dates) or "无中间缺口",
+                "待更新原因": "；".join(reasons) or "正式缓存待检查",
+                "主更新源": primary_source,
+                "复核源": verification_source,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _normalize_timestamp(value, timezone_name: str) -> datetime:

@@ -1,9 +1,11 @@
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+import math
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -106,6 +108,54 @@ class DatabaseResourceTests(unittest.TestCase):
 
         self.assertTrue(conn.closed)
 
+    def test_save_dataset_restores_existing_csv_when_metadata_write_fails(self):
+        conn = _TrackingConnection("execute")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            raw_dir = Path(temp_dir)
+            source_dir = raw_dir / "unit"
+            source_dir.mkdir()
+            file_path = source_dir / "TEST_1d.csv"
+            original = b"date,close\n2026-01-01,1\n"
+            file_path.write_bytes(original)
+
+            with (
+                patch("core.cache.RAW_DIR", raw_dir),
+                patch("core.cache.get_conn", return_value=conn),
+                self.assertRaises(sqlite3.OperationalError),
+            ):
+                cache.save_dataset(
+                    symbol="TEST",
+                    name="测试",
+                    source="unit",
+                    data_type="daily",
+                    df=pd.DataFrame({"date": ["2026-01-02"], "close": [2.0]}),
+                )
+
+            self.assertEqual(file_path.read_bytes(), original)
+            self.assertFalse(list(source_dir.glob("*.tmp")))
+            self.assertFalse(list(source_dir.glob("*.backup")))
+
+    def test_concurrent_dataset_writes_leave_one_complete_csv(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "cache.db"
+            first = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=200), "close": [1.0] * 200})
+            second = pd.DataFrame({"date": pd.date_range("2026-01-01", periods=200), "close": [2.0] * 200})
+
+            with patch("core.cache.RAW_DIR", root / "raw"), patch("core.db.DB_PATH", database_path):
+                db.init_db()
+
+                def save(frame):
+                    cache.save_dataset("TEST", "测试", "unit", "daily", frame)
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    list(executor.map(save, (first, second)))
+
+                loaded, _ = cache.load_dataset("TEST", "unit", "daily")
+
+            self.assertEqual(len(loaded), 200)
+            self.assertIn(set(loaded["close"]), ({1.0}, {2.0}))
+
     def test_list_datasets_closes_connection_when_query_fails(self):
         conn = _TrackingConnection("")
 
@@ -142,6 +192,29 @@ class DatabaseResourceTests(unittest.TestCase):
 
         self.assertTrue(conn.closed)
 
+    def test_constant_correlation_is_marked_unavailable_and_not_saved(self):
+        items = [
+            correlation_analysis.CorrelationInput(
+                "A", "A", pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3), "close": [1, 1, 1]})
+            ),
+            correlation_analysis.CorrelationInput(
+                "B", "B", pd.DataFrame({"date": pd.date_range("2026-01-01", periods=3), "close": [2, 3, 4]})
+            ),
+        ]
+        result = correlation_analysis.calculate_price_correlation(items)
+
+        self.assertTrue(math.isnan(float(result.pair_table.iloc[0]["相关系数r"])))
+        self.assertEqual(result.pair_table.iloc[0]["相关性"], "无法计算")
+        self.assertEqual(result.summary["最高相关"], "-")
+
+        get_conn_mock = Mock(return_value=_TrackingConnection(""))
+        with (
+            patch("services.correlation_analysis.init_db"),
+            patch("services.correlation_analysis.get_conn", get_conn_mock),
+        ):
+            correlation_analysis.save_correlation_results(result.pair_table, result.summary)
+        get_conn_mock.assert_not_called()
+
 
 class MarketCalendarFallbackTests(unittest.TestCase):
     def test_static_calendar_warns_once_outside_covered_years(self):
@@ -158,6 +231,34 @@ class MarketCalendarFallbackTests(unittest.TestCase):
 
         coverage_logs = [line for line in logs.output if "静态休市日仅覆盖" in line]
         self.assertEqual(len(coverage_logs), 1)
+
+
+class PageReliabilityTests(unittest.TestCase):
+    def test_position_page_imports_realtime_timing_end_constant(self):
+        source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
+
+        self.assertIn("ETF_REALTIME_TIMING_END_TIME,", source)
+        self.assertIn("market_now.time() >= ETF_REALTIME_TIMING_END_TIME", source)
+
+    def test_analysis_pages_keep_last_source_in_session_state(self):
+        root = Path(__file__).parents[1]
+        a_share = (root / "pages" / "2_A股分析.py").read_text(encoding="utf-8")
+        us_stock = (root / "pages" / "7_美股分析.py").read_text(encoding="utf-8")
+
+        self.assertIn('analysis_state_key = "a_share_analysis_source"', a_share)
+        self.assertIn('analysis_state_key = "us_stock_analysis_source"', us_stock)
+        self.assertIn("if save_to_cache and fresh_analysis", a_share)
+        self.assertIn("if save_to_cache and fresh_analysis", us_stock)
+
+    def test_task_page_has_manual_formal_update_and_chinese_columns(self):
+        source = (Path(__file__).parents[1] / "pages" / "9_任务与数据.py").read_text(encoding="utf-8")
+
+        self.assertIn("更新缺失的正式指数数据", source)
+        self.assertIn("确认更新并复核", source)
+        self.assertIn("build_pending_index_update_preview", source)
+        self.assertIn("verify_updated_index_data", source)
+        self.assertIn('"last_update_time": "更新时间"', source)
+        self.assertIn('str.replace("T", " ", regex=False)', source)
 
 
 if __name__ == "__main__":

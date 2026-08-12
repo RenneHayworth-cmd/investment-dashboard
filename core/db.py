@@ -79,6 +79,154 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_statement_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL UNIQUE,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                file_mtime_ns INTEGER NOT NULL,
+                file_hash TEXT NOT NULL,
+                statement_month TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                warnings TEXT,
+                error_message TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_account_monthly (
+                statement_month TEXT PRIMARY KEY,
+                statement_end_date TEXT NOT NULL,
+                previous_balance REAL,
+                deposits_withdrawals REAL,
+                monthly_pnl REAL,
+                total_premium REAL,
+                monthly_fee REAL,
+                declaration_fee REAL NOT NULL DEFAULT 0,
+                ending_balance REAL,
+                customer_equity REAL,
+                cash_equity REAL,
+                frozen_funds REAL,
+                margin REAL,
+                floating_pnl REAL,
+                available_funds REAL,
+                risk_ratio REAL,
+                additional_margin REAL,
+                source_file TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                warnings TEXT
+            )
+            """
+        )
+        account_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(futures_account_monthly)")
+        }
+        if "declaration_fee" not in account_columns:
+            conn.execute(
+                "ALTER TABLE futures_account_monthly "
+                "ADD COLUMN declaration_fee REAL NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_month_end_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                statement_month TEXT NOT NULL,
+                statement_end_date TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                contract TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                average_price REAL,
+                previous_settlement REAL,
+                settlement_price REAL,
+                floating_pnl REAL,
+                margin REAL,
+                multiplier REAL,
+                trade_code TEXT,
+                source_file TEXT NOT NULL,
+                UNIQUE(statement_month, asset_type, contract, side)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_live_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                statement_month TEXT,
+                trade_date TEXT NOT NULL,
+                trade_time TEXT,
+                asset_type TEXT NOT NULL,
+                contract TEXT NOT NULL,
+                broker_trade_id TEXT,
+                buy_sell TEXT NOT NULL,
+                open_close TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                turnover REAL,
+                multiplier REAL,
+                fee REAL NOT NULL DEFAULT 0,
+                close_pnl REAL,
+                strategy TEXT,
+                notes TEXT,
+                reconciliation_status TEXT NOT NULL DEFAULT '不适用',
+                matched_statement_trade_id INTEGER,
+                source_file TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(matched_statement_trade_id) REFERENCES futures_live_trades(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_futures_statement_trade_key
+            ON futures_live_trades(source_file, asset_type, broker_trade_id)
+            WHERE source='月结单' AND broker_trade_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_daily_closes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_type TEXT NOT NULL,
+                contract TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                close_price REAL NOT NULL,
+                settlement_price REAL,
+                source TEXT NOT NULL,
+                settlement_source TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(asset_type, contract, trade_date)
+            )
+            """
+        )
+        close_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(futures_daily_closes)")
+        }
+        if "settlement_price" not in close_columns:
+            conn.execute(
+                "ALTER TABLE futures_daily_closes ADD COLUMN settlement_price REAL"
+            )
+        if "settlement_source" not in close_columns:
+            conn.execute(
+                "ALTER TABLE futures_daily_closes ADD COLUMN settlement_source TEXT"
+            )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_futures_live_trades_date
+            ON futures_live_trades(trade_date, contract)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_futures_positions_month
+            ON futures_month_end_positions(statement_month, contract)
+            """
+        )
         conn.commit()
 
 
