@@ -10,6 +10,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
+from services.fund_analysis import (
+    FUND_ADJUST_BACKWARD_ADDITIVE,
+    FUND_ADJUST_FORWARD_ADDITIVE,
+    stamp_fund_history_metadata,
+)
+
 from services.futures_options_analysis import (
     FUTURES_OPTION_DATA_VERSION,
     append_option_spot_row,
@@ -32,6 +38,9 @@ from services.position_analysis import (
     ETF_REALTIME_TIMING_REFRESH_SECONDS,
     ETF_TIMING_STRATEGIES,
     PositionItem,
+    _adjusted_history_has_overlap_changes,
+    _append_sina_final_close,
+    _fetch_eastmoney_exchange_fund_close,
     _fetch_sina_exchange_fund_close,
     _fetch_sina_exchange_fund_final_close,
     _fetch_sina_exchange_fund_quote,
@@ -69,7 +78,69 @@ from services.position_analysis import (
 )
 
 
+def _v2_adjusted_history(df: pd.DataFrame) -> pd.DataFrame:
+    return stamp_fund_history_metadata(df, FUND_ADJUST_FORWARD_ADDITIVE)
+
+
 class PositionAnalysisTests(unittest.TestCase):
+    def test_adjusted_overlap_change_detection_distinguishes_append_from_rebuild(self):
+        old = _v2_adjusted_history(
+            pd.DataFrame(
+                {
+                    "日期": pd.to_datetime(["2026-08-10", "2026-08-11"]),
+                    "收盘价": [1.20, 1.21],
+                }
+            )
+        )
+        unchanged = _v2_adjusted_history(
+            pd.DataFrame(
+                {
+                    "日期": pd.to_datetime(["2026-08-11", "2026-08-12"]),
+                    "收盘价": [1.21, 1.22],
+                }
+            )
+        )
+        changed = unchanged.copy()
+        changed.loc[changed["日期"] == pd.Timestamp("2026-08-11"), "收盘价"] = 1.196
+
+        self.assertFalse(_adjusted_history_has_overlap_changes(old, unchanged))
+        self.assertTrue(_adjusted_history_has_overlap_changes(old, changed))
+
+    def test_161128_maps_additive_and_unadjusted_modes_to_akshare(self):
+        calls = []
+
+        def fake_history(**kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame(
+                {
+                    "日期": ["2026-08-11", "2026-08-12"],
+                    "开盘": [1.0, 1.1],
+                    "收盘": [1.1, 1.2],
+                }
+            )
+
+        fake_akshare = SimpleNamespace(fund_etf_hist_em=fake_history)
+        with patch.dict("sys.modules", {"akshare": fake_akshare}):
+            for mode, expected in (
+                ("forward_additive", "qfq"),
+                ("backward_additive", "hfq"),
+                ("none", ""),
+            ):
+                result = _fetch_eastmoney_exchange_fund_close(
+                    symbol="161128.SZ",
+                    count=2,
+                    adjust=mode,
+                )
+                self.assertEqual(calls[-1]["adjust"], expected)
+                self.assertTrue(result["_adjust_mode"].eq(mode).all())
+
+            with self.assertRaisesRegex(ValueError, "比例复权"):
+                _fetch_eastmoney_exchange_fund_close(
+                    symbol="161128.SZ",
+                    count=2,
+                    adjust="forward",
+                )
+
     def test_default_spread_uses_current_iron_ore_contracts(self):
         self.assertEqual(DEFAULT_SPREAD_CONTRACTS, ["I2609", "I2705"])
 
@@ -1120,6 +1191,56 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertTrue(updated.dataframe.equals(cached_data))
         self.assertTrue(cached_item.dataframe.equals(cached_data))
 
+    def test_parking_etf_timing_row_uses_same_transient_quote_as_card(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+        cached_data = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-07-13", "2026-07-14"]),
+                "price": [1.20, 1.21],
+            }
+        )
+        cached_item = PositionItem(
+            "ETF",
+            "512890.SH",
+            ETF_DISPLAY_NAMES["512890"],
+            "缓存",
+            source="本地缓存",
+            latest_date="2026-07-14",
+            metrics={"最新价": 1.21, "日涨跌(%)": 0.0},
+            dataframe=cached_data,
+        )
+        preview_cases = (
+            (datetime(2026, 7, 15, 10, 0, tzinfo=timezone), False),
+            (datetime(2026, 7, 15, 13, 30, tzinfo=timezone), False),
+            (datetime(2026, 7, 15, 14, 58, tzinfo=timezone), False),
+            (datetime(2026, 7, 15, 15, 2, tzinfo=timezone), True),
+        )
+        for market_now, allow_close_retention in preview_cases:
+            with self.subTest(market_now=market_now):
+                updated = apply_etf_realtime_quote_to_timing(
+                    cached_item,
+                    {
+                        "symbol": "512890.SH",
+                        "price": 1.234,
+                        "previous_close": 1.21,
+                        "quote_time": market_now,
+                    },
+                    market_now=market_now,
+                    allow_close_retention=allow_close_retention,
+                )
+                table = build_etf_timing_table([updated]).set_index("代码")
+
+                self.assertEqual(updated.status, "盘中")
+                self.assertEqual(updated.metrics["最新价"], 1.234)
+                self.assertAlmostEqual(
+                    updated.metrics["日涨跌(%)"],
+                    (1.234 / 1.21 - 1) * 100,
+                    places=2,
+                )
+                self.assertEqual(table.loc["512890", "最新价"], 1.234)
+                self.assertTrue(updated.dataframe.equals(cached_data))
+        self.assertTrue(cached_item.dataframe.equals(cached_data))
+
     def test_realtime_timing_preview_recalculates_without_mutating_history(self):
         timezone = ZoneInfo("Asia/Shanghai")
         cached_data = pd.DataFrame(
@@ -1241,7 +1362,7 @@ class PositionAnalysisTests(unittest.TestCase):
         )
 
         load_mock.assert_called_once_with(
-            "fund_close_161128.SZ_forward",
+            "fund_close_v2_161128.SZ_forward_additive",
             "akshare",
             "fund_close_raw",
             period="5000_1d",
@@ -1249,7 +1370,7 @@ class PositionAnalysisTests(unittest.TestCase):
         eastmoney_mock.assert_called_once_with(
             symbol="161128.SZ",
             count=5000,
-            adjust="forward",
+            adjust="forward_additive",
         )
         tickflow_mock.assert_not_called()
         self.assertEqual(save_mock.call_args.kwargs["source"], "akshare")
@@ -1297,13 +1418,245 @@ class PositionAnalysisTests(unittest.TestCase):
         sina_mock.assert_called_once_with(
             symbol="161128.SZ",
             count=5000,
-            adjust="forward",
+            adjust="forward_additive",
         )
         tickflow_mock.assert_not_called()
         self.assertEqual(save_mock.call_args.kwargs["source"], "akshare")
         self.assertEqual(item.status, "已更新")
         self.assertEqual(item.source, "新浪财经备用源")
         self.assertEqual(item.latest_date, "2026-07-31")
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_adjusted_factor_change_rebuilds_only_that_symbol(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached_dates = pd.bdate_range(end="2026-08-11", periods=40)
+        cached = _v2_adjusted_history(
+            pd.DataFrame(
+                {
+                    "日期": cached_dates,
+                    "收盘价": [1.20 + index / 1000 for index in range(40)],
+                    "symbol": ["159545.SZ"] * 40,
+                    "name": ["恒生红利低波ETF易方达"] * 40,
+                    "_final_close_confirmed": [True] * 40,
+                }
+            )
+        )
+        recent = cached.tail(10).copy()
+        recent["收盘价"] = recent["收盘价"] - 0.014
+        recent = pd.concat(
+            [
+                recent,
+                pd.DataFrame(
+                    {
+                        "日期": [pd.Timestamp("2026-08-12")],
+                        "收盘价": [1.285],
+                        "symbol": ["159545.SZ"],
+                        "name": ["恒生红利低波ETF易方达"],
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
+        rebuilt = cached.copy()
+        rebuilt["收盘价"] = rebuilt["收盘价"] - 0.014
+        rebuilt = pd.concat([rebuilt, recent.tail(1)], ignore_index=True)
+        load_mock.return_value = (cached, {"last_update_time": "2026-08-11T16:00:00"})
+        fetch_mock.side_effect = [recent, rebuilt]
+
+        item = load_or_fetch_etf(
+            "159545",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=True,
+            save_to_cache=True,
+            market_now=datetime(2026, 8, 12, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(item.status, "已重建")
+        self.assertTrue(item.formal_history_valid)
+        saved = save_mock.call_args.kwargs["df"]
+        first_date = cached_dates[0]
+        self.assertAlmostEqual(
+            float(saved.loc[saved["日期"] == first_date, "收盘价"].iloc[0]),
+            float(cached.loc[cached["日期"] == first_date, "收盘价"].iloc[0]) - 0.014,
+        )
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_failed_adjusted_rebuild_keeps_card_but_blocks_signals(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        dates = pd.bdate_range(end="2026-08-11", periods=40)
+        cached = _v2_adjusted_history(
+            pd.DataFrame(
+                {
+                    "日期": dates,
+                    "收盘价": [1.20 + index / 1000 for index in range(40)],
+                    "symbol": ["159545.SZ"] * 40,
+                    "name": ["恒生红利低波ETF易方达"] * 40,
+                    "_final_close_confirmed": [True] * 40,
+                }
+            )
+        )
+        changed_recent = cached.tail(10).copy()
+        changed_recent["收盘价"] = changed_recent["收盘价"] - 0.014
+        load_mock.return_value = (cached, {"last_update_time": "2026-08-11T16:00:00"})
+        fetch_mock.side_effect = [changed_recent, RuntimeError("full fetch failed")]
+
+        item = load_or_fetch_etf(
+            "159545",
+            api_key="test-key",
+            allow_fetch=True,
+            force_refresh=True,
+            save_to_cache=True,
+            market_now=datetime(2026, 8, 12, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(item.status, "缓存待校验")
+        self.assertFalse(item.formal_history_valid)
+        self.assertIn("全量重建失败", item.error)
+        self.assertEqual(item.cache_time, "2026-08-11 16:00:00")
+        self.assertEqual(item.metrics["最新价"], round(float(cached["收盘价"].iloc[-1]), 4))
+        self.assertNotIn("策略均线", item.metrics)
+        self.assertTrue(build_recent_etf_operation_guidance([item], days=7).empty)
+        save_mock.assert_not_called()
+
+    @patch("services.position_analysis._fetch_sina_exchange_fund_final_close")
+    def test_sina_raw_close_is_not_appended_to_backward_adjusted_history(
+        self,
+        final_close_mock,
+    ):
+        history = stamp_fund_history_metadata(
+            pd.DataFrame(
+                {
+                    "日期": pd.to_datetime(["2026-07-31"]),
+                    "收盘价": [6.77],
+                }
+            ),
+            FUND_ADJUST_BACKWARD_ADDITIVE,
+        )
+
+        result = _append_sina_final_close(
+            history,
+            symbol="161128.SZ",
+            adjust=FUND_ADJUST_BACKWARD_ADDITIVE,
+            market_now=datetime(2026, 8, 3, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        final_close_mock.assert_not_called()
+        self.assertEqual(len(result), 1)
+        self.assertIn("不能追加到后复权正式历史", result.attrs["position_history_warning"])
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_tickflow_fund_close")
+    @patch("services.position_analysis._load_dataset_if_ready", return_value=(None, None))
+    def test_new_cache_is_not_saved_when_full_history_lags_latest_completed_session(
+        self,
+        _load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        dates = pd.bdate_range(end="2026-08-11", periods=40)
+        fetch_mock.return_value = pd.DataFrame(
+            {
+                "日期": dates,
+                "收盘价": [1.2 + index / 1000 for index in range(len(dates))],
+                "symbol": ["159545.SZ"] * len(dates),
+                "name": ["恒生红利低波ETF易方达"] * len(dates),
+            }
+        )
+
+        item = load_or_fetch_etf(
+            "159545",
+            allow_fetch=True,
+            save_to_cache=True,
+            market_now=datetime(2026, 8, 12, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(item.status, "失败")
+        self.assertFalse(item.formal_history_valid)
+        self.assertIn("尚未覆盖最新完成交易日2026-08-12", item.error)
+        save_mock.assert_not_called()
+
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_159545_fixed_20260812_additive_sample(self, load_mock):
+        dates = pd.bdate_range("2026-06-15", "2026-08-12")
+        final_prices = {
+            "2026-07-30": 1.356,
+            "2026-07-31": 1.337,
+            "2026-08-03": 1.327,
+            "2026-08-04": 1.307,
+            "2026-08-05": 1.304,
+            "2026-08-06": 1.290,
+            "2026-08-07": 1.279,
+            "2026-08-10": 1.291,
+            "2026-08-11": 1.293,
+            "2026-08-12": 1.285,
+        }
+        prices = []
+        for date in dates:
+            if date < pd.Timestamp("2026-07-06"):
+                price = 1.20
+            elif date == pd.Timestamp("2026-07-06"):
+                price = 1.23
+            elif date < pd.Timestamp("2026-07-22"):
+                price = 1.28 + (date.day % 5) * 0.005
+            elif date <= pd.Timestamp("2026-07-29"):
+                price = 1.349
+            else:
+                price = final_prices[date.strftime("%Y-%m-%d")]
+            prices.append(price)
+        cached = _v2_adjusted_history(
+            pd.DataFrame(
+                {
+                    "日期": dates,
+                    "收盘价": prices,
+                    "symbol": ["159545.SZ"] * len(dates),
+                    "name": ["恒生红利低波ETF易方达"] * len(dates),
+                    "_final_close_confirmed": [True] * len(dates),
+                }
+            )
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-08-12T16:00:00"})
+
+        item = load_or_fetch_etf(
+            "159545",
+            allow_fetch=False,
+            market_now=datetime(2026, 8, 13, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+        snapshot = calculate_etf_timing_snapshot(
+            item.dataframe,
+            ma_period=10,
+            threshold_pct=1.0,
+        )
+
+        self.assertAlmostEqual(float(snapshot["策略均线"]), 1.3069, places=4)
+        self.assertAlmostEqual(float(snapshot["策略偏离(%)"]), -1.6757, places=4)
+        self.assertAlmostEqual(
+            float(item.dataframe.iloc[-1]["daily_return_pct"]),
+            -0.6187,
+            places=4,
+        )
+        self.assertEqual(snapshot["择时判断"], "空仓")
+        self.assertEqual(snapshot["状态转换时间"], "2026-08-04")
+        self.assertEqual(snapshot["上一状态转换时间"], "2026-07-06")
+        guidance = build_recent_etf_operation_guidance([item], days=10)
+        self.assertFalse(
+            bool(
+                ((guidance["日期"] == "2026-08-12") & (guidance["操作指引"] == "买入")).any()
+            )
+        )
 
     @patch("services.position_analysis._ensure_sina_adjustment_is_identity")
     @patch("services.position_analysis.requests.get")
@@ -1451,6 +1804,7 @@ class PositionAnalysisTests(unittest.TestCase):
                 "_final_close_confirmed": [True] * len(dates),
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-31T16:00:00"})
         eastmoney_mock.return_value = cached.drop(columns="_final_close_confirmed")
         final_close_mock.return_value = pd.DataFrame(
@@ -1511,8 +1865,9 @@ class PositionAnalysisTests(unittest.TestCase):
                 "name": ["红利低波ETF华泰柏瑞"],
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-23T16:00:00"})
-        fetch_mock.return_value = friday
+        fetch_mock.return_value = pd.concat([cached.tail(5), friday], ignore_index=True)
 
         item = load_or_fetch_etf(
             "512890",
@@ -1549,6 +1904,7 @@ class PositionAnalysisTests(unittest.TestCase):
                 "_final_close_confirmed": True,
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-24T16:00:00"})
 
         item = load_or_fetch_etf(
@@ -1590,8 +1946,9 @@ class PositionAnalysisTests(unittest.TestCase):
                 "name": ["红利低波ETF华泰柏瑞", "红利低波ETF华泰柏瑞"],
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-23T16:00:00"})
-        fetch_mock.return_value = latest
+        fetch_mock.return_value = pd.concat([cached.tail(5), latest], ignore_index=True)
 
         item = load_or_fetch_etf(
             "512890",
@@ -1636,8 +1993,9 @@ class PositionAnalysisTests(unittest.TestCase):
                 "name": ["红利低波ETF华泰柏瑞"] * 3,
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-20T16:00:00"})
-        fetch_mock.return_value = latest
+        fetch_mock.return_value = pd.concat([cached.tail(5), latest], ignore_index=True)
 
         item = load_or_fetch_etf(
             "512890",
@@ -1681,6 +2039,7 @@ class PositionAnalysisTests(unittest.TestCase):
             ],
             ignore_index=True,
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-14T16:00:00"})
         fetch_mock.return_value = latest
 
@@ -1710,6 +2069,7 @@ class PositionAnalysisTests(unittest.TestCase):
         )
         latest = cached.tail(5).copy()
         latest.loc[latest["日期"] == pd.Timestamp("2026-07-15"), "收盘价"] = 1.2
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-15T14:30:00"})
         fetch_mock.return_value = latest
 
@@ -1739,6 +2099,7 @@ class PositionAnalysisTests(unittest.TestCase):
                 "name": "标普500ETF华夏",
             }
         )
+        cached = _v2_adjusted_history(cached)
         load_mock.return_value = (cached, {"last_update_time": "2026-07-14T16:00:00"})
 
         item = load_or_fetch_etf("159655", allow_fetch=False)

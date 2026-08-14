@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from contextlib import closing
 from datetime import date, datetime
 import re
@@ -34,6 +35,22 @@ LIVE_DAILY_PNL_COLUMNS = [
     "net_investment",
     "return_pct",
 ]
+LIVE_DAILY_RETURN_COLUMNS = [
+    "date",
+    "pnl_amount",
+    "return_base",
+    "return_pct",
+    "daily_buy_cost",
+    "daily_sell_proceeds",
+]
+LIVE_PERIOD_RETURN_COLUMNS = [
+    "period_start",
+    "period_end",
+    "label",
+    "pnl_amount",
+    "return_pct",
+]
+LIVE_RETURN_PERIODS = ("day", "week", "month", "year")
 LIVE_POSITION_PERFORMANCE_COLUMNS = [
     "name",
     "symbol",
@@ -510,6 +527,171 @@ def build_live_daily_pnl(
             }
         )
     return pd.DataFrame(rows, columns=LIVE_DAILY_PNL_COLUMNS)
+
+
+def build_live_daily_returns(daily_pnl: pd.DataFrame) -> pd.DataFrame:
+    """Derive close-to-close holding returns without treating trades as profit."""
+    required_columns = {
+        "date",
+        "market_value",
+        "total_pnl",
+        "cumulative_buy_cost",
+        "net_investment",
+    }
+    if daily_pnl is None or daily_pnl.empty or not required_columns.issubset(daily_pnl.columns):
+        return pd.DataFrame(columns=LIVE_DAILY_RETURN_COLUMNS)
+
+    data = daily_pnl[list(required_columns)].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    numeric_columns = required_columns - {"date"}
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    data = (
+        data.dropna(subset=list(required_columns))
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+    if data.empty:
+        return pd.DataFrame(columns=LIVE_DAILY_RETURN_COLUMNS)
+
+    previous_total_pnl = data["total_pnl"].shift(1, fill_value=0.0)
+    pnl_amount = data["total_pnl"] - previous_total_pnl
+    daily_buy_cost = data["cumulative_buy_cost"].diff()
+    daily_buy_cost.iloc[0] = data.iloc[0]["cumulative_buy_cost"]
+    daily_buy_cost = daily_buy_cost.clip(lower=0.0)
+
+    cumulative_sell_proceeds = data["cumulative_buy_cost"] - data["net_investment"]
+    daily_sell_proceeds = cumulative_sell_proceeds.diff()
+    daily_sell_proceeds.iloc[0] = cumulative_sell_proceeds.iloc[0]
+    daily_sell_proceeds = daily_sell_proceeds.clip(lower=0.0)
+
+    previous_market_value = data["market_value"].shift(1, fill_value=0.0)
+    net_new_investment = (daily_buy_cost - daily_sell_proceeds).clip(lower=0.0)
+    return_base = previous_market_value + net_new_investment
+    starts_from_empty = previous_market_value.le(0.0) & daily_buy_cost.gt(0.0)
+    return_base = return_base.where(~starts_from_empty, daily_buy_cost)
+
+    return_pct = pd.Series(pd.NA, index=data.index, dtype="Float64")
+    valid_base = return_base.gt(0.0)
+    return_pct.loc[valid_base] = (
+        pnl_amount.loc[valid_base] / return_base.loc[valid_base] * 100
+    )
+    no_exposure_change = ~valid_base & pnl_amount.abs().le(1e-12)
+    return_pct.loc[no_exposure_change] = 0.0
+
+    return pd.DataFrame(
+        {
+            "date": data["date"],
+            "pnl_amount": pnl_amount.astype(float),
+            "return_base": return_base.astype(float),
+            "return_pct": return_pct,
+            "daily_buy_cost": daily_buy_cost.astype(float),
+            "daily_sell_proceeds": daily_sell_proceeds.astype(float),
+        },
+        columns=LIVE_DAILY_RETURN_COLUMNS,
+    )
+
+
+def _compound_return_pct(values: pd.Series) -> float | object:
+    rates = pd.to_numeric(values, errors="coerce")
+    if rates.isna().any():
+        return pd.NA
+    return float(((1.0 + rates / 100.0).prod() - 1.0) * 100.0)
+
+
+def build_live_period_returns(
+    daily_returns: pd.DataFrame,
+    *,
+    period: str,
+    excluded_dates: set[date] | None = None,
+) -> pd.DataFrame:
+    """Aggregate daily holding returns into calendar day, week, month, or year."""
+    normalized_period = str(period or "").strip().lower()
+    if normalized_period not in LIVE_RETURN_PERIODS:
+        raise ValueError(f"不支持的收益周期：{period}。")
+    required_columns = {"date", "pnl_amount", "return_pct"}
+    if (
+        daily_returns is None
+        or daily_returns.empty
+        or not required_columns.issubset(daily_returns.columns)
+    ):
+        return pd.DataFrame(columns=LIVE_PERIOD_RETURN_COLUMNS)
+
+    data = daily_returns[list(required_columns)].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    data["pnl_amount"] = pd.to_numeric(data["pnl_amount"], errors="coerce")
+    data["return_pct"] = pd.to_numeric(data["return_pct"], errors="coerce")
+    data = (
+        data.dropna(subset=["date", "pnl_amount"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+    data = data[data["date"].dt.weekday.lt(5)].copy()
+    if excluded_dates:
+        normalized_excluded_dates = {
+            pd.Timestamp(value).date()
+            for value in excluded_dates
+            if not pd.isna(pd.Timestamp(value))
+        }
+        data = data[~data["date"].dt.date.isin(normalized_excluded_dates)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=LIVE_PERIOD_RETURN_COLUMNS)
+
+    if normalized_period == "day":
+        return pd.DataFrame(
+            {
+                "period_start": data["date"],
+                "period_end": data["date"],
+                "label": data["date"].dt.strftime("%d"),
+                "pnl_amount": data["pnl_amount"].astype(float),
+                "return_pct": data["return_pct"].astype("Float64"),
+            },
+            columns=LIVE_PERIOD_RETURN_COLUMNS,
+        )
+
+    frequency = {
+        "week": "W-SUN",
+        "month": "M",
+        "year": "Y",
+    }[normalized_period]
+    data["_period"] = data["date"].dt.to_period(frequency)
+    rows: list[dict[str, object]] = []
+    for period_key, group in data.groupby("_period", sort=True):
+        period_start = pd.Timestamp(period_key.start_time).normalize()
+        period_end = (
+            period_start + pd.Timedelta(days=4)
+            if normalized_period == "week"
+            else pd.Timestamp(period_key.end_time).normalize()
+        )
+        if normalized_period == "week":
+            iso_year, iso_week, _weekday = period_start.isocalendar()
+            label = f"{iso_year}年第{iso_week:02d}周"
+        elif normalized_period == "month":
+            label = f"{period_start.month}月"
+        else:
+            label = f"{period_start.year}年"
+        rows.append(
+            {
+                "period_start": period_start,
+                "period_end": period_end,
+                "label": label,
+                "pnl_amount": float(group["pnl_amount"].sum()),
+                "return_pct": _compound_return_pct(group["return_pct"]),
+            }
+        )
+    return pd.DataFrame(rows, columns=LIVE_PERIOD_RETURN_COLUMNS)
+
+
+def build_live_return_month_grid(year: int, month: int) -> list[list[date]]:
+    """Build Monday-Friday rows for a monthly return calendar."""
+    rows: list[list[date]] = []
+    for week in calendar.Calendar(firstweekday=0).monthdatescalendar(year, month):
+        weekdays = week[:5]
+        if any(day.year == year and day.month == month for day in weekdays):
+            rows.append(weekdays)
+    return rows
 
 
 def build_live_position_performance(

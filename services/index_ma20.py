@@ -385,6 +385,8 @@ def build_export_df(
     )
     result["状态转变时间"] = transition_history["状态转变时间"]
     result["区间涨幅"] = transition_history["区间涨幅"]
+    result["上一状态转换时间"] = transition_history["上一状态转换时间"]
+    result["上一区间涨幅"] = transition_history["上一区间涨幅"]
 
     start_date = pd.Timestamp(datetime.now()).normalize() - pd.Timedelta(days=days)
     recent_data = result[result["trade_date"] >= start_date].copy()
@@ -392,13 +394,25 @@ def build_export_df(
         return None
 
     export_df = recent_data[
-        ["trade_date", "close", "MA20", "偏离率", "状态转变时间", "区间涨幅"]
+        [
+            "trade_date",
+            "close",
+            "MA20",
+            "偏离率",
+            "状态转变时间",
+            "区间涨幅",
+            "上一状态转换时间",
+            "上一区间涨幅",
+        ]
     ].copy()
     export_df["trade_date"] = export_df["trade_date"].dt.strftime("%Y-%m-%d")
     export_df["close"] = export_df["close"].round(2)
     export_df["MA20"] = export_df["MA20"].round(2)
     export_df["偏离率"] = export_df["偏离率"].round(2)
     export_df["区间涨幅"] = pd.to_numeric(export_df["区间涨幅"], errors="coerce").round(2)
+    export_df["上一区间涨幅"] = pd.to_numeric(
+        export_df["上一区间涨幅"], errors="coerce"
+    ).round(2)
     export_df.columns = [
         "日期",
         f"{index_name}_收盘价",
@@ -406,6 +420,8 @@ def build_export_df(
         f"{index_name}_偏离率(%)",
         f"{index_name}_状态转变时间",
         f"{index_name}_区间涨幅(%)",
+        f"{index_name}_上一状态转换时间",
+        f"{index_name}_上一区间涨幅(%)",
     ]
     return export_df
 
@@ -1949,18 +1965,39 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
         show_deviation = index_config.get("show_ma20_deviation", True)
         transition_col = f"{index_name}_状态转变时间"
         interval_col = f"{index_name}_区间涨幅(%)"
+        previous_transition_col = f"{index_name}_上一状态转换时间"
+        previous_interval_col = f"{index_name}_上一区间涨幅(%)"
         transition_date, interval_return_pct = (pd.NA, pd.NA)
+        previous_transition_date, previous_interval_return_pct = (pd.NA, pd.NA)
         if show_deviation and not indicator_rows.empty:
-            if transition_col in latest and interval_col in latest and not pd.isna(latest[transition_col]):
-                transition_date = latest[transition_col]
-                interval_return_pct = latest[interval_col]
-            else:
-                transition_date, interval_return_pct = calculate_ma20_transition(
-                    indicator_rows,
-                    close_col,
-                    ma20_col,
-                    date_col="日期",
-                )
+            calculated_transition = calculate_ma20_transition_snapshot(
+                indicator_rows,
+                close_col,
+                ma20_col,
+                date_col="日期",
+            )
+            transition_date = (
+                latest[transition_col]
+                if transition_col in latest and not pd.isna(latest[transition_col])
+                else calculated_transition[0]
+            )
+            interval_return_pct = (
+                latest[interval_col]
+                if interval_col in latest and not pd.isna(latest[interval_col])
+                else calculated_transition[1]
+            )
+            previous_transition_date = (
+                latest[previous_transition_col]
+                if previous_transition_col in latest
+                and not pd.isna(latest[previous_transition_col])
+                else calculated_transition[2]
+            )
+            previous_interval_return_pct = (
+                latest[previous_interval_col]
+                if previous_interval_col in latest
+                and not pd.isna(latest[previous_interval_col])
+                else calculated_transition[3]
+            )
         previous_close = pd.NA
         daily_change_pct = pd.NA
         if len(price_rows) >= 2:
@@ -1979,6 +2016,8 @@ def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
                 "偏离率(%)": latest[deviation_col] if show_deviation and deviation_col in latest else pd.NA,
                 "状态转变时间": transition_date,
                 "区间涨幅(%)": interval_return_pct,
+                "上一状态转换时间": previous_transition_date,
+                "上一区间涨幅(%)": previous_interval_return_pct,
             }
         )
     if not rows:
@@ -1992,6 +2031,21 @@ def calculate_ma20_transition(
     ma20_col: str,
     date_col: str = "日期",
 ) -> tuple[object, object]:
+    transition = calculate_ma20_transition_snapshot(
+        valid_rows,
+        close_col,
+        ma20_col,
+        date_col=date_col,
+    )
+    return transition[0], transition[1]
+
+
+def calculate_ma20_transition_snapshot(
+    valid_rows: pd.DataFrame,
+    close_col: str,
+    ma20_col: str,
+    date_col: str = "日期",
+) -> tuple[object, object, object, object]:
     history = calculate_ma20_transition_history(
         valid_rows,
         close_col,
@@ -2000,10 +2054,15 @@ def calculate_ma20_transition(
     )
     valid_history = history.dropna(subset=["状态转变时间"])
     if valid_history.empty:
-        return pd.NA, pd.NA
+        return pd.NA, pd.NA, pd.NA, pd.NA
 
     latest = valid_history.iloc[-1]
-    return latest["状态转变时间"], latest["区间涨幅"]
+    return (
+        latest["状态转变时间"],
+        latest["区间涨幅"],
+        latest["上一状态转换时间"],
+        latest["上一区间涨幅"],
+    )
 
 
 def calculate_ma20_transition_history(
@@ -2016,6 +2075,12 @@ def calculate_ma20_transition_history(
         {
             "状态转变时间": pd.Series(pd.NA, index=valid_rows.index, dtype="object"),
             "区间涨幅": pd.Series(pd.NA, index=valid_rows.index, dtype="Float64"),
+            "上一状态转换时间": pd.Series(
+                pd.NA, index=valid_rows.index, dtype="object"
+            ),
+            "上一区间涨幅": pd.Series(
+                pd.NA, index=valid_rows.index, dtype="Float64"
+            ),
         }
     )
     if len(valid_rows) < 2 or date_col not in valid_rows.columns:
@@ -2038,7 +2103,27 @@ def calculate_ma20_transition_history(
         .ffill()
     )
     interval_return = (data[close_col] / transition_close - 1) * 100
+    transition_event_dates = (
+        pd.to_datetime(data.loc[is_transition, date_col], errors="coerce")
+        .dt.strftime("%Y-%m-%d")
+    )
+    transition_event_closes = data.loc[is_transition, close_col]
+    previous_transition_date = pd.Series(pd.NA, index=data.index, dtype="object")
+    previous_interval_return = pd.Series(pd.NA, index=data.index, dtype="Float64")
+    previous_transition_date.loc[transition_event_dates.index] = (
+        transition_event_dates.shift(1)
+    )
+    completed_interval_return = (
+        transition_event_closes / transition_event_closes.shift(1) - 1
+    ) * 100
+    previous_interval_return.loc[completed_interval_return.index] = (
+        completed_interval_return
+    )
+    previous_transition_date = previous_transition_date.ffill()
+    previous_interval_return = previous_interval_return.ffill()
 
     history.loc[data.index, "状态转变时间"] = transition_date
     history.loc[data.index, "区间涨幅"] = interval_return.astype("Float64")
+    history.loc[data.index, "上一状态转换时间"] = previous_transition_date
+    history.loc[data.index, "上一区间涨幅"] = previous_interval_return
     return history

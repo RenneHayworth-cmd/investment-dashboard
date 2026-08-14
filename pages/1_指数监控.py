@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from core.cache import load_dataset
+from core.cache import list_datasets, load_dataset
 from core.db import init_db
 from core.ui import DEFAULT_CHART_HEIGHT, apply_global_style, apply_plotly_layout, render_page_header
 from services.index_ma20 import (
@@ -36,6 +36,7 @@ from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, late
 from services.update_tasks import (
     enrich_index_report_indicators,
     run_index_ma20_update,
+    refresh_futures_current_contract_histories,
     trim_index_report,
 )
 
@@ -72,6 +73,10 @@ if "index_lunch_quote_keys" not in st.session_state:
     st.session_state.index_lunch_quote_keys = []
 if "index_futures_main_contracts" not in st.session_state:
     st.session_state.index_futures_main_contracts = load_futures_main_contract_names()
+if "index_report_observed_signature" not in st.session_state:
+    st.session_state.index_report_observed_signature = None
+if "index_report_watcher_initialized" not in st.session_state:
+    st.session_state.index_report_watcher_initialized = False
 
 
 def format_update_time(value: str | None) -> str:
@@ -81,6 +86,56 @@ def format_update_time(value: str | None) -> str:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return value.replace("T", " ")
+
+
+def build_index_report_cache_signature(
+    source: object,
+    last_trade_date: object,
+    last_update_time: object,
+    row_count: object,
+) -> str:
+    values = (source, last_trade_date, last_update_time, row_count)
+    return "|".join("" if value is None or pd.isna(value) else str(value) for value in values)
+
+
+def index_report_cache_signature() -> str | None:
+    datasets = list_datasets()
+    if datasets.empty:
+        return None
+    for source in ("auto", "manual"):
+        matched = datasets[
+            (datasets["symbol"] == "index_ma20_latest")
+            & (datasets["source"] == source)
+            & (datasets["data_type"] == "index_ma20_report")
+        ]
+        if matched.empty:
+            continue
+        row = matched.iloc[0]
+        return build_index_report_cache_signature(
+            row.get("source"),
+            row.get("last_trade_date"),
+            row.get("last_update_time"),
+            row.get("row_count"),
+        )
+    return None
+
+
+@st.fragment(run_every="30s")
+def watch_scheduled_index_cache() -> None:
+    """Refresh this page after the standalone scheduler changes the local report cache."""
+    current_signature = index_report_cache_signature()
+    observed_signature = st.session_state.get("index_report_observed_signature")
+    if not st.session_state.get("index_report_watcher_initialized"):
+        st.session_state.index_report_observed_signature = current_signature
+        st.session_state.index_report_watcher_initialized = True
+        return
+    if current_signature and current_signature != observed_signature:
+        st.session_state.index_report_observed_signature = current_signature
+        st.session_state.index_update_notice = (
+            "success",
+            "本地正式指数数据已更新，卡片和MA20已同步刷新。",
+        )
+        st.rerun()
 
 
 def format_number(value) -> str:
@@ -611,6 +666,7 @@ with st.sidebar:
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
     update_clicked = st.button("更新指数数据", type="primary")
+    st.caption("每天15:10、16:10自动补齐正式日线；本页只监听本地缓存并自动重绘。")
 
 notice = st.session_state.pop("index_update_notice", None)
 if notice:
@@ -618,6 +674,7 @@ if notice:
     getattr(st, level)(message)
 
 if update_clicked:
+    contract_history_errors = []
     completed_lunch_keys = set(st.session_state.get("index_lunch_quote_keys", []))
     quote_names, lunch_keys = manual_quote_request_names(completed_lunch_keys)
     quotes = fetch_realtime_index_quotes(
@@ -637,6 +694,10 @@ if update_clicked:
         if resolved_contracts:
             st.session_state.index_futures_main_contracts = save_futures_main_contract_names(
                 resolved_contracts
+            )
+            contract_history_errors = refresh_futures_current_contract_histories(
+                resolved_contracts,
+                max_workers=INDEX_UPDATE_WORKERS,
             )
 
     pending_indexes = find_pending_post_close_index_names()
@@ -679,14 +740,17 @@ if update_clicked:
         message_parts.append(f"实时卡片已更新 {len(quotes)} 个盘中/午间报价")
     if result is not None:
         message_parts.append(result.message)
+    if contract_history_errors:
+        message_parts.append("当前合约正式日线更新失败：" + " | ".join(contract_history_errors))
     if not message_parts:
         message_parts.append("当前没有需要联网更新的指数数据")
-    level = "warning" if result is not None and (result.status != "success" or result.errors) else "success"
+    level = "warning" if contract_history_errors or (result is not None and (result.status != "success" or result.errors)) else "success"
     st.session_state.index_update_notice = (level, "；".join(message_parts))
     st.rerun()
 
 report_df = None
 report_meta = None
+report_source = None
 for source in ("auto", "manual"):
     report_df, meta = load_dataset(
         "index_ma20_latest",
@@ -695,7 +759,22 @@ for source in ("auto", "manual"):
     )
     if report_df is not None:
         report_meta = meta
+        report_source = source
         break
+
+# A normal page rerun already renders the newest cache, so only a later
+# fragment-only metadata change should trigger another full page rerun.
+st.session_state.index_report_observed_signature = (
+    build_index_report_cache_signature(
+        report_source,
+        report_meta.get("last_trade_date") if report_meta else None,
+        report_meta.get("last_update_time") if report_meta else None,
+        len(report_df) if report_df is not None else None,
+    )
+    if report_source is not None
+    else None
+)
+st.session_state.index_report_watcher_initialized = True
 
 if report_df is not None and report_meta is not None:
     st.caption(f"更新时间：{format_update_time(report_meta['last_update_time'])}")
@@ -737,3 +816,5 @@ if report_df is not None:
         st.dataframe(report_df, use_container_width=True, hide_index=True)
 else:
     st.info("还没有缓存数据。可以先点击左侧按钮联网更新，或上传已有 CSV。")
+
+watch_scheduled_index_cache()

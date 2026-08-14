@@ -4,6 +4,11 @@ import re
 
 import pandas as pd
 
+from services.fund_analysis import (
+    FUND_ADJUST_FORWARD_ADDITIVE,
+    normalize_fund_adjustment,
+)
+
 
 def parse_us_symbols(text: str) -> list[str]:
     symbols = [item.strip().upper() for item in re.split(r"[\s,，;；]+", text) if item.strip()]
@@ -29,19 +34,19 @@ def fetch_tickflow_us_daily(
     symbol: str,
     api_key: str = "",
     count: int = 1500,
-    adjust: str | None = "forward",
+    adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
 ) -> pd.DataFrame:
     from tickflow import TickFlow
 
+    adjustment = normalize_fund_adjustment(adjust)
     client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
     name = fetch_tickflow_us_name(symbol, api_key=api_key)
     kwargs = {
         "period": "1d",
         "count": count,
         "as_dataframe": True,
+        "adjust": adjustment,
     }
-    if adjust:
-        kwargs["adjust"] = adjust
     df = client.klines.get(symbol, **kwargs)
     if df is None or df.empty:
         raise ValueError(f"TickFlow 未返回 {symbol} 的日线数据。")

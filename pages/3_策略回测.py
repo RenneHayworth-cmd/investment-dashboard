@@ -7,6 +7,9 @@ import streamlit as st
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
 from services.fund_analysis import (
+    FUND_ADJUSTMENT_OPTIONS,
+    FUND_ADJUST_NONE,
+    build_fund_cache_symbol,
     fetch_eastmoney_fund_nav,
     fetch_tickflow_fund_close,
     infer_tickflow_symbol,
@@ -31,6 +34,11 @@ from services.fund_rotation import (
 FULL_HISTORY_COUNT = 10000
 FULL_HISTORY_CACHE_PERIOD = "full_1d"
 LEGACY_CACHE_PERIODS = ("10000_1d", "5000_1d")
+BACKTEST_ADJUSTMENT_OPTIONS = {
+    label: mode
+    for label, mode in FUND_ADJUSTMENT_OPTIONS.items()
+    if mode != FUND_ADJUST_NONE
+}
 PORTFOLIO_STRATEGY_LABELS = {
     "一直持有": PORTFOLIO_STRATEGY_HOLD,
     "纯择时": PORTFOLIO_STRATEGY_TIMING,
@@ -385,7 +393,11 @@ def render_ma20_timing_mode() -> None:
 
     with st.form("ma20_timing_form"):
         code = st.text_input("场内基金/ETF代码", value="512890", placeholder="例如 512890、159915 或 512890.SH")
-        adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0)
+        adjust_option = st.selectbox(
+            "复权",
+            options=list(BACKTEST_ADJUSTMENT_OPTIONS),
+            index=0,
+        )
         api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         run_clicked = st.form_submit_button("运行MA20择时回测", type="primary")
 
@@ -398,9 +410,8 @@ def render_ma20_timing_mode() -> None:
 
     try:
         symbol = infer_tickflow_symbol(code)
-        adjust_map = {"前复权": "forward", "后复权": "backward"}
-        adjust_value = adjust_map[adjust_option]
-        cache_symbol = f"fund_rotation_{symbol}_{adjust_value}"
+        adjust_value = BACKTEST_ADJUSTMENT_OPTIONS[adjust_option]
+        cache_symbol = build_fund_cache_symbol("fund_rotation", symbol, adjust_value)
         cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
         try:
             with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."):
@@ -706,7 +717,12 @@ def render_portfolio_timing_mode() -> None:
             },
             key="portfolio_timing_config_editor",
         )
-        adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0, key="portfolio_timing_adjust")
+        adjust_option = st.selectbox(
+            "复权",
+            options=list(BACKTEST_ADJUSTMENT_OPTIONS),
+            index=0,
+            key="portfolio_timing_adjust",
+        )
         api_key = st.text_input(
             "TickFlow API Key",
             value=os.getenv("TICKFLOW_API_KEY", ""),
@@ -725,13 +741,15 @@ def render_portfolio_timing_mode() -> None:
 
     try:
         allocations = parse_portfolio_allocations(config_df)
-        adjust_value = "forward" if adjust_option == "前复权" else "backward"
+        adjust_value = BACKTEST_ADJUSTMENT_OPTIONS[adjust_option]
         funds = []
         data_messages = []
         for allocation in allocations:
             if allocation.strategy == PORTFOLIO_STRATEGY_CASH:
                 continue
-            cache_symbol = f"fund_rotation_{allocation.symbol}_{adjust_value}"
+            cache_symbol = build_fund_cache_symbol(
+                "fund_rotation", allocation.symbol, adjust_value
+            )
             cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
             raw_df = cached_df
             if force_refresh or cached_df is None:
@@ -880,7 +898,7 @@ if strategy_mode == "多ETF配置择时":
 uploaded_files = []
 tickflow_codes = ""
 eastmoney_codes = ""
-adjust_option = "前复权"
+adjust_option = "前复权（差值）"
 api_key = ""
 max_workers = 8
 force_refresh = False
@@ -903,7 +921,11 @@ with st.form("fund_rotation_data_form"):
             height=96,
             placeholder="可输入 159915 512890，或 159915.SZ 512890.SH",
         )
-        adjust_option = st.selectbox("复权", options=["前复权", "后复权"], index=0)
+        adjust_option = st.selectbox(
+            "复权",
+            options=list(BACKTEST_ADJUSTMENT_OPTIONS),
+            index=0,
+        )
         api_key = st.text_input("TickFlow API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         force_refresh = st.checkbox("联网更新数据", value=False)
     elif data_source == "场外基金":
@@ -1023,12 +1045,13 @@ try:
             if len(codes) < 2:
                 st.error("至少需要输入 2 个场内基金/ETF代码。")
                 st.stop()
-            adjust_map = {"前复权": "forward", "后复权": "backward"}
-            adjust_value = adjust_map[adjust_option]
+            adjust_value = BACKTEST_ADJUSTMENT_OPTIONS[adjust_option]
             for code in codes:
                 try:
                     symbol = infer_tickflow_symbol(code)
-                    cache_symbol = f"fund_rotation_{symbol}_{adjust_value}"
+                    cache_symbol = build_fund_cache_symbol(
+                        "fund_rotation", symbol, adjust_value
+                    )
                     cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
                     if cached_df is not None and not force_refresh:
                         raw_df = cached_df

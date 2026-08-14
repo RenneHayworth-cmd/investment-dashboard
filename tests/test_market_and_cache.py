@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -29,17 +29,26 @@ from services.index_ma20 import (
     sanitize_index_report_market_dates,
     supplement_stale_yahoo_history,
 )
-from services.market_calendar import get_market_window, is_market_trading_day, latest_completed_trade_date
+from services.market_calendar import (
+    STATIC_MARKET_HOLIDAYS,
+    get_market_holiday_label,
+    get_market_window,
+    is_market_trading_day,
+    latest_completed_trade_date,
+)
 from services.position_analysis import _cache_has_expected_trade_date
 from services.update_tasks import (
     append_cached_index_rows,
+    build_futures_current_contract_report,
     build_index_update_message,
     enrich_index_report_indicators,
+    find_pending_futures_current_contract_index_names,
     fetch_index_report,
     has_current_index_quote,
     merge_index_report,
     persist_confirmed_index_report_row,
     refresh_cached_eastmoney_index_report,
+    refresh_futures_current_contract_histories,
     sync_index_long_history,
     verify_updated_index_data,
 )
@@ -392,6 +401,24 @@ class MarketAndCacheTests(unittest.TestCase):
             self.assertIsNotNone(market)
             market_now = datetime.fromisoformat(value).replace(tzinfo=ZoneInfo(market.timezone))
             self.assertFalse(is_market_trading_day(market, market_now), market_name)
+
+    def test_a_share_holiday_labels_cover_static_weekday_closures(self):
+        market = get_market_window("A股")
+
+        self.assertEqual(get_market_holiday_label(market, date(2026, 6, 19)), "端午")
+        self.assertEqual(get_market_holiday_label(market, date(2026, 2, 16)), "春节")
+        self.assertEqual(get_market_holiday_label(market, date(2026, 2, 23)), "春节")
+        self.assertIsNone(get_market_holiday_label(market, date(2026, 6, 20)))
+        for holiday in STATIC_MARKET_HOLIDAYS["A股"]:
+            if holiday.weekday() < 5:
+                self.assertIsNotNone(get_market_holiday_label(market, holiday))
+
+    @patch("services.market_calendar.is_market_holiday", return_value=True)
+    def test_unknown_named_weekday_closure_uses_generic_label(self, _holiday_mock):
+        market = get_market_window("A股")
+
+        self.assertEqual(get_market_holiday_label(market, date(2027, 1, 4)), "休市")
+        self.assertIsNone(get_market_holiday_label(market, date(2027, 1, 3)))
 
     def test_weekend_cache_accepts_latest_trading_day(self):
         cache = pd.DataFrame({"date": ["2026-07-10"]})
@@ -759,6 +786,169 @@ class MarketAndCacheTests(unittest.TestCase):
         self.assertFalse(pd.isna(latest["微盘股_状态转变时间"]))
         self.assertFalse(pd.isna(latest["微盘股_区间涨幅(%)"]))
 
+    def test_futures_main_enrichment_uses_current_contract_history(self):
+        main_history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-08-12", periods=30),
+                "close": [740.0] * 30,
+            }
+        )
+        contract_history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-08-12", periods=30),
+                "close": list(range(700, 730)),
+            }
+        )
+        report = build_export_df(main_history, "铁矿石主连", days=10000)
+        mapping = pd.DataFrame(
+            {"index_name": ["铁矿石主连"], "contract": ["I2701"]}
+        )
+
+        def load_side_effect(_symbol, source, data_type):
+            if source == "index_metadata" and data_type == "futures_main_contracts":
+                return mapping, {}
+            if source == "index_futures_current_contract_history":
+                return contract_history, {}
+            return None, None
+
+        with patch("services.update_tasks.load_dataset", side_effect=load_side_effect):
+            enriched = enrich_index_report_indicators(report)
+
+        latest = enriched.loc[enriched["日期"] == "2026-08-12"].iloc[0]
+        self.assertEqual(latest["铁矿石主连_收盘价"], 729.0)
+        self.assertEqual(latest["铁矿石主连_MA20"], 719.5)
+
+    def test_futures_main_current_contract_falls_back_when_cache_is_stale(self):
+        report_raw = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-08-12", periods=30),
+                "close": [740.0] * 30,
+            }
+        )
+        stale_contract_history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-08-11", periods=30),
+                "close": [710.0] * 30,
+            }
+        )
+        mapping = pd.DataFrame(
+            {"index_name": ["铁矿石主连"], "contract": ["I2701"]}
+        )
+
+        def load_side_effect(_symbol, source, data_type):
+            if source == "index_metadata" and data_type == "futures_main_contracts":
+                return mapping, {}
+            if source == "index_futures_current_contract_history":
+                return stale_contract_history, {}
+            return None, None
+
+        with patch("services.update_tasks.load_dataset", side_effect=load_side_effect):
+            result = build_futures_current_contract_report(
+                "铁矿石主连",
+                report_raw,
+                days=10000,
+            )
+
+        self.assertIsNone(result)
+
+    def test_futures_contract_refresh_appends_without_overwriting_old_dates(self):
+        cached = pd.DataFrame(
+            {"trade_date": ["2026-08-11"], "close": [700.0]}
+        )
+        fetched = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-11", "2026-08-12"]),
+                "close": [999.0, 710.0],
+            }
+        )
+        saved_frames = []
+
+        def load_side_effect(_symbol, source, _data_type):
+            if source == "index_futures_current_contract_history":
+                return cached, {}
+            return None, None
+
+        def save_side_effect(**kwargs):
+            saved_frames.append(kwargs["df"].copy())
+
+        with (
+            patch("services.update_tasks.load_dataset", side_effect=load_side_effect),
+            patch("services.update_tasks.save_dataset", side_effect=save_side_effect),
+            patch(
+                "services.update_tasks.latest_settled_trade_date",
+                return_value=pd.Timestamp("2026-08-12").date(),
+            ),
+            patch(
+                "services.futures_spread.fetch_futures_daily_from_akshare",
+                return_value=fetched,
+            ),
+        ):
+            errors = refresh_futures_current_contract_histories(
+                {"铁矿石主连": "I2701"},
+                max_workers=1,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(saved_frames), 1)
+        saved = saved_frames[0].set_index("trade_date")
+        self.assertEqual(saved.loc[pd.Timestamp("2026-08-11"), "close"], 700.0)
+        self.assertEqual(saved.loc[pd.Timestamp("2026-08-12"), "close"], 710.0)
+
+    def test_futures_contract_refresh_excludes_unsettled_current_day(self):
+        cached = pd.DataFrame({"trade_date": ["2026-08-10"], "close": [700.0]})
+        fetched = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-10", "2026-08-11", "2026-08-12"]),
+                "close": [700.0, 705.0, 710.0],
+            }
+        )
+        saved_frames = []
+
+        def load_side_effect(_symbol, source, _data_type):
+            return (cached, {}) if source == "index_futures_current_contract_history" else (None, None)
+
+        with (
+            patch("services.update_tasks.load_dataset", side_effect=load_side_effect),
+            patch(
+                "services.update_tasks.save_dataset",
+                side_effect=lambda **kwargs: saved_frames.append(kwargs["df"].copy()),
+            ),
+            patch(
+                "services.futures_spread.fetch_futures_daily_from_akshare",
+                return_value=fetched,
+            ),
+        ):
+            errors = refresh_futures_current_contract_histories(
+                {"铁矿石主连": "I2701"},
+                max_workers=1,
+                market_now=datetime(2026, 8, 12, 15, 5, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(saved_frames), 1)
+        self.assertEqual(
+            pd.to_datetime(saved_frames[0]["trade_date"]).dt.strftime("%Y-%m-%d").tolist(),
+            ["2026-08-10", "2026-08-11"],
+        )
+
+    def test_pending_futures_contract_is_independent_from_main_history_status(self):
+        mapping = pd.DataFrame({"index_name": ["铁矿石主连"], "contract": ["I2701"]})
+        stale = pd.DataFrame({"trade_date": ["2026-08-11"], "close": [700.0]})
+
+        def load_side_effect(_symbol, source, data_type):
+            if source == "index_metadata" and data_type == "futures_main_contracts":
+                return mapping, {}
+            if source == "index_futures_current_contract_history":
+                return stale, {}
+            return None, None
+
+        with patch("services.update_tasks.load_dataset", side_effect=load_side_effect):
+            pending = find_pending_futures_current_contract_index_names(
+                market_now=datetime(2026, 8, 12, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai")),
+            )
+
+        self.assertEqual(pending, {"铁矿石主连"})
+
     def test_index_report_calculates_each_historical_transition_interval(self):
         history = pd.DataFrame(
             {
@@ -776,12 +966,44 @@ class MarketAndCacheTests(unittest.TestCase):
 
         self.assertEqual(first_below["测试指数_状态转变时间"], "2026-07-10")
         self.assertEqual(first_below["测试指数_区间涨幅(%)"], 0.0)
+        self.assertTrue(pd.isna(first_below["测试指数_上一状态转换时间"]))
+        self.assertTrue(pd.isna(first_below["测试指数_上一区间涨幅(%)"]))
         self.assertEqual(still_below["测试指数_状态转变时间"], "2026-07-10")
         self.assertEqual(still_below["测试指数_区间涨幅(%)"], -11.11)
         self.assertEqual(first_above["测试指数_状态转变时间"], "2026-07-14")
         self.assertEqual(first_above["测试指数_区间涨幅(%)"], 0.0)
+        self.assertEqual(first_above["测试指数_上一状态转换时间"], "2026-07-10")
+        self.assertEqual(first_above["测试指数_上一区间涨幅(%)"], 33.33)
         self.assertEqual(still_above["测试指数_状态转变时间"], "2026-07-14")
         self.assertEqual(still_above["测试指数_区间涨幅(%)"], 10.0)
+        self.assertEqual(still_above["测试指数_上一状态转换时间"], "2026-07-10")
+        self.assertEqual(still_above["测试指数_上一区间涨幅(%)"], 33.33)
+
+    def test_index_summary_includes_previous_transition_interval(self):
+        history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-07-15", periods=24),
+                "close": [100.0] * 20 + [90.0, 80.0, 120.0, 132.0],
+            }
+        )
+        report = build_export_df(history, "沪深300", days=10000)
+
+        summary = build_summary(report)
+        row = summary.loc[summary["指数"] == "沪深300"].iloc[0]
+
+        self.assertEqual(
+            summary.columns.tolist()[-4:],
+            ["状态转变时间", "区间涨幅(%)", "上一状态转换时间", "上一区间涨幅(%)"],
+        )
+        self.assertEqual(row["上一状态转换时间"], "2026-07-10")
+        self.assertEqual(row["上一区间涨幅(%)"], 33.33)
+
+        legacy_report = report.drop(
+            columns=["沪深300_上一状态转换时间", "沪深300_上一区间涨幅(%)"]
+        )
+        legacy_row = build_summary(legacy_report).iloc[0]
+        self.assertEqual(legacy_row["上一状态转换时间"], "2026-07-10")
+        self.assertAlmostEqual(legacy_row["上一区间涨幅(%)"], 33.333333, places=5)
 
     def test_index_detail_reads_long_history_cache_without_network(self):
         market = get_market_window("美股")
@@ -883,7 +1105,6 @@ class MarketAndCacheTests(unittest.TestCase):
                 "close": [999.0, 102.0, 103.0],
             }
         )
-        latest = build_export_df(latest_raw, "测试指数", days=30)
         config = {"source": "yahoo", "code": "^TEST", "market_group": "A股"}
 
         class ClosedSessionDateTime(datetime):
@@ -895,9 +1116,11 @@ class MarketAndCacheTests(unittest.TestCase):
         with (
             patch("core.cache.load_dataset", return_value=(long_cached, {})),
             patch("core.cache.save_dataset") as save_mock,
-            patch("services.index_ma20.fetch_index_from_source", return_value=latest) as fetch_mock,
+            patch("services.index_ma20.fetch_index_from_source") as fetch_mock,
             patch("services.index_ma20.datetime", ClosedSessionDateTime),
         ):
+            latest = build_export_df(latest_raw, "测试指数", days=30)
+            fetch_mock.return_value = latest
             result = fetch_index_history("测试指数", config, days=10000)
 
         fetch_mock.assert_called_once_with("测试指数", config, days=30)
@@ -1157,8 +1380,8 @@ class MarketAndCacheTests(unittest.TestCase):
             return None, None
 
         load_dataset_mock.side_effect = load_side_effect
-        fetch_mock.return_value = build_export_df(fetched_raw, "测试指数", days=30)
         with patch("services.index_ma20.datetime", ClosedSessionDateTime):
+            fetch_mock.return_value = build_export_df(fetched_raw, "测试指数", days=30)
             result = fetch_index_report("测试指数", config, "", 30)
 
         latest = result.loc[result["日期"] == "2026-07-14", "测试指数_收盘价"].iloc[0]

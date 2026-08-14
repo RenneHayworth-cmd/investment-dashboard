@@ -16,10 +16,14 @@ from core.ui import (
     render_metric_grid,
     render_page_header,
 )
+from services.fund_analysis import FUND_ADJUST_NONE
 from services.live_trading import (
     add_live_trade,
     append_live_symbol_pnl_total,
     build_live_daily_pnl,
+    build_live_daily_returns,
+    build_live_period_returns,
+    build_live_return_month_grid,
     build_live_position_performance,
     build_live_symbol_pnl_history,
     delete_live_trade,
@@ -29,6 +33,7 @@ from services.live_trading import (
     summarize_live_position_performance,
     summarize_live_trades,
 )
+from services.market_calendar import get_market_holiday_label, get_market_window
 from services.position_analysis import (
     latest_final_etf_trade_date,
     load_or_fetch_etf,
@@ -48,6 +53,541 @@ render_page_header(
 
 def money(value: object) -> str:
     return f"{float(value):,.2f}"
+
+
+LIVE_RETURN_PERIOD_OPTIONS = {
+    "日收益": "day",
+    "周收益": "week",
+    "月收益": "month",
+    "年收益": "year",
+}
+LIVE_RETURN_VALUE_OPTIONS = ("收益金额", "收益率")
+
+
+def format_signed_return(value: object, *, percentage: bool = False) -> str:
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number):
+        return "-"
+    suffix = "%" if percentage else ""
+    sign = "+" if float(number) > 0 else ""
+    return f"{sign}{float(number):,.2f}{suffix}"
+
+
+def _live_return_tile(
+    *,
+    label: str,
+    period_start: pd.Timestamp,
+    period_end: pd.Timestamp,
+    pnl_amount: object,
+    return_pct: object,
+    display_mode: str,
+    max_abs_value: float,
+    detail_label: str = "",
+) -> str:
+    selected_value = return_pct if display_mode == "收益率" else pnl_amount
+    selected_number = pd.to_numeric(selected_value, errors="coerce")
+    amount_number = pd.to_numeric(pnl_amount, errors="coerce")
+    rate_number = pd.to_numeric(return_pct, errors="coerce")
+    tooltip = (
+        f"{period_start:%Y-%m-%d} 至 {period_end:%Y-%m-%d}｜"
+        f"收益金额 {format_signed_return(amount_number)}｜"
+        f"收益率 {format_signed_return(rate_number, percentage=True)}"
+    )
+    if pd.isna(selected_number):
+        value_class = "live-return-unavailable"
+        background = "rgba(148, 163, 184, 0.12)"
+    elif float(selected_number) > 0:
+        intensity = min(abs(float(selected_number)) / max(max_abs_value, 1e-12), 1.0)
+        value_class = "live-return-positive"
+        background = f"rgba(239, 68, 68, {0.14 + intensity * 0.28:.3f})"
+    elif float(selected_number) < 0:
+        intensity = min(abs(float(selected_number)) / max(max_abs_value, 1e-12), 1.0)
+        value_class = "live-return-negative"
+        background = f"rgba(34, 197, 94, {0.14 + intensity * 0.28:.3f})"
+    else:
+        value_class = "live-return-zero"
+        background = "rgba(148, 163, 184, 0.18)"
+    value_text = format_signed_return(
+        selected_number,
+        percentage=display_mode == "收益率",
+    )
+    detail_html = (
+        f'<div class="live-return-detail">{html.escape(detail_label)}</div>'
+        if detail_label
+        else ""
+    )
+    return (
+        f'<div class="live-return-tile {value_class}" '
+        f'style="background:{background}" title="{html.escape(tooltip, quote=True)}">'
+        f'<div class="live-return-label">{html.escape(label)}</div>'
+        f'<div class="live-return-value">{html.escape(value_text)}</div>'
+        f"{detail_html}</div>"
+    )
+
+
+def _live_return_holiday_tile(
+    *,
+    calendar_date,
+    holiday_label: str,
+    outside_month: bool,
+) -> str:
+    outside_class = " live-return-outside-month" if outside_month else ""
+    tooltip = f"{calendar_date:%Y-%m-%d}｜A股{holiday_label}休市"
+    return (
+        f'<div class="live-return-empty-day live-return-holiday{outside_class}" '
+        f'title="{html.escape(tooltip, quote=True)}">'
+        f'<div class="live-return-label">{calendar_date.day:02d}</div>'
+        f'<div class="live-return-holiday-name">{html.escape(holiday_label)}</div>'
+        "</div>"
+    )
+
+
+def _return_period_summary(period_returns: pd.DataFrame) -> tuple[object, object]:
+    if period_returns is None or period_returns.empty:
+        return pd.NA, pd.NA
+    amount = float(pd.to_numeric(period_returns["pnl_amount"], errors="coerce").sum())
+    rates = pd.to_numeric(period_returns["return_pct"], errors="coerce")
+    if rates.isna().any():
+        return amount, pd.NA
+    return amount, float(((1.0 + rates / 100.0).prod() - 1.0) * 100.0)
+
+
+def _month_index(value: pd.Timestamp) -> int:
+    return int(value.year) * 12 + int(value.month) - 1
+
+
+def _month_from_index(value: int) -> tuple[int, int]:
+    return int(value) // 12, int(value) % 12 + 1
+
+
+def _bounded_session_value(key: str, *, minimum: int, maximum: int, default: int) -> int:
+    value = int(st.session_state.get(key, default))
+    value = min(max(value, minimum), maximum)
+    st.session_state[key] = value
+    return value
+
+
+def _render_return_navigation(
+    *,
+    state_key: str,
+    current: int,
+    minimum: int,
+    maximum: int,
+    title_formatter,
+    unit: int = 1,
+) -> int:
+    previous_col, title_col, next_col = st.columns([1, 5, 1])
+    previous_clicked = previous_col.button(
+        "‹",
+        key=f"{state_key}_previous",
+        help="上一个期间",
+        disabled=current <= minimum,
+        use_container_width=True,
+    )
+    next_clicked = next_col.button(
+        "›",
+        key=f"{state_key}_next",
+        help="下一个期间",
+        disabled=current >= maximum,
+        use_container_width=True,
+    )
+    if previous_clicked:
+        current = max(minimum, current - unit)
+        st.session_state[state_key] = current
+    elif next_clicked:
+        current = min(maximum, current + unit)
+        st.session_state[state_key] = current
+    title_col.markdown(
+        f'<div class="live-return-nav-title">{html.escape(title_formatter(current))}</div>',
+        unsafe_allow_html=True,
+    )
+    return current
+
+
+def _render_live_return_calendar_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .live-return-nav-title {
+            min-height: 2.45rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 650;
+            font-size: 1rem;
+        }
+        .live-return-calendar-scroll {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        .live-return-weekdays,
+        .live-return-day-grid {
+            min-width: 500px;
+            display: grid;
+            grid-template-columns: repeat(5, minmax(88px, 1fr));
+            gap: 0.38rem;
+        }
+        .live-return-weekdays {
+            margin-bottom: 0.38rem;
+            color: rgba(49, 51, 63, 0.64);
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-align: center;
+        }
+        .live-return-period-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+            gap: 0.5rem;
+        }
+        .live-return-tile,
+        .live-return-empty-day {
+            min-height: 88px;
+            border-radius: 6px;
+            padding: 0.55rem 0.45rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            box-sizing: border-box;
+            font-variant-numeric: tabular-nums;
+        }
+        .live-return-tile {
+            border: 1px solid rgba(49, 51, 63, 0.08);
+        }
+        .live-return-empty-day {
+            color: rgba(49, 51, 63, 0.42);
+            border: 1px solid rgba(49, 51, 63, 0.05);
+        }
+        .live-return-outside-month {
+            border-color: transparent;
+            color: rgba(49, 51, 63, 0.24);
+        }
+        .live-return-label {
+            font-size: 0.78rem;
+            line-height: 1.2;
+            opacity: 0.78;
+        }
+        .live-return-value {
+            margin-top: 0.34rem;
+            font-size: 0.95rem;
+            line-height: 1.25;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .live-return-detail {
+            margin-top: 0.25rem;
+            font-size: 0.7rem;
+            line-height: 1.2;
+            opacity: 0.7;
+            white-space: nowrap;
+        }
+        .live-return-holiday {
+            background: rgba(148, 163, 184, 0.06);
+        }
+        .live-return-holiday-name {
+            margin-top: 0.34rem;
+            color: rgb(217, 119, 6);
+            font-size: 0.92rem;
+            font-weight: 650;
+            line-height: 1.25;
+            white-space: nowrap;
+        }
+        .live-return-positive { color: rgb(159, 18, 57); }
+        .live-return-negative { color: rgb(21, 94, 55); }
+        .live-return-zero,
+        .live-return-unavailable { color: rgb(71, 85, 105); }
+        .live-return-summary {
+            margin-top: 0.65rem;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 0.55rem 1.5rem;
+            font-size: 0.92rem;
+        }
+        .live-return-summary strong { font-variant-numeric: tabular-nums; }
+        .live-return-summary .positive { color: rgb(190, 18, 60); }
+        .live-return-summary .negative { color: rgb(22, 101, 52); }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_live_return_calendar(
+    daily_pnl: pd.DataFrame,
+    *,
+    first_trade_date: object = None,
+) -> None:
+    st.subheader("收益日历")
+    daily_returns = build_live_daily_returns(daily_pnl)
+    if daily_returns.empty:
+        st.info("尚无可用于收益日历的完整估值数据。")
+        return
+
+    controls = st.columns([3, 2])
+    period_label = controls[0].segmented_control(
+        "统计周期",
+        options=list(LIVE_RETURN_PERIOD_OPTIONS),
+        default="日收益",
+        key="live_return_calendar_period",
+    ) or "日收益"
+    display_mode = controls[1].segmented_control(
+        "显示口径",
+        options=list(LIVE_RETURN_VALUE_OPTIONS),
+        default="收益金额",
+        key="live_return_calendar_value",
+    ) or "收益金额"
+    period = LIVE_RETURN_PERIOD_OPTIONS[period_label]
+    first_valuation_date = pd.Timestamp(daily_returns["date"].min())
+    latest_date = pd.Timestamp(daily_returns["date"].max())
+    requested_start = pd.to_datetime(first_trade_date, errors="coerce")
+    first_date = (
+        pd.Timestamp(requested_start).normalize()
+        if not pd.isna(requested_start)
+        else first_valuation_date
+    )
+    first_date = min(first_date, first_valuation_date)
+    a_share_market = get_market_window("A股")
+    holiday_dates = {
+        pd.Timestamp(value).date()
+        for value in daily_returns["date"]
+        if get_market_holiday_label(a_share_market, pd.Timestamp(value).date())
+    }
+    period_returns = build_live_period_returns(
+        daily_returns,
+        period=period,
+        excluded_dates=holiday_dates,
+    )
+    _render_live_return_calendar_css()
+
+    if len(daily_returns) == 1:
+        st.info("当前仅有1个完整估值日，收益日历会保留该日真实收益，周期比较需等待更多数据。")
+
+    if period == "day":
+        state_key = "live_return_calendar_month"
+        minimum = _month_index(first_date)
+        maximum = _month_index(latest_date)
+        current = _bounded_session_value(
+            state_key,
+            minimum=minimum,
+            maximum=maximum,
+            default=maximum,
+        )
+        current = _render_return_navigation(
+            state_key=state_key,
+            current=current,
+            minimum=minimum,
+            maximum=maximum,
+            title_formatter=lambda value: (
+                f"{_month_from_index(value)[0]}年{_month_from_index(value)[1]}月"
+            ),
+        )
+        selected_year, selected_month = _month_from_index(current)
+        visible = period_returns[
+            period_returns["period_start"].dt.year.eq(selected_year)
+            & period_returns["period_start"].dt.month.eq(selected_month)
+        ].copy()
+        lookup = {
+            pd.Timestamp(row.period_start).date(): row
+            for row in visible.itertuples(index=False)
+        }
+        values = (
+            pd.to_numeric(visible["return_pct"], errors="coerce")
+            if display_mode == "收益率"
+            else pd.to_numeric(visible["pnl_amount"], errors="coerce")
+        )
+        max_abs_value = float(values.abs().max()) if values.notna().any() else 0.0
+        day_cells: list[str] = []
+        month_grid = build_live_return_month_grid(selected_year, selected_month)
+        for calendar_date in (day for week in month_grid for day in week):
+            holiday_label = get_market_holiday_label(a_share_market, calendar_date)
+            if holiday_label:
+                day_cells.append(
+                    _live_return_holiday_tile(
+                        calendar_date=calendar_date,
+                        holiday_label=holiday_label,
+                        outside_month=calendar_date.month != selected_month,
+                    )
+                )
+                continue
+            row = lookup.get(calendar_date)
+            if row is not None:
+                day_cells.append(
+                    _live_return_tile(
+                        label=f"{calendar_date.day:02d}",
+                        period_start=pd.Timestamp(row.period_start),
+                        period_end=pd.Timestamp(row.period_end),
+                        pnl_amount=row.pnl_amount,
+                        return_pct=row.return_pct,
+                        display_mode=display_mode,
+                        max_abs_value=max_abs_value,
+                    )
+                )
+                continue
+            outside_class = (
+                " live-return-outside-month"
+                if calendar_date.month != selected_month
+                else ""
+            )
+            day_cells.append(
+                f'<div class="live-return-empty-day{outside_class}">'
+                f'<div class="live-return-label">{calendar_date.day:02d}</div></div>'
+            )
+        st.markdown(
+            """
+            <div class="live-return-calendar-scroll">
+                <div class="live-return-weekdays">
+                    <div>一</div><div>二</div><div>三</div><div>四</div>
+                    <div>五</div>
+                </div>
+                <div class="live-return-day-grid">
+            """
+            + "".join(day_cells)
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
+        summary_label = f"{selected_year}年{selected_month}月"
+    else:
+        if period == "week":
+            iso_years = period_returns["period_start"].map(
+                lambda value: pd.Timestamp(value).isocalendar().year
+            )
+            minimum = int(first_date.isocalendar().year)
+            maximum = int(latest_date.isocalendar().year)
+        else:
+            minimum = int(first_date.year)
+            maximum = int(latest_date.year)
+
+        if period in {"week", "month"}:
+            state_key = f"live_return_calendar_{period}_year"
+            current_year = _bounded_session_value(
+                state_key,
+                minimum=minimum,
+                maximum=maximum,
+                default=maximum,
+            )
+            current_year = _render_return_navigation(
+                state_key=state_key,
+                current=current_year,
+                minimum=minimum,
+                maximum=maximum,
+                title_formatter=lambda value: f"{value}年",
+            )
+        else:
+            current_year = maximum
+
+        if period == "week":
+            iso_years = period_returns["period_start"].map(
+                lambda value: pd.Timestamp(value).isocalendar().year
+            )
+            visible = period_returns[iso_years.eq(current_year)].copy()
+            lookup = {
+                int(pd.Timestamp(row.period_start).isocalendar().week): row
+                for row in visible.itertuples(index=False)
+            }
+            last_week = datetime(current_year, 12, 28).isocalendar().week
+            slots = []
+            for week_number in range(1, last_week + 1):
+                week_start = pd.Timestamp(datetime.fromisocalendar(current_year, week_number, 1))
+                slots.append((f"第{week_number:02d}周", week_start, lookup.get(week_number)))
+        elif period == "month":
+            visible = period_returns[
+                period_returns["period_start"].dt.year.eq(current_year)
+            ].copy()
+            lookup = {
+                int(pd.Timestamp(row.period_start).month): row
+                for row in visible.itertuples(index=False)
+            }
+            slots = [
+                (f"{month}月", pd.Timestamp(current_year, month, 1), lookup.get(month))
+                for month in range(1, 13)
+            ]
+        else:
+            visible = period_returns.copy()
+            lookup = {
+                int(pd.Timestamp(row.period_start).year): row
+                for row in visible.itertuples(index=False)
+            }
+            slots = [
+                (f"{year}年", pd.Timestamp(year, 1, 1), lookup.get(year))
+                for year in range(minimum, maximum + 1)
+            ]
+
+        values = (
+            pd.to_numeric(visible["return_pct"], errors="coerce")
+            if display_mode == "收益率"
+            else pd.to_numeric(visible["pnl_amount"], errors="coerce")
+        )
+        max_abs_value = float(values.abs().max()) if values.notna().any() else 0.0
+        period_cells: list[str] = []
+        for slot_label, _slot_start, row in slots:
+            if row is None:
+                period_cells.append(
+                    '<div class="live-return-empty-day">'
+                    f'<div class="live-return-label">{html.escape(slot_label)}</div></div>'
+                )
+                continue
+            detail_label = (
+                f"{pd.Timestamp(row.period_start):%m-%d} 至 "
+                f"{pd.Timestamp(row.period_end):%m-%d}"
+                if period == "week"
+                else ""
+            )
+            period_cells.append(
+                _live_return_tile(
+                    label=slot_label,
+                    period_start=pd.Timestamp(row.period_start),
+                    period_end=pd.Timestamp(row.period_end),
+                    pnl_amount=row.pnl_amount,
+                    return_pct=row.return_pct,
+                    display_mode=display_mode,
+                    max_abs_value=max_abs_value,
+                    detail_label=detail_label,
+                )
+            )
+        st.markdown(
+            '<div class="live-return-period-grid">'
+            + "".join(period_cells)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        summary_label = f"{current_year}年" if period in {"week", "month"} else "全部年度"
+
+    if visible.empty:
+        st.info("当前期间没有完整的正式收盘估值，日历保持空白。")
+
+    summary_amount, summary_return_pct = _return_period_summary(visible)
+    amount_number = pd.to_numeric(summary_amount, errors="coerce")
+    amount_class = (
+        "positive"
+        if not pd.isna(amount_number) and float(amount_number) > 0
+        else "negative"
+        if not pd.isna(amount_number) and float(amount_number) < 0
+        else ""
+    )
+    rate_number = pd.to_numeric(summary_return_pct, errors="coerce")
+    rate_class = (
+        "positive"
+        if not pd.isna(rate_number) and float(rate_number) > 0
+        else "negative"
+        if not pd.isna(rate_number) and float(rate_number) < 0
+        else ""
+    )
+    st.markdown(
+        '<div class="live-return-summary">'
+        f'<span>{html.escape(summary_label)}收益金额：'
+        f'<strong class="{amount_class}">{html.escape(format_signed_return(summary_amount))}</strong></span>'
+        f'<span>{html.escape(summary_label)}收益率：'
+        f'<strong class="{rate_class}">{html.escape(format_signed_return(summary_return_pct, percentage=True))}</strong></span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "收益率按每日实际持仓资金计算后复合；买入视为当日新增投入，"
+        "同日卖出回款优先抵扣买入，不包含账户未投资现金。"
+    )
 
 
 def format_live_number(value: object, digits: int = 2, prefix: str = "") -> str:
@@ -335,7 +875,7 @@ def render_daily_close_pnl() -> None:
             symbol,
             api_key=os.getenv("TICKFLOW_API_KEY", ""),
             count=5000,
-            adjust=None,
+            adjust=FUND_ADJUST_NONE,
             allow_fetch=network_refresh_due,
             force_refresh=False,
             save_to_cache=True,
@@ -415,6 +955,9 @@ def render_daily_close_pnl() -> None:
             ("累计收益率", f"{float(latest['return_pct']):.2f}%", "总盈亏除以累计买入成本"),
         ]
     )
+    trade_dates = pd.to_datetime(current_trades["trade_date"], errors="coerce").dropna()
+    first_trade_date = trade_dates.min() if not trade_dates.empty else None
+    render_live_return_calendar(daily_pnl, first_trade_date=first_trade_date)
 
     figure = make_subplots(specs=[[{"secondary_y": True}]])
     figure.add_trace(
@@ -645,7 +1188,7 @@ def render_live_symbol_pnl_history() -> None:
             symbol,
             api_key=os.getenv("TICKFLOW_API_KEY", ""),
             count=5000,
-            adjust=None,
+            adjust=FUND_ADJUST_NONE,
             allow_fetch=False,
             force_refresh=False,
             save_to_cache=False,

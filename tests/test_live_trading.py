@@ -1,7 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,8 +12,11 @@ from services.live_trading import (
     add_live_trade,
     append_live_symbol_pnl_total,
     build_live_daily_pnl,
+    build_live_daily_returns,
+    build_live_period_returns,
     build_live_position_performance,
     build_live_positions,
+    build_live_return_month_grid,
     build_live_symbol_pnl_history,
     delete_live_trade,
     live_close_refresh_due,
@@ -286,6 +289,163 @@ class LiveTradingTests(unittest.TestCase):
 
         self.assertEqual(daily["date"].tolist(), [pd.Timestamp("2026-08-05")])
 
+    def test_daily_returns_include_first_day_fee_and_new_investment(self):
+        daily_pnl = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06", "2026-08-07"]),
+                "market_value": [990.0, 2178.0, 2400.0],
+                "total_pnl": [-10.0, 168.0, 390.0],
+                "cumulative_buy_cost": [1010.0, 2222.0, 2222.0],
+                "net_investment": [1010.0, 2222.0, 2222.0],
+            }
+        )
+
+        result = build_live_daily_returns(daily_pnl)
+
+        self.assertAlmostEqual(result.iloc[0]["pnl_amount"], -10.0)
+        self.assertAlmostEqual(result.iloc[0]["return_base"], 1010.0)
+        self.assertAlmostEqual(result.iloc[0]["return_pct"], -10 / 1010 * 100)
+        self.assertAlmostEqual(result.iloc[1]["pnl_amount"], 178.0)
+        self.assertAlmostEqual(result.iloc[1]["return_base"], 990.0 + 1212.0)
+        self.assertAlmostEqual(result.iloc[1]["return_pct"], 178 / 2202 * 100)
+        self.assertAlmostEqual(result.iloc[2]["pnl_amount"], 222.0)
+        self.assertAlmostEqual(result.iloc[2]["return_base"], 2178.0)
+
+    def test_daily_returns_do_not_double_count_same_day_rotation(self):
+        daily_pnl = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                "market_value": [1000.0, 1100.0],
+                "total_pnl": [0.0, 100.0],
+                "cumulative_buy_cost": [1000.0, 2000.0],
+                "net_investment": [1000.0, 1000.0],
+            }
+        )
+
+        result = build_live_daily_returns(daily_pnl)
+
+        self.assertAlmostEqual(result.iloc[1]["daily_buy_cost"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["daily_sell_proceeds"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["return_base"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["return_pct"], 10.0)
+
+    def test_daily_returns_keep_previous_market_value_as_base_when_reducing(self):
+        daily_pnl = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                "market_value": [1000.0, 600.0],
+                "total_pnl": [0.0, 100.0],
+                "cumulative_buy_cost": [1000.0, 1000.0],
+                "net_investment": [1000.0, 500.0],
+            }
+        )
+
+        result = build_live_daily_returns(daily_pnl)
+
+        self.assertAlmostEqual(result.iloc[1]["daily_sell_proceeds"], 500.0)
+        self.assertAlmostEqual(result.iloc[1]["return_base"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["return_pct"], 10.0)
+
+    def test_daily_returns_use_new_buy_as_base_after_empty_position(self):
+        daily_pnl = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                "market_value": [0.0, 1010.0],
+                "total_pnl": [100.0, 110.0],
+                "cumulative_buy_cost": [1000.0, 2000.0],
+                "net_investment": [-100.0, 900.0],
+            }
+        )
+
+        result = build_live_daily_returns(daily_pnl)
+
+        self.assertAlmostEqual(result.iloc[1]["daily_buy_cost"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["return_base"], 1000.0)
+        self.assertAlmostEqual(result.iloc[1]["return_pct"], 1.0)
+
+    def test_period_returns_sum_amounts_and_compound_rates_across_boundaries(self):
+        daily_returns = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2025-12-29", "2025-12-31", "2026-01-02"]),
+                "pnl_amount": [100.0, 50.0, -25.0],
+                "return_base": [1000.0, 1100.0, 1150.0],
+                "return_pct": [10.0, 5.0, -2.0],
+                "daily_buy_cost": [1000.0, 0.0, 0.0],
+                "daily_sell_proceeds": [0.0, 0.0, 0.0],
+            }
+        )
+
+        weekly = build_live_period_returns(daily_returns, period="week")
+        monthly = build_live_period_returns(daily_returns, period="month")
+        yearly = build_live_period_returns(daily_returns, period="year")
+
+        self.assertEqual(len(weekly), 1)
+        self.assertEqual(weekly.iloc[0]["period_start"], pd.Timestamp("2025-12-29"))
+        self.assertEqual(weekly.iloc[0]["period_end"], pd.Timestamp("2026-01-02"))
+        self.assertAlmostEqual(weekly.iloc[0]["pnl_amount"], 125.0)
+        self.assertAlmostEqual(
+            weekly.iloc[0]["return_pct"],
+            ((1.10 * 1.05 * 0.98) - 1) * 100,
+        )
+        self.assertEqual(monthly["pnl_amount"].tolist(), [150.0, -25.0])
+        self.assertEqual(yearly["pnl_amount"].tolist(), [150.0, -25.0])
+
+    def test_period_returns_exclude_weekends_and_market_holidays(self):
+        daily_returns = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-06-19", "2026-06-20", "2026-06-22"]),
+                "pnl_amount": [100.0, 200.0, 300.0],
+                "return_pct": [1.0, 2.0, 3.0],
+            }
+        )
+
+        daily = build_live_period_returns(
+            daily_returns,
+            period="day",
+            excluded_dates={date(2026, 6, 19)},
+        )
+        monthly = build_live_period_returns(
+            daily_returns,
+            period="month",
+            excluded_dates={date(2026, 6, 19)},
+        )
+
+        self.assertEqual(daily["period_start"].tolist(), [pd.Timestamp("2026-06-22")])
+        self.assertEqual(monthly.iloc[0]["pnl_amount"], 300.0)
+        self.assertAlmostEqual(monthly.iloc[0]["return_pct"], 3.0)
+
+    def test_month_grid_contains_only_weekdays_and_keeps_cross_month_weekdays(self):
+        june = build_live_return_month_grid(2026, 6)
+        august = build_live_return_month_grid(2026, 8)
+
+        self.assertTrue(all(len(week) == 5 for week in june + august))
+        self.assertTrue(all(day.weekday() < 5 for week in june + august for day in week))
+        self.assertEqual(june[-1], [
+            date(2026, 6, 29),
+            date(2026, 6, 30),
+            date(2026, 7, 1),
+            date(2026, 7, 2),
+            date(2026, 7, 3),
+        ])
+        self.assertEqual(august[0][0], date(2026, 8, 3))
+
+    def test_period_returns_keep_unknown_rate_unavailable(self):
+        daily_returns = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-05", "2026-08-06"]),
+                "pnl_amount": [0.0, 10.0],
+                "return_base": [0.0, 0.0],
+                "return_pct": [0.0, pd.NA],
+                "daily_buy_cost": [0.0, 0.0],
+                "daily_sell_proceeds": [0.0, 0.0],
+            }
+        )
+
+        monthly = build_live_period_returns(daily_returns, period="month")
+
+        self.assertEqual(monthly.iloc[0]["pnl_amount"], 10.0)
+        self.assertTrue(pd.isna(monthly.iloc[0]["return_pct"]))
+
     def test_position_performance_reports_daily_and_cumulative_pnl(self):
         add_live_trade(
             trade_date="2026-08-05",
@@ -484,10 +644,45 @@ class LiveTradingTests(unittest.TestCase):
             "build_live_position_performance(\n        current_trades,",
             page_source,
         )
-        self.assertIn("adjust=None", page_source)
+        self.assertIn("adjust=FUND_ADJUST_NONE", page_source)
         self.assertIn("network_refresh_due", page_source)
         self.assertIn('name="总盈亏"', page_source)
         self.assertIn('name="累计收益率"', page_source)
+        self.assertIn('st.subheader("收益日历")', page_source)
+        self.assertIn("build_live_daily_returns(daily_pnl)", page_source)
+        self.assertIn(
+            "period_returns = build_live_period_returns(\n"
+            "        daily_returns,\n"
+            "        period=period,\n"
+            "        excluded_dates=holiday_dates,",
+            page_source,
+        )
+        self.assertIn(
+            '"日收益": "day",\n    "周收益": "week",\n    "月收益": "month",\n    "年收益": "year",',
+            page_source,
+        )
+        self.assertIn('LIVE_RETURN_VALUE_OPTIONS = ("收益金额", "收益率")', page_source)
+        self.assertIn(
+            "render_live_return_calendar(daily_pnl, first_trade_date=first_trade_date)",
+            page_source,
+        )
+        self.assertLess(
+            page_source.index(
+                "render_live_return_calendar(daily_pnl, first_trade_date=first_trade_date)"
+            ),
+            page_source.index('figure = make_subplots(specs=[[{"secondary_y": True}]])'),
+        )
+        self.assertIn("当前期间没有完整的正式收盘估值，日历保持空白。", page_source)
+        self.assertIn("grid-template-columns: repeat(5, minmax(88px, 1fr));", page_source)
+        self.assertNotIn("<div>六</div>", page_source)
+        self.assertNotIn("<div>日</div>", page_source)
+        self.assertIn("build_live_return_month_grid(selected_year, selected_month)", page_source)
+        self.assertIn("get_market_holiday_label(a_share_market, calendar_date)", page_source)
+        self.assertIn("live-return-holiday-name", page_source)
+        self.assertIn("rgb(190, 18, 60)", page_source)
+        self.assertIn("rgb(22, 101, 52)", page_source)
+        self.assertIn("不包含账户未投资现金", page_source)
+        self.assertNotIn("上证指数", page_source)
         self.assertIn('"现价",', page_source)
         self.assertIn('"市值",', page_source)
         self.assertIn('"成本",', page_source)

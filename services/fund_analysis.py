@@ -15,6 +15,35 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+FUND_ADJUST_FORWARD_ADDITIVE = "forward_additive"
+FUND_ADJUST_FORWARD_RATIO = "forward"
+FUND_ADJUST_BACKWARD_ADDITIVE = "backward_additive"
+FUND_ADJUST_BACKWARD_RATIO = "backward"
+FUND_ADJUST_NONE = "none"
+FUND_ADJUSTMENT_VALUES = frozenset(
+    {
+        FUND_ADJUST_FORWARD_ADDITIVE,
+        FUND_ADJUST_FORWARD_RATIO,
+        FUND_ADJUST_BACKWARD_ADDITIVE,
+        FUND_ADJUST_BACKWARD_RATIO,
+        FUND_ADJUST_NONE,
+    }
+)
+FUND_ADJUSTMENT_OPTIONS = {
+    "前复权（差值）": FUND_ADJUST_FORWARD_ADDITIVE,
+    "前复权（比例）": FUND_ADJUST_FORWARD_RATIO,
+    "后复权（差值）": FUND_ADJUST_BACKWARD_ADDITIVE,
+    "后复权（比例）": FUND_ADJUST_BACKWARD_RATIO,
+    "不复权": FUND_ADJUST_NONE,
+}
+FUND_ADDITIVE_ADJUSTMENT_OPTIONS = {
+    "前复权（差值）": FUND_ADJUST_FORWARD_ADDITIVE,
+    "后复权（差值）": FUND_ADJUST_BACKWARD_ADDITIVE,
+    "不复权": FUND_ADJUST_NONE,
+}
+FUND_CACHE_SCHEMA_VERSION = 2
+
+
 DATE_KEYWORDS = ("日期", "date", "trade_date", "净值日期")
 PRICE_KEYWORDS = (
     "累计净值",
@@ -224,23 +253,47 @@ def infer_tickflow_symbol(code: str) -> str:
     raise ValueError(f"无法推断交易所后缀：{code}，请改为输入完整代码，例如 {code}.SH。")
 
 
+def normalize_fund_adjustment(adjust: str | None) -> str:
+    """Return one explicit adjustment mode; legacy None means unadjusted."""
+    normalized = FUND_ADJUST_NONE if adjust is None else str(adjust).strip().lower()
+    if normalized not in FUND_ADJUSTMENT_VALUES:
+        supported = "、".join(sorted(FUND_ADJUSTMENT_VALUES))
+        raise ValueError(f"不支持的复权方式：{adjust}；可选值为 {supported}。")
+    return normalized
+
+
+def build_fund_cache_symbol(prefix: str, symbol: str, adjust: str | None) -> str:
+    mode = normalize_fund_adjustment(adjust)
+    return f"{prefix}_v{FUND_CACHE_SCHEMA_VERSION}_{symbol}_{mode}"
+
+
+def stamp_fund_history_metadata(
+    df: pd.DataFrame,
+    adjust: str | None,
+) -> pd.DataFrame:
+    result = df.copy()
+    result["_adjust_mode"] = normalize_fund_adjustment(adjust)
+    result["_cache_schema_version"] = FUND_CACHE_SCHEMA_VERSION
+    return result
+
+
 def fetch_tickflow_fund_close(
     symbol: str,
     api_key: str = "",
     count: int = 5000,
-    adjust: str | None = None,
+    adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
 ) -> pd.DataFrame:
     from tickflow import TickFlow
 
+    adjustment = normalize_fund_adjustment(adjust)
     client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
     fund_name = fetch_tickflow_instrument_name(symbol, api_key=api_key)
     kwargs = {
         "period": "1d",
         "count": count,
         "as_dataframe": True,
+        "adjust": adjustment,
     }
-    if adjust:
-        kwargs["adjust"] = adjust
     df = client.klines.get(symbol, **kwargs)
     if df is None or df.empty:
         raise ValueError(f"TickFlow 未返回 {symbol} 的日线数据。")
@@ -263,7 +316,7 @@ def fetch_tickflow_fund_close(
     result = result.sort_values("日期").drop_duplicates("日期").reset_index(drop=True)
     result["symbol"] = symbol
     result["name"] = fund_name or symbol
-    return result
+    return stamp_fund_history_metadata(result, adjustment)
 
 
 def fetch_tickflow_instrument_name(symbol: str, api_key: str = "") -> str:

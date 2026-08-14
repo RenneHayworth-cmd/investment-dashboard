@@ -63,10 +63,12 @@ class IndexRealtimeTests(unittest.TestCase):
             ["中证500期货主连", "中证1000期货主连"],
         )
 
-    def test_index_page_has_no_periodic_refresh(self):
+    def test_index_page_only_periodically_watches_local_scheduled_cache(self):
         page_source = (Path(__file__).parents[1] / "pages" / "1_指数监控.py").read_text(encoding="utf-8")
 
-        self.assertNotIn("run_every=", page_source)
+        self.assertIn('@st.fragment(run_every="30s")', page_source)
+        self.assertIn("def watch_scheduled_index_cache", page_source)
+        self.assertIn("index_report_cache_signature()", page_source)
         self.assertNotIn("盘中卡片每10分钟自动刷新", page_source)
         self.assertIn('[data-stale="true"]', page_source)
         self.assertIn("opacity: 1 !important", page_source)
@@ -415,6 +417,14 @@ class IndexRealtimeTests(unittest.TestCase):
             _daily_update_target("恒生港股通高息低波", now=after_delay).isoformat(),
             "2026-07-15",
         )
+
+    def test_mainland_daily_update_starts_at_1510(self):
+        before_delay = datetime(2026, 7, 15, 15, 9, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+        at_update_time = datetime(2026, 7, 15, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        self.assertEqual(_daily_update_target("沪深300", now=before_delay).isoformat(), "2026-07-14")
+        self.assertEqual(_daily_update_target("沪深300", now=at_update_time).isoformat(), "2026-07-15")
+        self.assertEqual(_daily_update_target("铁矿石主连", now=at_update_time).isoformat(), "2026-07-15")
 
     @patch("services.index_realtime.load_dataset")
     def test_current_session_still_updates_missing_previous_close(self, load_dataset_mock):

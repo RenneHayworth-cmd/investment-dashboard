@@ -11,6 +11,7 @@ import pandas as pd
 
 from core import cache, db
 from services import correlation_analysis, market_calendar
+from scripts import migrate_fund_price_caches
 
 
 class _FakeCursor:
@@ -234,6 +235,88 @@ class MarketCalendarFallbackTests(unittest.TestCase):
 
 
 class PageReliabilityTests(unittest.TestCase):
+    def test_fund_cache_migration_defaults_to_read_only_preview(self):
+        rows = [
+            {
+                "用途": "持仓择时",
+                "代码": "159545",
+                "复权": "forward_additive",
+                "缓存键": "fund_close_v2_159545.SZ_forward_additive",
+                "现状": "待建立",
+            }
+        ]
+        with (
+            patch.object(migrate_fund_price_caches, "build_preview", return_value=rows),
+            patch.object(migrate_fund_price_caches, "apply_migration") as apply_mock,
+            patch("builtins.print"),
+        ):
+            result = migrate_fund_price_caches.main([])
+
+        self.assertEqual(result, 0)
+        apply_mock.assert_not_called()
+
+    def test_fund_cache_migration_repairs_existing_invalid_v2_cache(self):
+        rows = [
+            {
+                "用途": "持仓择时",
+                "代码": "159545",
+                "复权": "forward_additive",
+                "缓存键": "fund_close_v2_159545.SZ_forward_additive",
+                "现状": "已存在",
+            }
+        ]
+        invalid_item = Mock(
+            status="缓存待校验",
+            formal_history_valid=False,
+            error="缓存标签错误",
+            dataframe=pd.DataFrame(),
+            latest_date="",
+        )
+        repaired_item = Mock(
+            status="已更新",
+            formal_history_valid=True,
+            error="",
+            dataframe=pd.DataFrame({"date": [pd.Timestamp("2026-08-12")]}),
+            latest_date="2026-08-12",
+        )
+        with (
+            patch.object(
+                migrate_fund_price_caches,
+                "load_or_fetch_etf",
+                side_effect=[invalid_item, repaired_item],
+            ) as load_mock,
+            patch.object(
+                migrate_fund_price_caches,
+                "validate_159545_acceptance",
+                return_value=["159545固定验收通过。"],
+            ),
+            patch("builtins.print"),
+        ):
+            result = migrate_fund_price_caches.apply_migration(
+                rows,
+                api_key="environment-key",
+                count=5000,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(load_mock.call_args_list[0].kwargs["allow_fetch"])
+        self.assertFalse(load_mock.call_args_list[0].kwargs["save_to_cache"])
+        self.assertTrue(load_mock.call_args_list[1].kwargs["allow_fetch"])
+        self.assertTrue(load_mock.call_args_list[1].kwargs["save_to_cache"])
+
+    def test_analysis_pages_use_explicit_adjustment_labels_and_live_none(self):
+        root = Path(__file__).parents[1]
+        for page_name in (
+            "2_A股分析.py",
+            "3_策略回测.py",
+            "4_相关性分析.py",
+            "5_持仓分析.py",
+            "7_美股分析.py",
+        ):
+            source = (root / "pages" / page_name).read_text(encoding="utf-8")
+            self.assertIn("FUND_ADJUSTMENT_OPTIONS", source)
+        live_source = (root / "pages" / "6_实盘记录.py").read_text(encoding="utf-8")
+        self.assertIn("adjust=FUND_ADJUST_NONE", live_source)
     def test_position_page_imports_realtime_timing_end_constant(self):
         source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
 

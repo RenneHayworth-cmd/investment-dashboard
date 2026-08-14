@@ -8,15 +8,25 @@ import re
 from threading import Lock
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
 from core.cache import load_dataset, save_dataset
 from services.fund_analysis import (
+    FUND_ADJUST_BACKWARD_ADDITIVE,
+    FUND_ADJUST_BACKWARD_RATIO,
+    FUND_ADJUST_FORWARD_ADDITIVE,
+    FUND_ADJUST_FORWARD_RATIO,
+    FUND_ADJUST_NONE,
+    FUND_CACHE_SCHEMA_VERSION,
     analyze_fund_nav,
+    build_fund_cache_symbol,
     fetch_tickflow_fund_close,
     infer_tickflow_symbol,
+    normalize_fund_adjustment,
     normalize_nav_dataframe,
+    stamp_fund_history_metadata,
 )
 from services.futures_options_analysis import (
     DATA_TYPE_AUTO,
@@ -186,6 +196,7 @@ class PositionItem:
     metrics: dict[str, object] = field(default_factory=dict)
     dataframe: pd.DataFrame = field(default_factory=pd.DataFrame)
     error: str = ""
+    formal_history_valid: bool = True
 
 
 def normalize_etf_base_code(code: str) -> str:
@@ -447,6 +458,8 @@ def apply_etf_realtime_quote(item: PositionItem, quote: dict[str, object]) -> Po
         cache_time=item.cache_time,
         metrics=metrics,
         dataframe=item.dataframe,
+        error=item.error,
+        formal_history_valid=item.formal_history_valid,
     )
 
 
@@ -495,8 +508,7 @@ def apply_etf_realtime_quote_to_timing(
     quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
     quote_price = pd.to_numeric(quote.get("price"), errors="coerce")
     if (
-        strategy is None
-        or pd.isna(quote_time)
+        pd.isna(quote_time)
         or quote_time.date() != market_now.date()
         or pd.isna(quote_price)
         or float(quote_price) <= 0
@@ -504,6 +516,14 @@ def apply_etf_realtime_quote_to_timing(
         return item
 
     quoted_item = apply_etf_realtime_quote(item, quote)
+    if not item.formal_history_valid:
+        return quoted_item
+    if strategy is None:
+        # 512890 has no MA signal of its own, but its parking row should use the
+        # same transient price and daily change as its card. Its aggregate
+        # position state is still calculated from the three transfer sources.
+        return quoted_item if base_code == "512890" else item
+
     timing_data = (
         item.dataframe[["date", "price"]].copy()
         if item.dataframe is not None
@@ -570,6 +590,7 @@ def apply_etf_realtime_quote_to_timing(
         metrics=metrics,
         dataframe=item.dataframe,
         error=item.error,
+        formal_history_valid=item.formal_history_valid,
     )
 
 
@@ -827,6 +848,19 @@ def calculate_512890_parking_snapshot(items: list[PositionItem]) -> dict[str, ob
     if parking_item is None:
         return {}
 
+    active_source_items = [
+        etf_items.get(code) for code in ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES
+    ]
+    if any(item is None or not item.formal_history_valid for item in active_source_items):
+        return {
+            "组合权重比例": "-",
+            "择时判断": "-",
+            "状态转换时间": "-",
+            "策略区间涨幅(%)": pd.NA,
+            "上一状态转换时间": "-",
+            "策略上一区间涨幅(%)": pd.NA,
+        }
+
     source_series: dict[str, pd.Series] = {}
     current_source_positions: dict[str, int] = {}
     latest_date_candidates: list[pd.Timestamp] = []
@@ -969,7 +1003,12 @@ def build_recent_etf_operation_guidance(
     columns = ["日期", "ETF名称", "代码", "策略参数", "操作指引", "操作后仓位", "触发收盘价"]
     latest_dates = []
     for item in items:
-        if item.category != "ETF" or item.dataframe is None or item.dataframe.empty:
+        if (
+            item.category != "ETF"
+            or not item.formal_history_valid
+            or item.dataframe is None
+            or item.dataframe.empty
+        ):
             continue
         dates = pd.to_datetime(item.dataframe.get("date"), errors="coerce").dropna()
         if not dates.empty:
@@ -1003,8 +1042,15 @@ def build_recent_etf_operation_guidance(
             )
             parking_prices = parking_history.set_index("date")["price"]
     parking_buys: dict[pd.Timestamp, set[str]] = {}
+    parking_sources_valid = not any(
+        candidate.category == "ETF"
+        and normalize_etf_base_code(candidate.code)
+        in ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES
+        and not candidate.formal_history_valid
+        for candidate in items
+    )
     for item in items:
-        if item.category != "ETF":
+        if item.category != "ETF" or not item.formal_history_valid:
             continue
         base_code = normalize_etf_base_code(item.code)
         strategy = ETF_TIMING_STRATEGIES.get(base_code)
@@ -1047,6 +1093,7 @@ def build_recent_etf_operation_guidance(
             )
             if (
                 raw_action == "卖出"
+                and parking_sources_valid
                 and base_code in ETF_512890_TRANSFER_SOURCE_CODES
                 and ETF_PORTFOLIO_WEIGHTS_PCT.get(base_code, 0) > 0
             ):
@@ -1220,6 +1267,172 @@ def _merge_by_date(old_df: pd.DataFrame | None, new_df: pd.DataFrame, date_colum
     )
 
 
+def _fund_history_validation_error(
+    df: pd.DataFrame | None,
+    *,
+    adjust: str | None,
+    min_rows: int,
+    market_now: datetime | None = None,
+    require_latest: bool = False,
+) -> str:
+    if df is None or df.empty:
+        return "正式历史为空。"
+    if not {"日期", "收盘价"}.issubset(df.columns):
+        return f"正式历史缺少必要列：{list(df.columns)}。"
+
+    dates = pd.to_datetime(df["日期"], errors="coerce")
+    closes = pd.to_numeric(df["收盘价"], errors="coerce")
+    if dates.isna().any():
+        return "正式历史包含无法识别的日期。"
+    if dates.dt.normalize().duplicated().any():
+        return "正式历史包含重复交易日期。"
+    if closes.isna().any() or (closes <= 0).any():
+        return "正式历史包含空值或非正收盘价。"
+    if len(df) < max(int(min_rows), 2):
+        return f"正式历史仅有{len(df)}条，不足以计算至少{max(int(min_rows), 2)}条的策略。"
+
+    adjustment = normalize_fund_adjustment(adjust)
+    if "_adjust_mode" not in df.columns:
+        return "缓存缺少复权方式标记。"
+    modes = df["_adjust_mode"].dropna().astype(str).str.lower().unique().tolist()
+    if modes != [adjustment]:
+        return f"缓存复权标签为{modes}，预期为{adjustment}。"
+    if "_cache_schema_version" not in df.columns:
+        return "缓存缺少结构版本标记。"
+    versions = pd.to_numeric(df["_cache_schema_version"], errors="coerce").dropna().unique()
+    if len(versions) != 1 or not np.all(versions == FUND_CACHE_SCHEMA_VERSION):
+        return "缓存结构版本与当前版本不一致。"
+
+    if require_latest:
+        target_date = latest_final_etf_trade_date(market_now)
+        if dates.max().date() < target_date:
+            return (
+                f"正式历史最新到{dates.max():%Y-%m-%d}，"
+                f"尚未覆盖最新完成交易日{target_date:%Y-%m-%d}。"
+            )
+    return ""
+
+
+def _recent_etf_gap_warning(
+    df: pd.DataFrame | None,
+    *,
+    market_now: datetime | None = None,
+    sessions: int = 20,
+) -> str:
+    if df is None or df.empty or "日期" not in df.columns:
+        return ""
+    market = get_market_window("A股")
+    if market is None:
+        return ""
+    dates = pd.to_datetime(df["日期"], errors="coerce").dropna().dt.date
+    if dates.empty:
+        return ""
+    available = set(dates)
+    first_date = min(available)
+    expected_date = latest_final_etf_trade_date(market_now)
+    expected: list[object] = []
+    cursor = expected_date
+    for _ in range(max(int(sessions), 1)):
+        if cursor >= first_date:
+            expected.append(cursor)
+        cursor = previous_trading_day(market, cursor)
+    missing = sorted(day for day in expected if day not in available)
+    if not missing:
+        return ""
+    preview = "、".join(day.strftime("%Y-%m-%d") for day in missing[:5])
+    suffix = "等" if len(missing) > 5 else ""
+    return f"最近交易日存在{len(missing)}个缺口（{preview}{suffix}）；可能为停牌，请核对。"
+
+
+def _adjusted_history_has_overlap_changes(
+    old_df: pd.DataFrame | None,
+    new_df: pd.DataFrame | None,
+    *,
+    date_column: str = "日期",
+) -> bool:
+    if old_df is None or old_df.empty or new_df is None or new_df.empty:
+        return False
+    if date_column not in old_df.columns or date_column not in new_df.columns:
+        return True
+
+    old = old_df.copy()
+    new = new_df.copy()
+    old[date_column] = pd.to_datetime(old[date_column], errors="coerce").dt.normalize()
+    new[date_column] = pd.to_datetime(new[date_column], errors="coerce").dt.normalize()
+    old = old.dropna(subset=[date_column]).drop_duplicates(date_column, keep="first")
+    new = new.dropna(subset=[date_column]).drop_duplicates(date_column, keep="last")
+    overlap = old.merge(new, on=date_column, how="inner", suffixes=("_old", "_new"))
+    if overlap.empty:
+        return True
+
+    compared = False
+    for column in ("收盘价", "开盘价"):
+        old_column = f"{column}_old"
+        new_column = f"{column}_new"
+        if old_column not in overlap.columns or new_column not in overlap.columns:
+            continue
+        compared = True
+        old_values = pd.to_numeric(overlap[old_column], errors="coerce")
+        new_values = pd.to_numeric(overlap[new_column], errors="coerce")
+        both_missing = old_values.isna() & new_values.isna()
+        equal = np.isclose(
+            old_values.fillna(0.0),
+            new_values.fillna(0.0),
+            rtol=1e-9,
+            atol=1e-9,
+        ) | both_missing
+        if not bool(equal.all()):
+            return True
+    return not compared
+
+
+def _append_position_error(current: str, message: str) -> str:
+    parts = [str(value).strip() for value in (current, message) if str(value).strip()]
+    return "；".join(dict.fromkeys(parts))
+
+
+def _prepare_fetched_etf_history(
+    df: pd.DataFrame,
+    *,
+    adjust: str,
+    market_now: datetime | None,
+    allow_unfinished_session: bool,
+) -> pd.DataFrame:
+    result = stamp_fund_history_metadata(df, adjust)
+    if allow_unfinished_session:
+        return result
+    filtered = filter_final_etf_rows(result, market_now=market_now)
+    if filtered is None:
+        return pd.DataFrame()
+    filtered = stamp_fund_history_metadata(filtered, adjust)
+    filtered["_final_close_confirmed"] = True
+    return filtered
+
+
+def _fetch_position_etf_history(
+    *,
+    symbol: str,
+    base_code: str,
+    api_key: str,
+    count: int,
+    adjust: str,
+    market_now: datetime | None,
+) -> pd.DataFrame:
+    if base_code in ETF_AKSHARE_HISTORY_CODES:
+        return _fetch_exchange_fund_close(
+            symbol=symbol,
+            count=int(count),
+            adjust=adjust,
+            market_now=market_now,
+        )
+    return fetch_tickflow_fund_close(
+        symbol=symbol,
+        api_key=api_key,
+        count=int(count),
+        adjust=adjust,
+    )
+
+
 def _merge_current_day_refresh(
     old_df: pd.DataFrame | None,
     new_df: pd.DataFrame,
@@ -1342,6 +1555,7 @@ def _missing_item(category: str, code: str, name: str = "") -> PositionItem:
         name=name or code,
         status="无缓存",
         error="本地暂无缓存；点击「加载持仓信息」可联网补齐。",
+        formal_history_valid=False if category == "ETF" else True,
     )
 
 
@@ -1353,15 +1567,18 @@ def _fetch_eastmoney_exchange_fund_close(
 ) -> pd.DataFrame:
     import akshare as ak
 
+    adjustment = normalize_fund_adjustment(adjust)
     base_code = normalize_etf_base_code(symbol)
     end_date = datetime.now(ZoneInfo("Asia/Shanghai")).date()
     calendar_days = max(int(count) * 2, 365)
     start_date = end_date - timedelta(days=calendar_days)
     adjust_value = {
-        "forward": "qfq",
-        "backward": "hfq",
-        None: "",
-    }.get(adjust, "")
+        FUND_ADJUST_FORWARD_ADDITIVE: "qfq",
+        FUND_ADJUST_BACKWARD_ADDITIVE: "hfq",
+        FUND_ADJUST_NONE: "",
+    }.get(adjustment)
+    if adjust_value is None:
+        raise ValueError("东方财富/AkShare不提供与TickFlow比例复权等价的口径。")
     raw = ak.fund_etf_hist_em(
         symbol=base_code,
         period="daily",
@@ -1396,7 +1613,7 @@ def _fetch_eastmoney_exchange_fund_close(
     )
     result["symbol"] = symbol
     result["name"] = display_etf_name(base_code, symbol)
-    return result
+    return stamp_fund_history_metadata(result, adjustment)
 
 
 def _sina_exchange_symbol(symbol: str) -> str:
@@ -1475,10 +1692,15 @@ def _fetch_sina_exchange_fund_quote(
 
 
 def _ensure_sina_adjustment_is_identity(sina_symbol: str, adjust: str | None) -> None:
-    if adjust not in {"forward", "backward"}:
+    adjustment = normalize_fund_adjustment(adjust)
+    if adjustment == FUND_ADJUST_NONE:
         return
+    if adjustment in {FUND_ADJUST_FORWARD_RATIO, FUND_ADJUST_BACKWARD_RATIO}:
+        raise ValueError("新浪备用源不提供与TickFlow比例复权等价的口径。")
 
-    adjustment_name = "qfq" if adjust == "forward" else "hfq"
+    adjustment_name = (
+        "qfq" if adjustment == FUND_ADJUST_FORWARD_ADDITIVE else "hfq"
+    )
     response = requests.get(
         f"https://finance.sina.com.cn/realstock/company/{sina_symbol}/{adjustment_name}.js",
         timeout=SINA_REQUEST_TIMEOUT_SECONDS,
@@ -1570,7 +1792,7 @@ def _fetch_sina_exchange_fund_close(
         raise ValueError(f"新浪财经未返回 {base_code} 的有效场内日线数据。")
     result["symbol"] = symbol
     result["name"] = display_etf_name(base_code, symbol)
-    return result
+    return stamp_fund_history_metadata(result, adjust)
 
 
 def _fetch_sina_exchange_fund_final_close(
@@ -1633,6 +1855,7 @@ def _append_sina_final_close(
     history: pd.DataFrame,
     *,
     symbol: str,
+    adjust: str | None,
     market_now: datetime | None = None,
 ) -> pd.DataFrame:
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -1644,6 +1867,13 @@ def _append_sina_final_close(
     target_date = latest_final_etf_trade_date(market_now)
     history_dates = pd.to_datetime(result["日期"], errors="coerce")
     if history_dates.dt.date.eq(target_date).any():
+        return result
+
+    adjustment = normalize_fund_adjustment(adjust)
+    if adjustment == FUND_ADJUST_BACKWARD_ADDITIVE:
+        warning = "新浪当日收盘快照为原始价格，不能追加到后复权正式历史。"
+        result.attrs["position_history_warning"] = warning
+        logger.warning("%s %s", symbol, warning)
         return result
 
     try:
@@ -1673,17 +1903,21 @@ def _fetch_exchange_fund_close(
     adjust: str | None,
     market_now: datetime | None = None,
 ) -> pd.DataFrame:
+    adjustment = normalize_fund_adjustment(adjust)
+    if adjustment in {FUND_ADJUST_FORWARD_RATIO, FUND_ADJUST_BACKWARD_RATIO}:
+        raise ValueError("161128的东方财富/AkShare正式历史不支持比例复权。")
     eastmoney_error = ""
     try:
         result = _fetch_eastmoney_exchange_fund_close(
             symbol=symbol,
             count=count,
-            adjust=adjust,
+            adjust=adjustment,
         )
         result.attrs["position_history_source"] = "东方财富/AkShare"
         return _append_sina_final_close(
             result,
             symbol=symbol,
+            adjust=adjustment,
             market_now=market_now,
         )
     except Exception as exc:
@@ -1694,12 +1928,13 @@ def _fetch_exchange_fund_close(
         result = _fetch_sina_exchange_fund_close(
             symbol=symbol,
             count=count,
-            adjust=adjust,
+            adjust=adjustment,
         )
         result.attrs["position_history_source"] = "新浪财经备用源"
         return _append_sina_final_close(
             result,
             symbol=symbol,
+            adjust=adjustment,
             market_now=market_now,
         )
     except Exception as sina_exc:
@@ -1713,7 +1948,7 @@ def load_or_fetch_etf(
     *,
     api_key: str = "",
     count: int = 5000,
-    adjust: str | None = "forward",
+    adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
     ma_periods: list[int] | tuple[int, ...] = (20, 60, 120, 250),
     rsi_period: int = 14,
     base_date: str = "2024-09-24",
@@ -1727,6 +1962,7 @@ def load_or_fetch_etf(
     base_code = normalize_etf_base_code(raw_code)
     strategy = ETF_TIMING_STRATEGIES.get(base_code)
     try:
+        adjustment = normalize_fund_adjustment(adjust)
         symbol = infer_tickflow_symbol(raw_code)
     except Exception as exc:
         return PositionItem("ETF", raw_code, display_etf_name(base_code, raw_code), "失败", error=str(exc))
@@ -1734,7 +1970,7 @@ def load_or_fetch_etf(
     use_akshare_history = base_code in ETF_AKSHARE_HISTORY_CODES
     cache_source = "akshare" if use_akshare_history else "tickflow"
     fetch_source = "东方财富/AkShare" if use_akshare_history else "TickFlow"
-    cache_symbol = f"fund_close_{symbol}_{adjust or 'none'}"
+    cache_symbol = build_fund_cache_symbol("fund_close", symbol, adjustment)
     period = f"{int(count)}_1d"
     cached_df, cache_meta = _load_dataset_if_ready(
         cache_symbol,
@@ -1747,71 +1983,157 @@ def load_or_fetch_etf(
         market_now=market_now,
         require_current_confirmation=True,
     )
+    minimum_rows = int(strategy[0]) if strategy is not None else 2
+    cache_validation_error = _fund_history_validation_error(
+        cached_df,
+        adjust=adjustment,
+        min_rows=minimum_rows,
+        market_now=market_now,
+    )
+    cached_history_valid = not cache_validation_error
     cache_is_current = etf_cache_has_latest_final_close(
         cached_df,
         date_column="日期",
         market_now=market_now,
     )
-    should_refresh = force_refresh or (allow_fetch and not cache_is_current)
+    should_refresh = force_refresh or (
+        allow_fetch and (not cache_is_current or not cached_history_valid)
+    )
     used_cache = cached_df is not None and not should_refresh
     source_df = cached_df.copy() if used_cache else None
     source = "本地缓存" if used_cache else fetch_source
     status = "缓存"
-    error = ""
+    error = cache_validation_error if cached_df is not None and not cached_history_valid else ""
+    formal_history_valid = bool(cached_df is not None and cached_history_valid)
 
     if source_df is None:
         if not allow_fetch:
-            return _missing_item("ETF", raw_code, display_etf_name(base_code, symbol))
+            if cached_df is None:
+                return _missing_item("ETF", raw_code, display_etf_name(base_code, symbol))
+            source_df = cached_df.copy()
+            source = "本地缓存（待校验）"
+            status = "缓存待校验"
+            formal_history_valid = False
         try:
-            if cached_df is not None:
+            if source_df is None and cached_df is not None and cached_history_valid:
                 incremental_count = min(max(120, int(count) // 20), int(count))
-                latest_df = (
-                    _fetch_exchange_fund_close(
-                        symbol=symbol,
-                        count=incremental_count,
-                        adjust=adjust,
-                        market_now=market_now,
-                    )
-                    if use_akshare_history
-                    else fetch_tickflow_fund_close(
-                        symbol=symbol,
-                        api_key=api_key,
-                        count=incremental_count,
-                        adjust=adjust,
-                    )
+                latest_df = _fetch_position_etf_history(
+                    symbol=symbol,
+                    base_code=base_code,
+                    api_key=api_key,
+                    count=incremental_count,
+                    adjust=adjustment,
+                    market_now=market_now,
                 )
                 if use_akshare_history:
                     source = str(latest_df.attrs.get("position_history_source") or fetch_source)
                     error = str(latest_df.attrs.get("position_history_warning") or "")
-                if not allow_unfinished_session:
-                    latest_df = filter_final_etf_rows(latest_df, market_now=market_now)
-                    latest_df["_final_close_confirmed"] = True
-                source_df = _merge_by_date(cached_df, latest_df, "日期")
-                status = "已增量更新"
-            else:
-                source_df = (
-                    _fetch_exchange_fund_close(
-                        symbol=symbol,
-                        count=int(count),
-                        adjust=adjust,
+                latest_df = _prepare_fetched_etf_history(
+                    latest_df,
+                    adjust=adjustment,
+                    market_now=market_now,
+                    allow_unfinished_session=allow_unfinished_session,
+                )
+                rebuild_required = bool(
+                    adjustment != FUND_ADJUST_NONE
+                    and _adjusted_history_has_overlap_changes(cached_df, latest_df)
+                )
+                if rebuild_required:
+                    try:
+                        rebuilt_df = _fetch_position_etf_history(
+                            symbol=symbol,
+                            base_code=base_code,
+                            api_key=api_key,
+                            count=int(count),
+                            adjust=adjustment,
+                            market_now=market_now,
+                        )
+                        if use_akshare_history:
+                            source = str(
+                                rebuilt_df.attrs.get("position_history_source") or fetch_source
+                            )
+                            error = _append_position_error(
+                                error,
+                                str(rebuilt_df.attrs.get("position_history_warning") or ""),
+                            )
+                        source_df = _prepare_fetched_etf_history(
+                            rebuilt_df,
+                            adjust=adjustment,
+                            market_now=market_now,
+                            allow_unfinished_session=allow_unfinished_session,
+                        )
+                        validation_error = _fund_history_validation_error(
+                            source_df,
+                            adjust=adjustment,
+                            min_rows=minimum_rows,
+                            market_now=market_now,
+                            require_latest=not allow_unfinished_session,
+                        )
+                        if validation_error:
+                            raise ValueError(validation_error)
+                        status = "已重建"
+                        formal_history_valid = not allow_unfinished_session
+                    except Exception as rebuild_exc:
+                        source_df = cached_df.copy()
+                        source = "本地缓存（复权重建失败）"
+                        status = "缓存待校验"
+                        formal_history_valid = False
+                        error = _append_position_error(
+                            error,
+                            f"复权历史发生回溯变化，但全量重建失败：{rebuild_exc}",
+                        )
+                else:
+                    source_df = stamp_fund_history_metadata(
+                        _merge_by_date(cached_df, latest_df, "日期"),
+                        adjustment,
+                    )
+                    validation_error = _fund_history_validation_error(
+                        source_df,
+                        adjust=adjustment,
+                        min_rows=minimum_rows,
                         market_now=market_now,
+                        require_latest=not allow_unfinished_session,
                     )
-                    if use_akshare_history
-                    else fetch_tickflow_fund_close(
-                        symbol=symbol,
-                        api_key=api_key,
-                        count=int(count),
-                        adjust=adjust,
-                    )
+                    if validation_error:
+                        raise ValueError(validation_error)
+                    status = "已增量更新"
+                    formal_history_valid = not allow_unfinished_session
+            elif source_df is None:
+                source_df = _fetch_position_etf_history(
+                    symbol=symbol,
+                    base_code=base_code,
+                    api_key=api_key,
+                    count=int(count),
+                    adjust=adjustment,
+                    market_now=market_now,
                 )
                 if use_akshare_history:
                     source = str(source_df.attrs.get("position_history_source") or fetch_source)
                     error = str(source_df.attrs.get("position_history_warning") or "")
-                if not allow_unfinished_session:
-                    source_df = filter_final_etf_rows(source_df, market_now=market_now)
-                    source_df["_final_close_confirmed"] = True
+                source_df = _prepare_fetched_etf_history(
+                    source_df,
+                    adjust=adjustment,
+                    market_now=market_now,
+                    allow_unfinished_session=allow_unfinished_session,
+                )
+                validation_error = _fund_history_validation_error(
+                    source_df,
+                    adjust=adjustment,
+                    min_rows=minimum_rows,
+                    market_now=market_now,
+                    require_latest=not allow_unfinished_session,
+                )
+                if validation_error:
+                    raise ValueError(validation_error)
                 status = "已更新"
-            if save_to_cache and not allow_unfinished_session:
+                formal_history_valid = not allow_unfinished_session
+
+            if (
+                formal_history_valid
+                and save_to_cache
+                and not allow_unfinished_session
+                and status in {"已更新", "已增量更新", "已重建"}
+            ):
                 save_dataset(
                     symbol=cache_symbol,
                     name=f"{symbol} 场内基金/股票原始收盘价",
@@ -1829,11 +2151,16 @@ def load_or_fetch_etf(
                     "失败",
                     source=fetch_source,
                     error=str(exc),
+                    formal_history_valid=False,
                 )
             source_df = cached_df.copy()
             source = "本地缓存（刷新失败）"
-            status = "缓存"
-            error = str(exc)
+            status = "缓存" if cached_history_valid else "缓存待校验"
+            formal_history_valid = cached_history_valid
+            error = _append_position_error(error, str(exc))
+
+    gap_warning = _recent_etf_gap_warning(source_df, market_now=market_now)
+    error = _append_position_error(error, gap_warning)
 
     try:
         analysis_source_df = source_df.drop(
@@ -1865,7 +2192,7 @@ def load_or_fetch_etf(
         "价格百分位": _round_metric(summary.get("价格百分位")),
         "年化波动(%)": _round_metric(summary.get("年化波动率(%)")),
     }
-    if strategy is not None:
+    if strategy is not None and formal_history_valid:
         timing_snapshot = calculate_etf_timing_snapshot(
             result.dataframe,
             ma_period=int(strategy[0]),
@@ -1890,12 +2217,13 @@ def load_or_fetch_etf(
         latest_date=str(summary.get("最新日期") or ""),
         cache_time=(
             _current_cache_time_text()
-            if status != "缓存" and save_to_cache
+            if status in {"已更新", "已增量更新", "已重建"} and save_to_cache
             else format_cache_time(cache_meta.get("last_update_time") if cache_meta else "")
         ),
         metrics=metrics,
         dataframe=result.dataframe,
         error=error,
+        formal_history_valid=formal_history_valid,
     )
 
 

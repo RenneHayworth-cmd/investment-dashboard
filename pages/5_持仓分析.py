@@ -21,6 +21,7 @@ from core.ui import (
     render_page_header,
 )
 from services.fund_analysis import (
+    FUND_ADJUSTMENT_OPTIONS,
     calculate_current_drawdown_info,
     calculate_max_drawdown_info,
     calculate_yearly_drawdowns,
@@ -1377,9 +1378,12 @@ with st.sidebar:
     )
     update_clicked = st.button("加载持仓信息", type="primary", use_container_width=True)
     force_refresh = st.checkbox(
-        "联网增量更新已有缓存",
+        "联网检查并更新已有缓存",
         value=True,
-        help="加载时联网获取最新数据，只追加缓存中不存在的日期；已有日期和值保持不变。",
+        help=(
+            "加载时联网检查近期数据。复权历史未变化时只追加新日期；"
+            "发现分红等因素导致历史价格回溯时，仅在完整校验通过后重建对应标的新版缓存。"
+        ),
     )
     save_to_cache = st.checkbox("更新后保存到本地缓存", value=True)
 
@@ -1394,12 +1398,20 @@ with st.sidebar:
         option_text = st.text_area("期权持仓", value="\n".join(DEFAULT_OPTION_CODES), height=110)
 
     with st.expander("高级参数", expanded=False):
-        adjust_option = st.selectbox("ETF复权", options=["前复权", "后复权", "不复权"], index=0)
+        adjust_option = st.selectbox(
+            "ETF复权",
+            options=list(FUND_ADJUSTMENT_OPTIONS),
+            index=0,
+            help=(
+                "普通前复权使用差值口径；比例口径仅用于复现旧结果。"
+                "不复权缓存只追加新日期，复权因分红发生历史回溯时仅重建对应标的。"
+            ),
+        )
         etf_count = st.number_input("ETF日线条数", min_value=300, max_value=10000, value=5000, step=100)
         market_count = st.number_input("期货/期权日线条数", min_value=20, max_value=5000, value=500, step=100)
         max_workers = st.slider("期货并发请求数", min_value=1, max_value=4, value=2)
 
-adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
+adjust_map = FUND_ADJUSTMENT_OPTIONS
 etf_codes = parse_position_codes(etf_text)
 spread_groups = parse_spread_groups(spread_text)
 option_codes = parse_position_codes(option_text)

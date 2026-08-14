@@ -17,6 +17,8 @@ from core.ui import (
     render_page_header,
 )
 from services.fund_analysis import (
+    FUND_ADJUSTMENT_OPTIONS,
+    build_fund_cache_symbol,
     analyze_fund_nav,
     calculate_current_drawdown_info,
     normalize_nav_dataframe,
@@ -105,7 +107,11 @@ with st.form("us_stock_form"):
     with col2:
         count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
     with col3:
-        adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
+        adjust_option = st.selectbox(
+            "复权",
+            options=list(FUND_ADJUSTMENT_OPTIONS),
+            index=0,
+        )
     with col4:
         api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
     submitted = st.form_submit_button("拉取并分析", type="primary")
@@ -140,12 +146,11 @@ if not symbols:
 if len(symbols) > 1:
     st.warning("当前页面一次分析一个标的；已使用第一个代码。")
 
-adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
 if submitted:
  try:
     symbol = infer_us_symbol(symbols[0])
-    adjust_value = adjust_map[adjust_option]
-    raw_symbol = f"us_daily_{symbol}_{adjust_value or 'none'}"
+    adjust_value = FUND_ADJUSTMENT_OPTIONS[adjust_option]
+    raw_symbol = build_fund_cache_symbol("us_daily", symbol, adjust_value)
     period = f"{int(count)}_1d"
     cached_df, cache_meta = _load_cache(raw_symbol, "tickflow_us", "us_daily_raw", period=period)
 

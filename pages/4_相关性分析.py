@@ -13,7 +13,14 @@ from services.correlation_analysis import (
     parse_symbols,
     save_correlation_results,
 )
-from services.fund_analysis import fetch_tickflow_fund_close, infer_tickflow_symbol, read_uploaded_table
+from services.fund_analysis import (
+    FUND_ADJUSTMENT_OPTIONS,
+    FUND_ADJUSTMENT_VALUES,
+    build_fund_cache_symbol,
+    fetch_tickflow_fund_close,
+    infer_tickflow_symbol,
+    read_uploaded_table,
+)
 from services.futures_options_analysis import DATA_TYPE_FUTURES, fetch_futures_option_data
 from services.futures_spread import CONTRACT_PREFIXES
 from services.us_stock_analysis import fetch_tickflow_us_daily, infer_us_symbol, parse_us_symbols
@@ -42,7 +49,11 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 with st.sidebar:
     st.subheader("分析设置")
     count = st.number_input("日线条数", min_value=60, max_value=10000, value=2500, step=100)
-    adjust_option = st.selectbox("股票/ETF复权", options=["前复权", "后复权", "不复权"], index=0)
+    adjust_option = st.selectbox(
+        "股票/ETF复权",
+        options=list(FUND_ADJUSTMENT_OPTIONS),
+        index=0,
+    )
     correlation_method = st.selectbox("计算方式", options=["收盘价相关", "日收益率相关"], index=1)
     force_refresh = st.checkbox("联网更新数据", value=False)
 
@@ -246,14 +257,14 @@ def source_to_category_from_dataset(source: str, data_type: str) -> str:
 
 def cached_symbol_from_dataset(symbol: str, category: str) -> str:
     if category == "A股ETF/股票" and symbol.startswith("correlation_cn_"):
-        clean = symbol.removeprefix("correlation_cn_")
-        for suffix in ("_forward", "_backward", "_none"):
+        clean = symbol.removeprefix("correlation_cn_v2_").removeprefix("correlation_cn_")
+        for suffix in sorted((f"_{mode}" for mode in FUND_ADJUSTMENT_VALUES), key=len, reverse=True):
             if clean.endswith(suffix):
                 return clean[: -len(suffix)]
         return clean
     if category == "美股" and symbol.startswith("correlation_us_"):
-        clean = symbol.removeprefix("correlation_us_")
-        for suffix in ("_forward", "_backward", "_none"):
+        clean = symbol.removeprefix("correlation_us_v2_").removeprefix("correlation_us_")
+        for suffix in sorted((f"_{mode}" for mode in FUND_ADJUSTMENT_VALUES), key=len, reverse=True):
             if clean.endswith(suffix):
                 return clean[: -len(suffix)]
         return clean
@@ -263,7 +274,7 @@ def cached_symbol_from_dataset(symbol: str, category: str) -> str:
 
 
 def cached_name_from_dataset(name: str, symbol: str, category: str) -> str:
-    for suffix in (" 前复权", " 后复权", " 不复权"):
+    for suffix in (f" {label}" for label in FUND_ADJUSTMENT_OPTIONS):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
     if category == "期货主连":
@@ -434,9 +445,7 @@ if not calculate_clicked:
 
 items = []
 errors = []
-adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
-adjust_value = adjust_map[adjust_option]
-adjust_key = adjust_value or "none"
+adjust_value = FUND_ADJUSTMENT_OPTIONS[adjust_option]
 
 try:
     source_names = []
@@ -451,7 +460,7 @@ try:
     for code in parse_symbols(cn_codes):
         try:
             symbol = infer_tickflow_symbol(code)
-            cache_symbol = f"correlation_cn_{symbol}_{adjust_key}"
+            cache_symbol = build_fund_cache_symbol("correlation_cn", symbol, adjust_value)
             cache_period = f"{int(count)}_1d"
             cached_df, cache_meta = load_dataset(
                 cache_symbol,
@@ -489,7 +498,7 @@ try:
     for code in parse_us_symbols(us_codes):
         try:
             symbol = infer_us_symbol(code)
-            cache_symbol = f"correlation_us_{symbol}_{adjust_key}"
+            cache_symbol = build_fund_cache_symbol("correlation_us", symbol, adjust_value)
             cache_period = f"{int(count)}_1d"
             cached_df, cache_meta = load_dataset(
                 cache_symbol,

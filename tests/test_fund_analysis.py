@@ -1,15 +1,70 @@
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from services.fund_analysis import (
+    FUND_ADJUSTMENT_VALUES,
+    FUND_ADJUST_NONE,
     _fetch_eastmoney_fund_nav_page,
     _request_eastmoney_page,
     analyze_fund_nav,
+    fetch_tickflow_fund_close,
     fetch_eastmoney_fund_name,
+    normalize_fund_adjustment,
     normalize_nav_dataframe,
 )
+
+
+class TickFlowAdjustmentTests(unittest.TestCase):
+    @patch("services.fund_analysis.fetch_tickflow_instrument_name", return_value="测试ETF")
+    def test_tickflow_receives_each_explicit_adjustment_mode(self, _name_mock):
+        klines = Mock()
+        klines.get.return_value = pd.DataFrame(
+            {
+                "trade_date": ["2026-08-11", "2026-08-12"],
+                "open": [1.0, 1.1],
+                "close": [1.1, 1.2],
+            }
+        )
+        client = SimpleNamespace(klines=klines)
+
+        class FakeTickFlow:
+            def __new__(cls, *args, **kwargs):
+                return client
+
+            @classmethod
+            def free(cls):
+                return client
+
+        with patch.dict(sys.modules, {"tickflow": SimpleNamespace(TickFlow=FakeTickFlow)}):
+            for mode in sorted(FUND_ADJUSTMENT_VALUES):
+                result = fetch_tickflow_fund_close(
+                    "159545.SZ",
+                    api_key="test-key",
+                    count=2,
+                    adjust=mode,
+                )
+                self.assertTrue(result["_adjust_mode"].eq(mode).all())
+
+            legacy_none = fetch_tickflow_fund_close(
+                "159545.SZ",
+                api_key="test-key",
+                count=2,
+                adjust=None,
+            )
+
+        passed_modes = [call.kwargs["adjust"] for call in klines.get.call_args_list]
+        self.assertEqual(passed_modes[:-1], sorted(FUND_ADJUSTMENT_VALUES))
+        self.assertEqual(passed_modes[-1], FUND_ADJUST_NONE)
+        self.assertTrue(legacy_none["_adjust_mode"].eq(FUND_ADJUST_NONE).all())
+
+    def test_adjustment_validation_rejects_unknown_values(self):
+        self.assertEqual(normalize_fund_adjustment(None), FUND_ADJUST_NONE)
+        with self.assertRaisesRegex(ValueError, "不支持的复权方式"):
+            normalize_fund_adjustment("qfq")
 
 
 class EastMoneyResponseTests(unittest.TestCase):

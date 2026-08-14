@@ -49,8 +49,10 @@ before a larger handoff or commit.
   cache count, latest cache update time, latest trade date, today-focus notes,
   and common page entry text. Avoid rebuilding it as a heavy card dashboard.
 - The `指数监控` page should show cached data first and must not use a periodic
-  refresh timer for its summary cards or formal summary update. The
-  `更新指数数据` button is their network trigger: fetch one read-only quote for
+  network refresh timer for its summary cards or formal summary update. A
+  cache-only fragment may poll local dataset metadata every 30 seconds and
+  rerender the page after the standalone scheduled updater changes the formal
+  report cache. The `更新指数数据` button is the manual network trigger: fetch one read-only quote for
   instruments currently trading, fetch mainland, Hong Kong, Japan, and domestic
   futures lunch closes only once per page session during their respective
   breaks, and
@@ -63,8 +65,17 @@ before a larger handoff or commit.
   latest 120 calendar days. For every displayed trading day, show that day's
   latest MA20 state-transition date and the return accumulated from the
   transition-day close; do not repeat only the current transition metrics
-  across all historical rows.
+  across all historical rows. The bottom MA20 summary also shows the immediately
+  preceding transition date and the completed return from that transition-day
+  close to the current transition-day close.
   Detail views retain their separate cache-first incremental history behavior.
+- Formal index cards and MA20 caches are automatically checked by the standalone
+  scheduler every day at 15:10 and 16:10 Asia/Shanghai. The 15:10 run covers
+  mainland China, day-session futures, and other markets already closed; the
+  16:10 run adds Hong Kong and retries remaining gaps. Use
+  `scripts/update_index_ma20_scheduled.py` through the Windows scheduled-task
+  wrapper, keep it single-instance, and skip network work when no completed-day
+  gap exists. Scheduled updates never persist intraday quotes.
 - The `任务与数据` page provides manual index updates, dataset metadata, and job
   records. Its manual update only fills missing completed-session formal data
   after checking the latest 20 market trading sessions, and does not fetch
@@ -117,7 +128,11 @@ before a larger handoff or commit.
   contract, for example `铁矿石主连（I2609）`. Re-resolve the contract only after
   a successful manual quote update, persist the small mapping in
   `index_futures_main_contracts`, and keep canonical index names unchanged for
-  links, cache keys, and calculations.
+  links and main-continuous history cache keys. Calculate the summary MA20,
+  deviation, and transition fields from a separate append-only formal daily
+  cache for the currently matched concrete contract, so a rollover does not mix
+  old and new contract prices. Keep detail views on the unadjusted
+  main-continuous long history.
 - The monitored set includes the Shanghai Composite, mainland China indices,
   EastMoney micro-cap board index, STAR 50, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
   Dividend Low Volatility, Nikkei 225, Korea KOSPI, and iron ore/gold/crude
@@ -221,6 +236,19 @@ before a larger handoff or commit.
   Show close-fetch failures prominently above the current-position table,
   including the affected symbol and source error, while retaining the local
   cache and the ten-minute retry behavior.
+  Below the daily-close summary, render a calendar heatmap that switches among
+  daily, weekly, monthly, and yearly holding returns and between amount and
+  percentage. Daily P&L is the change in cumulative total P&L. Its return base
+  is the previous valuation's market value plus positive net new investment
+  after offsetting same-day sale proceeds; when the day starts empty, use that
+  day's buy cost as the fallback base. Sum amounts and compound daily return
+  rates for calendar weeks, months, and years. Use red for gains, green for
+  losses, and gray for zero or unavailable values. The daily calendar has only
+  Monday-through-Friday columns. Keep weekday A-share holidays as non-return
+  cells labeled with their holiday name, and show weekly periods as Monday
+  through Friday. Derive these results locally
+  without a new table or persisted calculation, exclude unrecorded cash, add no
+  market benchmark, and retain the existing cumulative P&L curve.
   The current-position table also shows the latest formal close, market value,
   and each symbol's daily and cumulative P&L as compact amount/rate cells from
   the same formal-close histories. Show each open symbol's market-value weight
@@ -313,6 +341,26 @@ YYYY-MM-DD HH:MM:SS
 ```
 
 not ISO strings containing `T`.
+
+For TickFlow fund/ETF/stock daily prices, use the shared explicit adjustment
+constants from `services.fund_analysis`. Plain forward adjustment means
+`forward_additive`; expose `forward` only as the clearly labeled ratio-adjusted
+legacy-comparison option. Always pass `none` explicitly for unadjusted prices;
+legacy Python `None` is accepted only at the normalization boundary.
+
+Fund price caches use versioned, adjustment-specific keys such as
+`fund_close_v2_159545.SZ_forward_additive`. Do not fall back to the legacy
+unversioned cache. Unadjusted formal closes remain append-only by date. For an
+adjusted cache, fetch a recent overlap first: append unseen dates when overlap
+prices are unchanged, and rebuild only that symbol when an upstream corporate
+action changes historical adjusted prices. Validate the complete replacement
+before the existing atomic save. If drift was detected but rebuilding fails,
+keep the last card/intraday quote visible, mark formal history invalid, and
+suppress timing signals, recent guidance, and 512890 parking decisions.
+
+`scripts/migrate_fund_price_caches.py` is preview-only unless `--apply` is
+provided. It reads the API key only from `TICKFLOW_API_KEY` and migrates symbols
+sequentially. Keep generated cache and adjustment-audit outputs uncommitted.
 
 ## Market Data Notes
 

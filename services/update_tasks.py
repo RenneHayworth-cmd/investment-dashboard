@@ -43,6 +43,17 @@ INDEX_HISTORY_BOOTSTRAP_BARS = 1000
 INDEX_HISTORY_MIN_ROWS = 252
 INDEX_HISTORY_INCREMENTAL_DAYS = 30
 INDEX_VERIFICATION_TOLERANCE_PCT = 0.20
+FUTURES_CURRENT_CONTRACT_HISTORY_SOURCE = "index_futures_current_contract_history"
+FUTURES_MAIN_CONTRACT_CACHE_SYMBOL = "index_futures_main_contracts"
+FUTURES_MAIN_CONTRACT_CACHE_SOURCE = "index_metadata"
+FUTURES_MAIN_INDEX_NAMES = {
+    "中证500期货主连",
+    "中证1000期货主连",
+    "铁矿石主连",
+    "沪金主连",
+    "沪银主连",
+    "原油主连",
+}
 
 
 @dataclass
@@ -218,6 +229,19 @@ def run_index_ma20_update(
             cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
         if cached_df is None:
             cached_df, _ = load_dataset("index_ma20_latest", cache_source, "index_ma20_report")
+
+        selected_futures = {
+            name: contract
+            for name, contract in load_futures_main_contract_mapping().items()
+            if name in {selected_name for selected_name, _ in selected_items}
+        }
+        contract_history_errors = refresh_futures_current_contract_histories(
+            selected_futures,
+            max_workers=max_workers,
+        )
+        errors.extend(
+            f"当前合约正式日线: {message}" for message in contract_history_errors
+        )
 
         workers = min(max(int(max_workers), 1), total)
         completed = 0
@@ -464,6 +488,174 @@ def append_cached_index_rows(old_df: pd.DataFrame | None, new_df: pd.DataFrame) 
     return pd.concat([normalized_old, unseen], ignore_index=True).sort_values("trade_date").reset_index(drop=True)
 
 
+def futures_contract_history_cache_symbol(contract: str) -> str:
+    return f"index_futures_contract_{str(contract).strip().upper()}"
+
+
+def load_futures_main_contract_mapping() -> dict[str, str]:
+    cached, _ = load_dataset(
+        FUTURES_MAIN_CONTRACT_CACHE_SYMBOL,
+        FUTURES_MAIN_CONTRACT_CACHE_SOURCE,
+        "futures_main_contracts",
+    )
+    if cached is None or cached.empty or not {"index_name", "contract"}.issubset(cached.columns):
+        return {}
+    return {
+        str(row["index_name"]): str(row["contract"]).strip().upper()
+        for _, row in cached.dropna(subset=["index_name", "contract"]).iterrows()
+        if str(row["contract"]).strip()
+    }
+
+
+def load_futures_current_contract_history(index_name: str) -> tuple[str | None, pd.DataFrame | None]:
+    if index_name not in FUTURES_MAIN_INDEX_NAMES:
+        return None, None
+    contract = load_futures_main_contract_mapping().get(index_name)
+    if not contract:
+        return None, None
+    cached, _ = load_dataset(
+        futures_contract_history_cache_symbol(contract),
+        FUTURES_CURRENT_CONTRACT_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    return contract, merge_raw_index_data(None, cached) if cached is not None and not cached.empty else None
+
+
+def _fetch_and_cache_futures_contract_history(
+    index_name: str,
+    contract: str,
+    *,
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    from services.futures_spread import fetch_futures_daily_from_akshare
+
+    cache_symbol = futures_contract_history_cache_symbol(contract)
+    cached, _ = load_dataset(
+        cache_symbol,
+        FUTURES_CURRENT_CONTRACT_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    market = next((item for item in MARKET_WINDOWS if item.name == "A股"), None)
+    market_now = (
+        market_now.astimezone(ZoneInfo(market.timezone))
+        if market is not None and market_now is not None
+        else datetime.now(ZoneInfo(market.timezone))
+        if market is not None
+        else None
+    )
+    target_date = latest_settled_trade_date(market, market_now) if market is not None else None
+    normalized_cached = merge_raw_index_data(None, cached) if cached is not None and not cached.empty else None
+    if normalized_cached is not None and not normalized_cached.empty and target_date is not None:
+        latest_cached = pd.to_datetime(normalized_cached["trade_date"], errors="coerce").max()
+        if pd.notna(latest_cached) and latest_cached.date() >= target_date:
+            return normalized_cached
+
+    fetched = fetch_futures_daily_from_akshare(contract).rename(columns={"date": "trade_date"})
+    fetched = filter_completed_market_dates(fetched, "A股")
+    if fetched is not None and not fetched.empty and target_date is not None:
+        fetched_dates = pd.to_datetime(fetched["trade_date"], errors="coerce")
+        fetched = fetched.loc[fetched_dates.dt.date <= target_date].reset_index(drop=True)
+    if fetched is None or fetched.empty:
+        target_text = target_date.isoformat() if target_date is not None else "-"
+        raise RuntimeError(f"{contract} 未返回截至 {target_text} 的已确认收盘数据")
+    merged = append_cached_index_rows(normalized_cached, fetched)
+    if normalized_cached is None or len(merged) > len(normalized_cached):
+        save_dataset(
+            symbol=cache_symbol,
+            name=f"{index_name}（{contract}）正式日线",
+            source=FUTURES_CURRENT_CONTRACT_HISTORY_SOURCE,
+            data_type="index_daily_raw",
+            df=merged,
+        )
+    return merged
+
+
+def refresh_futures_current_contract_histories(
+    contract_names: dict[str, str],
+    max_workers: int = 4,
+    *,
+    market_now: datetime | None = None,
+) -> list[str]:
+    selected = {
+        name: str(contract).strip().upper()
+        for name, contract in contract_names.items()
+        if name in FUTURES_MAIN_INDEX_NAMES and str(contract).strip()
+    }
+    if not selected:
+        return []
+
+    errors: list[str] = []
+    workers = min(max(int(max_workers), 1), len(selected))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                _fetch_and_cache_futures_contract_history,
+                name,
+                contract,
+                market_now=market_now,
+            ): (name, contract)
+            for name, contract in selected.items()
+        }
+        for future in as_completed(futures):
+            name, contract = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                errors.append(f"{name}（{contract}）：{str(exc).strip() or type(exc).__name__}")
+    return errors
+
+
+def find_pending_futures_current_contract_index_names(
+    *,
+    market_now: datetime | None = None,
+    index_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> set[str]:
+    """Return mapped futures indexes whose concrete-contract close is not settled locally."""
+    market = next((item for item in MARKET_WINDOWS if item.name == "A股"), None)
+    if market is None:
+        return set()
+    current = (
+        market_now.astimezone(ZoneInfo(market.timezone))
+        if market_now is not None
+        else datetime.now(ZoneInfo(market.timezone))
+    )
+    target_date = latest_settled_trade_date(market, current)
+    selected = set(index_names) if index_names is not None else set(FUTURES_MAIN_INDEX_NAMES)
+    mapping = load_futures_main_contract_mapping()
+    pending: set[str] = set()
+    for index_name, contract in mapping.items():
+        if index_name not in selected or index_name not in FUTURES_MAIN_INDEX_NAMES:
+            continue
+        cached, _ = load_dataset(
+            futures_contract_history_cache_symbol(contract),
+            FUTURES_CURRENT_CONTRACT_HISTORY_SOURCE,
+            "index_daily_raw",
+        )
+        latest_date = pd.NaT
+        if cached is not None and not cached.empty and "trade_date" in cached.columns:
+            latest_date = pd.to_datetime(cached["trade_date"], errors="coerce").max()
+        if pd.isna(latest_date) or latest_date.date() < target_date:
+            pending.add(index_name)
+    return pending
+
+
+def build_futures_current_contract_report(
+    index_name: str,
+    report_raw: pd.DataFrame | None,
+    *,
+    days: int = INDEX_REPORT_DISPLAY_DAYS,
+) -> pd.DataFrame | None:
+    _, contract_raw = load_futures_current_contract_history(index_name)
+    if contract_raw is None or len(contract_raw) < 20:
+        return None
+    if report_raw is not None and not report_raw.empty:
+        report_latest = pd.to_datetime(report_raw["trade_date"], errors="coerce").max()
+        contract_latest = pd.to_datetime(contract_raw["trade_date"], errors="coerce").max()
+        if pd.notna(report_latest) and (pd.isna(contract_latest) or contract_latest < report_latest):
+            return None
+    return build_export_df(contract_raw, index_name, days=days)
+
+
 def sync_index_long_history(cache_symbol: str, index_name: str, new_df: pd.DataFrame) -> None:
     long_cached_raw, _ = load_dataset(
         cache_symbol,
@@ -492,6 +684,22 @@ def enrich_index_report_indicators(report_df: pd.DataFrame) -> pd.DataFrame:
 
     enriched = report_df.copy()
     for index_name, index_config in INDEX_CONFIG.items():
+        report_raw = extract_raw_from_export_df(enriched, index_name)
+        if report_raw is None or report_raw.empty:
+            continue
+        current_contract_report = build_futures_current_contract_report(
+            index_name,
+            report_raw,
+            days=INDEX_REPORT_DISPLAY_DAYS,
+        )
+        if current_contract_report is not None and not current_contract_report.empty:
+            enriched = merge_index_report(
+                enriched,
+                current_contract_report,
+                prefer_update_index_names={index_name},
+            )
+            continue
+
         cache_symbol = raw_cache_symbol(index_name, index_config)
         history_raw, _ = load_dataset(
             cache_symbol,
@@ -517,10 +725,6 @@ def enrich_index_report_indicators(report_df: pd.DataFrame) -> pd.DataFrame:
         )
         correction_raw = extract_source_correction_rows(correction_raw, index_config)
         history_raw = overlay_finalized_index_rows(history_raw, correction_raw)
-        report_raw = extract_raw_from_export_df(enriched, index_name)
-        if report_raw is None or report_raw.empty:
-            continue
-
         combined_raw = append_cached_index_rows(history_raw, report_raw)
         combined_raw = filter_completed_market_dates(
             combined_raw,

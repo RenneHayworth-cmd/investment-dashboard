@@ -120,6 +120,40 @@ STATIC_MARKET_HOLIDAYS = {
     ),
 }
 
+STATIC_MARKET_HOLIDAY_LABELS = {
+    "A股": {
+        **{day: "元旦" for day in _date_set("2026-01-01", "2026-01-02")},
+        **{
+            day: "春节"
+            for day in _date_set(
+                "2026-02-16",
+                "2026-02-17",
+                "2026-02-18",
+                "2026-02-19",
+                "2026-02-20",
+                "2026-02-23",
+            )
+        },
+        date(2026, 4, 6): "清明",
+        **{
+            day: "劳动节"
+            for day in _date_set("2026-05-01", "2026-05-04", "2026-05-05")
+        },
+        date(2026, 6, 19): "端午",
+        date(2026, 9, 25): "中秋",
+        **{
+            day: "国庆"
+            for day in _date_set(
+                "2026-10-01",
+                "2026-10-02",
+                "2026-10-05",
+                "2026-10-06",
+                "2026-10-07",
+            )
+        },
+    },
+}
+
 
 def _observed_date(day: date) -> date:
     if day.weekday() == 5:
@@ -224,6 +258,16 @@ def is_market_holiday(market: MarketWindow, day: date) -> bool:
         holidays = set().union(*(us_market_holidays(year) for year in (day.year - 1, day.year, day.year + 1)))
         return day in holidays
     return False
+
+
+def get_market_holiday_label(market: MarketWindow | None, day: date) -> str | None:
+    """Return a display label for a weekday market closure."""
+    if market is None or day.weekday() >= 5:
+        return None
+    label = STATIC_MARKET_HOLIDAY_LABELS.get(market.name, {}).get(day)
+    if label:
+        return label
+    return "休市" if is_market_holiday(market, day) else None
 
 
 def is_market_trading_day(market: MarketWindow, market_now: datetime) -> bool:

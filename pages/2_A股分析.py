@@ -17,7 +17,10 @@ from core.ui import (
     render_page_header,
 )
 from services.fund_analysis import (
+    FUND_ADJUSTMENT_OPTIONS,
+    FUND_ADJUST_NONE,
     analyze_fund_nav,
+    build_fund_cache_symbol,
     calculate_current_drawdown_info,
     fetch_eastmoney_fund_nav,
     fetch_tickflow_fund_close,
@@ -73,7 +76,12 @@ def _load_cache(symbol: str, source: str, data_type: str, period: str = "1d"):
     return cached_df, meta
 
 
-def _merge_raw_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
+def _merge_raw_data(
+    old_df: pd.DataFrame | None,
+    new_df: pd.DataFrame,
+    *,
+    preserve_existing: bool = False,
+) -> pd.DataFrame:
     if old_df is None or old_df.empty:
         merged = new_df.copy()
     else:
@@ -82,7 +90,8 @@ def _merge_raw_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.Dat
         return merged
     merged["日期"] = pd.to_datetime(merged["日期"], errors="coerce")
     merged = merged.dropna(subset=["日期"])
-    return merged.sort_values("日期").drop_duplicates("日期", keep="last").reset_index(drop=True)
+    keep = "first" if preserve_existing else "last"
+    return merged.sort_values("日期").drop_duplicates("日期", keep=keep).reset_index(drop=True)
 
 
 st.set_page_config(page_title="A股分析", layout="wide")
@@ -215,7 +224,11 @@ elif input_mode == "场内基金/股票":
         with col2:
             count = st.number_input("日线条数", min_value=300, max_value=10000, value=5000, step=100)
         with col3:
-            adjust_option = st.selectbox("复权", options=["前复权", "后复权", "不复权"], index=0)
+            adjust_option = st.selectbox(
+                "复权",
+                options=list(FUND_ADJUSTMENT_OPTIONS),
+                index=0,
+            )
         with col4:
             api_key = st.text_input("API Key", value=os.getenv("TICKFLOW_API_KEY", ""), type="password")
         submitted = st.form_submit_button("拉取并分析", type="primary")
@@ -236,12 +249,11 @@ elif input_mode == "场内基金/股票":
             base_date=base_date.strftime("%Y-%m-%d"),
         )
 
-    adjust_map = {"前复权": "forward", "后复权": "backward", "不复权": None}
     if submitted:
       try:
         symbol = infer_tickflow_symbol(fund_code)
-        adjust_value = adjust_map[adjust_option]
-        raw_symbol = f"fund_close_{symbol}_{adjust_value or 'none'}"
+        adjust_value = FUND_ADJUSTMENT_OPTIONS[adjust_option]
+        raw_symbol = build_fund_cache_symbol("fund_close", symbol, adjust_value)
         cached_df, cache_meta = _load_cache(
             raw_symbol,
             "tickflow",
@@ -252,7 +264,7 @@ elif input_mode == "场内基金/股票":
             source_df = cached_df
             st.info(f"已使用本地缓存，缓存时间：{_format_datetime_text(cache_meta['last_update_time'])}")
         else:
-            if cached_df is not None:
+            if cached_df is not None and adjust_value == FUND_ADJUST_NONE:
                 incremental_count = min(max(120, int(count) // 20), int(count))
                 with st.spinner(f"正在增量更新 {symbol} 最近 {incremental_count} 条日线..."):
                     latest_df = fetch_tickflow_fund_close(
@@ -261,12 +273,17 @@ elif input_mode == "场内基金/股票":
                         count=incremental_count,
                         adjust=adjust_value,
                     )
-                source_df = _merge_raw_data(cached_df, latest_df)
+                source_df = _merge_raw_data(
+                    cached_df,
+                    latest_df,
+                    preserve_existing=True,
+                )
                 st.info(
                     f"已基于本地缓存增量更新：{len(cached_df)} 条 → {len(source_df)} 条"
                 )
             else:
-                with st.spinner(f"正在通过 TickFlow 全量拉取 {symbol} 的日线收盘价..."):
+                action_text = "重建" if cached_df is not None else "拉取"
+                with st.spinner(f"正在通过 TickFlow 全量{action_text} {symbol} 的日线收盘价..."):
                     source_df = fetch_tickflow_fund_close(
                         symbol=symbol,
                         api_key=api_key,
