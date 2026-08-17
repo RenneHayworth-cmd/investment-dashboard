@@ -40,6 +40,11 @@ class AuditAllocation:
     threshold_pct: float = 1.0
     signal_rule: str = "percent"
     atr_k: float = 0.0
+    sigma_period: int = 60
+    buy_k: float = 0.0
+    sell_k: float = 0.0
+    buy_alpha_pct: float = 0.0
+    sell_alpha_pct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -238,6 +243,19 @@ def validate_audit_inputs(
     missing = [symbol for symbol in symbols if symbol not in market_data]
     if missing:
         raise ValueError(f"缺少行情：{'、'.join(missing)}")
+    allowed_signal_rules = {"percent", "atr", "sigma", "hybrid_sigma"}
+    for item in allocations:
+        if item.signal_rule not in allowed_signal_rules:
+            raise ValueError(f"{item.symbol} 不支持的信号规则：{item.signal_rule}")
+        if item.ma_period < 1:
+            raise ValueError(f"{item.symbol} 的均线周期必须大于0。")
+        if item.threshold_pct < 0 or item.atr_k < 0:
+            raise ValueError(f"{item.symbol} 的固定阈值或ATR系数不能为负数。")
+        if item.signal_rule in {"sigma", "hybrid_sigma"}:
+            if item.sigma_period < 2:
+                raise ValueError(f"{item.symbol} 的σ周期不能小于2。")
+            if min(item.buy_k, item.sell_k, item.buy_alpha_pct, item.sell_alpha_pct) < 0:
+                raise ValueError(f"{item.symbol} 的σ系数和alpha不能为负数。")
     required = {"trade_date", "signal_close", "raw_open", "raw_close", "dividend_per_share"}
     for symbol in symbols:
         absent = required - set(market_data[symbol].columns)
@@ -380,6 +398,18 @@ def run_portfolio_audit(
         )
         symbol_daily_columns[f"{symbol}_cash"] = symbol_rows["cash"].values
         symbol_daily_columns[f"{symbol}_signal"] = symbol_rows["signal"].values
+        for diagnostic_column in (
+            "ma",
+            "deviation",
+            "sigma_prev",
+            "buy_threshold_pct",
+            "sell_threshold_pct",
+            "upper_trigger_line",
+            "lower_trigger_line",
+        ):
+            symbol_daily_columns[f"{symbol}_{diagnostic_column}"] = symbol_rows[
+                diagnostic_column
+            ].values
         for event_column in (
             "signal_generated",
             "target_position",
@@ -490,6 +520,13 @@ def _run_sleeve(
     data = data.sort_values("trade_date").drop_duplicates("trade_date").set_index("trade_date")
     ma_period = allocation.ma_period
     data["ma"] = data["signal_close"].rolling(ma_period, min_periods=ma_period).mean()
+    data["deviation"] = data["signal_close"] / data["ma"] - 1
+    data["sigma_prev"] = (
+        data["deviation"]
+        .rolling(allocation.sigma_period, min_periods=allocation.sigma_period)
+        .std(ddof=1)
+        .shift(1)
+    )
     previous_close = data["signal_close"].shift(1)
     true_range = pd.concat(
         [
@@ -581,7 +618,13 @@ def _run_sleeve(
             trade_dividends += dividend
 
         ma = float(row["ma"]) if pd.notna(row["ma"]) else np.nan
+        deviation = float(row["deviation"]) if pd.notna(row["deviation"]) else np.nan
+        sigma_prev = float(row["sigma_prev"]) if pd.notna(row["sigma_prev"]) else np.nan
         signal_price = float(row["signal_close"])
+        buy_threshold = np.nan
+        sell_threshold = np.nan
+        upper_line = np.nan
+        lower_line = np.nan
         if always_hold:
             desired = 1
             signal = "持有"
@@ -593,7 +636,19 @@ def _run_sleeve(
                 atr = float(row["atr20"]) if pd.notna(row["atr20"]) else np.nan
                 upper_line = ma + allocation.atr_k * atr
                 lower_line = ma - allocation.atr_k * atr
+                buy_threshold = upper_line / ma - 1 if ma else np.nan
+                sell_threshold = 1 - lower_line / ma if ma else np.nan
+            elif allocation.signal_rule in {"sigma", "hybrid_sigma"}:
+                if np.isfinite(sigma_prev) and sigma_prev > 0:
+                    buy_alpha = allocation.buy_alpha_pct / 100 if allocation.signal_rule == "hybrid_sigma" else 0.0
+                    sell_alpha = allocation.sell_alpha_pct / 100 if allocation.signal_rule == "hybrid_sigma" else 0.0
+                    buy_threshold = buy_alpha + allocation.buy_k * sigma_prev
+                    sell_threshold = sell_alpha + allocation.sell_k * sigma_prev
+                    upper_line = ma * (1 + buy_threshold)
+                    lower_line = ma * (1 - sell_threshold)
             else:
+                buy_threshold = threshold
+                sell_threshold = threshold
                 upper_line = ma * (1 + threshold)
                 lower_line = ma * (1 - threshold)
             if np.isnan(upper_line) or np.isnan(lower_line):
@@ -799,6 +854,12 @@ def _run_sleeve(
                 "raw_close": float(row["raw_close"]),
                 "valuation_price": float(row["raw_close"]),
                 "ma": ma,
+                "deviation": deviation,
+                "sigma_prev": sigma_prev,
+                "buy_threshold_pct": buy_threshold * 100 if np.isfinite(buy_threshold) else np.nan,
+                "sell_threshold_pct": sell_threshold * 100 if np.isfinite(sell_threshold) else np.nan,
+                "upper_trigger_line": upper_line,
+                "lower_trigger_line": lower_line,
                 "signal": signal,
                 "signal_generated": bool(signal_generated),
                 "target_position": target_position,
@@ -939,6 +1000,16 @@ def _combine_sleeves(
         axis=1,
     )
     combined["signal"] = indexed_parts[-1]["signal"]
+    for diagnostic_column in (
+        "ma",
+        "deviation",
+        "sigma_prev",
+        "buy_threshold_pct",
+        "sell_threshold_pct",
+        "upper_trigger_line",
+        "lower_trigger_line",
+    ):
+        combined[diagnostic_column] = indexed_parts[-1][diagnostic_column]
     combined["execution_status"] = signals.filter(like="execution_status_").astype(str).agg("/".join, axis=1)
     for event_column in (
         "signal_generated",

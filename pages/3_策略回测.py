@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from components.annual_etf_dynamic import render_annual_dynamic_mode
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
 from services.fund_analysis import (
@@ -863,7 +864,7 @@ st.set_page_config(page_title="策略回测", layout="wide")
 init_db()
 
 st.title("策略回测")
-st.caption("支持单标的均线择时、多ETF配置择时，以及按动量排名执行多基金轮动。")
+st.caption("支持单标的均线择时、多ETF配置择时、历史年度ETF动态组合，以及按动量排名执行多基金轮动。")
 
 st.markdown(
     """
@@ -885,7 +886,7 @@ st.markdown(
 
 strategy_mode = st.radio(
     "策略类型",
-    options=["单标的MA20择时", "多ETF配置择时", "多基金动量轮动"],
+    options=["单标的MA20择时", "多ETF配置择时", "年度动态组合", "多基金动量轮动"],
     horizontal=True,
 )
 if strategy_mode == "单标的MA20择时":
@@ -893,6 +894,9 @@ if strategy_mode == "单标的MA20择时":
     st.stop()
 if strategy_mode == "多ETF配置择时":
     render_portfolio_timing_mode()
+    st.stop()
+if strategy_mode == "年度动态组合":
+    render_annual_dynamic_mode()
     st.stop()
 
 uploaded_files = []

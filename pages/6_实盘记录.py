@@ -9,6 +9,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from core.db import init_db
+from core.return_calendar import render_return_calendar
 from core.ui import (
     DEFAULT_CHART_HEIGHT,
     apply_global_style,
@@ -590,6 +591,23 @@ def render_live_return_calendar(
     )
 
 
+def render_live_return_calendar(
+    daily_pnl: pd.DataFrame,
+    *,
+    first_trade_date: object = None,
+) -> None:
+    render_return_calendar(
+        build_live_daily_returns(daily_pnl),
+        title="收益日历",
+        key_prefix="live_return_calendar",
+        first_date=first_trade_date,
+        caption=(
+            "收益率按每日实际持仓资金计算后复合；买入视为当日新增投入，"
+            "同日卖出回款优先抵扣买入，不包含账户未投资现金。"
+        ),
+    )
+
+
 def format_live_number(value: object, digits: int = 2, prefix: str = "") -> str:
     if value is None or pd.isna(value):
         return "-"
@@ -858,18 +876,22 @@ def render_daily_close_pnl() -> None:
     target_date = latest_final_etf_trade_date(market_now)
     attempt_key = "live_pnl_close_last_attempt"
     attempt_target_key = "live_pnl_close_last_target"
+    attempt_scope_key = "live_pnl_close_last_scope"
     market_now_naive = market_now.replace(tzinfo=None)
+    symbols = sorted(current_trades["symbol"].dropna().astype(str).unique())
+    refresh_scope = "|".join(symbols)
     network_refresh_due = live_close_refresh_due(
         target_date=target_date,
         market_now=market_now,
         last_attempt=st.session_state.get(attempt_key),
         last_target_date=st.session_state.get(attempt_target_key),
+        refresh_scope=refresh_scope,
+        last_refresh_scope=st.session_state.get(attempt_scope_key),
     )
 
     price_histories: dict[str, pd.DataFrame] = {}
     update_failures: list[str] = []
     data_warnings: list[str] = []
-    symbols = sorted(current_trades["symbol"].dropna().astype(str).unique())
     for symbol in symbols:
         item = load_or_fetch_etf(
             symbol,
@@ -885,7 +907,12 @@ def render_daily_close_pnl() -> None:
             price_histories[symbol] = item.dataframe
         item_date = pd.to_datetime(item.latest_date, errors="coerce")
         if item.error:
-            detail = f"{symbol}：{item.error}"
+            detail = (
+                f"{symbol}：本地暂无正式收盘缓存；"
+                "页面将在下次自动检查时联网补齐。"
+                if item.status == "无缓存"
+                else f"{symbol}：{item.error}"
+            )
             if network_refresh_due and item.status in {"失败", "缓存"}:
                 update_failures.append(detail)
             else:
@@ -897,6 +924,7 @@ def render_daily_close_pnl() -> None:
     if network_refresh_due:
         st.session_state[attempt_key] = market_now_naive.isoformat()
         st.session_state[attempt_target_key] = str(target_date)
+        st.session_state[attempt_scope_key] = refresh_scope
 
     failure_state_key = "live_pnl_close_failures"
     if network_refresh_due:

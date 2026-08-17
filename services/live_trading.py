@@ -104,6 +104,8 @@ def live_close_refresh_due(
     market_now: datetime,
     last_attempt: object = None,
     last_target_date: object = None,
+    refresh_scope: object = None,
+    last_refresh_scope: object = None,
     retry_seconds: int = 600,
 ) -> bool:
     """Allow backfilling any completed session, including weekends and mornings."""
@@ -113,6 +115,9 @@ def live_close_refresh_due(
 
     previous_target = pd.to_datetime(last_target_date, errors="coerce")
     if pd.isna(previous_target) or pd.Timestamp(previous_target).date() != pd.Timestamp(target).date():
+        return True
+
+    if refresh_scope is not None and str(refresh_scope) != str(last_refresh_scope or ""):
         return True
 
     previous_attempt = pd.to_datetime(last_attempt, errors="coerce")

@@ -121,6 +121,31 @@ class FundAnalysisCalculationTests(unittest.TestCase):
         self.assertEqual(normalized["date"].dt.strftime("%Y-%m-%d").tolist(), ["2026-01-02", "2026-01-05"])
         self.assertEqual(normalized["price"].tolist(), [1.0, 1.1])
 
+    def test_normalize_prefers_close_price_over_confirmation_metadata(self):
+        raw = pd.DataFrame(
+            {
+                "日期": ["2026-01-02", "2026-01-05"],
+                "收盘价": [1.15, 1.16],
+                "_final_close_confirmed": [True, True],
+            }
+        )
+
+        _, normalized = normalize_nav_dataframe(raw)
+
+        self.assertEqual(normalized["price"].tolist(), [1.15, 1.16])
+        self.assertTrue(pd.api.types.is_float_dtype(normalized["price"]))
+
+    def test_normalize_rejects_boolean_price_column(self):
+        raw = pd.DataFrame(
+            {
+                "date": ["2026-01-02", "2026-01-05"],
+                "close": [True, False],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "布尔列"):
+            normalize_nav_dataframe(raw)
+
     def test_normalize_rejects_empty_input(self):
         with self.assertRaisesRegex(ValueError, "没有可分析的数据"):
             normalize_nav_dataframe(pd.DataFrame())
@@ -140,6 +165,18 @@ class FundAnalysisCalculationTests(unittest.TestCase):
         self.assertEqual(result.summary["最大回撤谷底日"], "2026-01-06")
         self.assertEqual(result.summary["最大回撤修复日"], "2026-01-07")
         self.assertTrue(result.summary["最大回撤是否已修复"])
+
+    def test_analysis_handles_zero_20d_volatility(self):
+        data = pd.DataFrame(
+            {
+                "date": pd.bdate_range("2026-01-02", periods=40),
+                "price": [100.0] * 40,
+            }
+        )
+
+        result = analyze_fund_nav(data, "测试基金", ma_periods=(20,))
+
+        self.assertTrue(result.dataframe["momentum_volatility_20d"].isna().all())
 
     def test_one_year_rolling_annual_return_uses_252_trading_days(self):
         data = pd.DataFrame(

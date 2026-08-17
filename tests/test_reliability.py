@@ -333,6 +333,21 @@ class PageReliabilityTests(unittest.TestCase):
         self.assertIn("if save_to_cache and fresh_analysis", a_share)
         self.assertIn("if save_to_cache and fresh_analysis", us_stock)
 
+    def test_a_share_analysis_exports_every_chart_and_table(self):
+        source = (Path(__file__).parents[1] / "pages" / "2_A股分析.py").read_text(encoding="utf-8")
+
+        self.assertIn('"toImageButtonOptions"', source)
+        self.assertIn('f"{download_name}_走势分析"', source)
+        self.assertIn('f"{download_name}_回撤分析"', source)
+        for label in (
+            "下载回撤波段 CSV",
+            "下载年度最大回撤 CSV",
+            "下载摘要 CSV",
+            "下载指标数据 CSV",
+            "下载原始数据 CSV",
+        ):
+            self.assertIn(label, source)
+
     def test_task_page_has_manual_formal_update_and_chinese_columns(self):
         source = (Path(__file__).parents[1] / "pages" / "9_任务与数据.py").read_text(encoding="utf-8")
 

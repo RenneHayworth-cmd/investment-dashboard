@@ -3,7 +3,7 @@ from __future__ import annotations
 import calendar
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 import os
@@ -22,6 +22,7 @@ from services.futures_spread import (
     completed_futures_daily_cutoff,
     fetch_futures_daily,
 )
+from services.market_calendar import get_market_window, is_market_holiday
 
 
 DEFAULT_FUTURES_STATEMENT_DIR = Path(
@@ -31,6 +32,9 @@ STATEMENT_FILE_PATTERN = re.compile(r"^\d+_(\d{4}-\d{2})\.(xls|xlsx)$", re.IGNOR
 ASSET_TYPES = ("期货", "期权")
 BUY_SELL_VALUES = ("买", "卖")
 OPEN_CLOSE_VALUES = ("开", "平")
+CASH_FLOW_TYPES = ("入金", "出金")
+OPTION_EXPIRY_OUTCOMES = ("作废", "履约")
+DAILY_PNL_RESOLUTIONS = ("采用手工", "采用正式")
 RECONCILIATION_TOLERANCE = 0.05
 
 
@@ -41,6 +45,7 @@ class StatementPayload:
     account: dict[str, object]
     positions: pd.DataFrame
     trades: pd.DataFrame
+    cash_flows: pd.DataFrame
     warnings: list[str]
 
 
@@ -271,6 +276,95 @@ def _parse_declaration_fee(raw: pd.DataFrame) -> float:
     return total
 
 
+def _parse_statement_cash_flows(raw: pd.DataFrame, statement_month: str) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    external = _section_table(
+        raw,
+        "期货期权账户出入金明细（单位：人民币）",
+        ("发生日期", "入金", "出金"),
+    )
+    for sequence, record in enumerate(external.to_dict("records"), start=1):
+        flow_date = _date_text(record.get("发生日期"))
+        if not flow_date:
+            continue
+        for entry_type in CASH_FLOW_TYPES:
+            amount = _number(record.get(entry_type))
+            if amount is None or abs(amount) <= 1e-12:
+                continue
+            rows.append(
+                {
+                    "source": "月结单",
+                    "statement_month": statement_month,
+                    "flow_date": flow_date,
+                    "entry_type": entry_type,
+                    "amount": abs(amount),
+                    "notes": _text(record.get("摘要")),
+                    "reconciliation_status": "不适用",
+                    "source_row": f"cash-{sequence}-{entry_type}",
+                }
+            )
+
+    title_row = None
+    header_row = None
+    header_columns: dict[str, int] = {}
+    for index in range(len(raw.index)):
+        labels = [_clean_label(value) for value in raw.iloc[index].tolist()]
+        if "其它资金明细（单位：人民币）" in labels:
+            title_row = index
+            continue
+        if title_row is not None and index > title_row and all(
+            label in labels for label in ("发生日期", "类型", "金额")
+        ):
+            header_row = index
+            header_columns = {
+                label: labels.index(label)
+                for label in ("发生日期", "类型", "金额")
+            }
+            break
+    if header_row is not None:
+        fee_sequence = 0
+        for index in range(header_row + 1, len(raw.index)):
+            row = raw.iloc[index].tolist()
+            if not any(pd.notna(value) and str(value).strip() for value in row):
+                break
+            first = _clean_label(row[header_columns["发生日期"]])
+            if "汇总" in first or first in {"期货持仓明细", "期权持仓明细"}:
+                break
+            flow_date = _date_text(row[header_columns["发生日期"]])
+            fee_type = _clean_label(row[header_columns["类型"]])
+            amount = _number(row[header_columns["金额"]])
+            if not flow_date or amount is None or abs(amount) <= 1e-12:
+                continue
+            if "交易手续费" in fee_type:
+                continue
+            fee_sequence += 1
+            rows.append(
+                {
+                    "source": "月结单",
+                    "statement_month": statement_month,
+                    "flow_date": flow_date,
+                    "entry_type": "申报费" if "申报费" in fee_type else "账户费用",
+                    "amount": abs(amount),
+                    "notes": fee_type,
+                    "reconciliation_status": "不适用",
+                    "source_row": f"fee-{fee_sequence}",
+                }
+            )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "source",
+            "statement_month",
+            "flow_date",
+            "entry_type",
+            "amount",
+            "notes",
+            "reconciliation_status",
+            "source_row",
+        ],
+    )
+
+
 def _position_multiplier(
     *,
     average_price: float | None,
@@ -457,7 +551,11 @@ def parse_statement(path: str | os.PathLike[str]) -> StatementPayload:
     workbook_month = f"{int(month_match.group(1)):04d}-{int(month_match.group(2)):02d}"
     statement_month = workbook_month
     account = _parse_account(report, statement_month)
-    account["declaration_fee"] = _parse_declaration_fee(report)
+    cash_flows = _parse_statement_cash_flows(report, statement_month)
+    declaration_rows = cash_flows[cash_flows["entry_type"].eq("申报费")]
+    account["declaration_fee"] = float(
+        pd.to_numeric(declaration_rows["amount"], errors="coerce").fillna(0).sum()
+    )
     positions = _parse_positions(report, statement_month)
     futures_raw = _read_sheet(source, "成交明细")
     options_raw = _read_sheet(source, "期权成交明细")
@@ -485,17 +583,39 @@ def parse_statement(path: str | os.PathLike[str]) -> StatementPayload:
             positions["statement_end_date"] = _statement_end_date(statement_month)
         if not trades.empty:
             trades["statement_month"] = statement_month
+        if not cash_flows.empty:
+            cash_flows["statement_month"] = statement_month
         warnings_list.append(
             f"工作簿交易月份为 {workbook_month}，但文件名及全部成交日期均为 {filename_month}，已按 {filename_month} 导入"
         )
     statement_fee = float(account.get("monthly_fee") or 0)
     detail_fee = float(pd.to_numeric(trades.get("fee"), errors="coerce").fillna(0).sum()) if not trades.empty else 0.0
-    declaration_fee = float(account.get("declaration_fee") or 0)
-    reconciled_detail_fee = detail_fee + declaration_fee
+    account_fee_rows = cash_flows[
+        cash_flows["entry_type"].isin(["申报费", "账户费用"])
+    ]
+    account_level_fee = float(
+        pd.to_numeric(account_fee_rows["amount"], errors="coerce").fillna(0).sum()
+    )
+    reconciled_detail_fee = detail_fee + account_level_fee
     if abs(statement_fee - reconciled_detail_fee) > RECONCILIATION_TOLERANCE:
         warnings_list.append(
             f"账户手续费 {statement_fee:.2f} 与成交明细及申报费 {reconciled_detail_fee:.2f} "
             f"相差 {statement_fee - reconciled_detail_fee:.2f}"
+        )
+    external_rows = cash_flows[cash_flows["entry_type"].isin(CASH_FLOW_TYPES)]
+    parsed_net_flow = float(
+        pd.to_numeric(external_rows.loc[external_rows["entry_type"].eq("入金"), "amount"], errors="coerce")
+        .fillna(0)
+        .sum()
+        - pd.to_numeric(external_rows.loc[external_rows["entry_type"].eq("出金"), "amount"], errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+    official_net_flow = float(account.get("deposits_withdrawals") or 0)
+    if abs(parsed_net_flow - official_net_flow) > RECONCILIATION_TOLERANCE:
+        warnings_list.append(
+            f"逐日资金流水净额 {parsed_net_flow:.2f} 与当月存取合计 "
+            f"{official_net_flow:.2f} 相差 {official_net_flow - parsed_net_flow:.2f}"
         )
     futures_positions = positions[positions.get("asset_type").eq("期货")] if not positions.empty else positions
     position_float = float(pd.to_numeric(futures_positions.get("floating_pnl"), errors="coerce").fillna(0).sum()) if not futures_positions.empty else 0.0
@@ -516,6 +636,7 @@ def parse_statement(path: str | os.PathLike[str]) -> StatementPayload:
         account=account,
         positions=positions,
         trades=trades,
+        cash_flows=cash_flows,
         warnings=warnings_list,
     )
 
@@ -539,6 +660,10 @@ def _insert_statement_payload(conn, path: Path, payload: StatementPayload, file_
     conn.execute("DELETE FROM futures_month_end_positions WHERE source_file=?", (source_file,))
     conn.execute(
         "DELETE FROM futures_live_trades WHERE source='月结单' AND source_file=?",
+        (source_file,),
+    )
+    conn.execute(
+        "DELETE FROM futures_cash_flows WHERE source='月结单' AND source_file=?",
         (source_file,),
     )
     account = payload.account
@@ -630,6 +755,29 @@ def _insert_statement_payload(conn, path: Path, payload: StatementPayload, file_
                 record.get("strategy"),
                 record.get("notes"),
                 record.get("reconciliation_status"),
+                source_file,
+                now,
+            ),
+        )
+    for record in payload.cash_flows.to_dict("records"):
+        source_key = f"{source_file}|{record.get('source_row')}"
+        conn.execute(
+            """
+            INSERT INTO futures_cash_flows (
+                source, statement_month, flow_date, entry_type, amount, notes,
+                reconciliation_status, matched_statement_flow_id, source_key,
+                source_file, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                record.get("source"),
+                record.get("statement_month"),
+                record.get("flow_date"),
+                record.get("entry_type"),
+                record.get("amount"),
+                record.get("notes"),
+                record.get("reconciliation_status"),
+                source_key,
                 source_file,
                 now,
             ),
@@ -758,6 +906,102 @@ def _reconcile_manual_trades(conn) -> None:
     conn.row_factory = None
 
 
+def _reconcile_manual_cash_flows(conn) -> None:
+    conn.execute(
+        """
+        UPDATE futures_cash_flows
+        SET reconciliation_status='手工', matched_statement_flow_id=NULL
+        WHERE source='手工'
+        """
+    )
+    latest_row = conn.execute(
+        "SELECT MAX(statement_end_date) FROM futures_account_monthly"
+    ).fetchone()
+    latest_end = str(latest_row[0] or "") if latest_row else ""
+    conn.row_factory = __import__("sqlite3").Row
+    manual_rows = conn.execute(
+        "SELECT * FROM futures_cash_flows WHERE source='手工' ORDER BY id"
+    ).fetchall()
+    for manual in manual_rows:
+        if latest_end and str(manual["flow_date"]) <= latest_end:
+            candidates = conn.execute(
+                """
+                SELECT id FROM futures_cash_flows
+                WHERE source='月结单' AND flow_date=? AND entry_type=?
+                  AND ABS(amount - ?) < 0.0000001
+                """,
+                (manual["flow_date"], manual["entry_type"], manual["amount"]),
+            ).fetchall()
+            if len(candidates) == 1:
+                conn.execute(
+                    """
+                    UPDATE futures_cash_flows
+                    SET reconciliation_status='已接管', matched_statement_flow_id=?
+                    WHERE id=?
+                    """,
+                    (int(candidates[0][0]), int(manual["id"])),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE futures_cash_flows
+                    SET reconciliation_status='待核对', matched_statement_flow_id=NULL
+                    WHERE id=?
+                    """,
+                    (int(manual["id"]),),
+                )
+    conn.row_factory = None
+
+
+def _reconcile_option_expiry_events(conn) -> None:
+    latest_row = conn.execute(
+        "SELECT MAX(statement_end_date) FROM futures_account_monthly"
+    ).fetchone()
+    latest_end = str(latest_row[0] or "") if latest_row else ""
+    if not latest_end:
+        return
+    conn.row_factory = __import__("sqlite3").Row
+    events = conn.execute(
+        """
+        SELECT * FROM futures_option_expiry_events
+        WHERE source='手工' AND event_date <= ?
+        ORDER BY id
+        """,
+        (latest_end,),
+    ).fetchall()
+    for event in events:
+        month = str(event["event_date"])[:7]
+        option_quantity = conn.execute(
+            """
+            SELECT COALESCE(SUM(quantity), 0)
+            FROM futures_month_end_positions
+            WHERE statement_month=? AND asset_type='期权' AND contract=?
+            """,
+            (month, event["option_contract"]),
+        ).fetchone()[0]
+        reconciled = int(option_quantity or 0) == 0
+        if reconciled and event["outcome"] == "履约":
+            futures_quantity = conn.execute(
+                """
+                SELECT COALESCE(SUM(quantity), 0)
+                FROM futures_month_end_positions
+                WHERE statement_month=? AND asset_type='期货'
+                  AND contract=? AND side=?
+                """,
+                (month, event["underlying_contract"], event["futures_side"]),
+            ).fetchone()[0]
+            reconciled = int(futures_quantity or 0) >= int(event["quantity"])
+        conn.execute(
+            """
+            UPDATE futures_option_expiry_events
+            SET reconciliation_status=?
+            WHERE id=?
+            """,
+            ("已接管" if reconciled else "待核对", int(event["id"])),
+        )
+    conn.row_factory = None
+
+
 def sync_statements(
     directory: str | os.PathLike[str] | None = None,
     *,
@@ -816,6 +1060,8 @@ def sync_statements(
             conn.commit()
         _backfill_position_multipliers(conn)
         _reconcile_manual_trades(conn)
+        _reconcile_manual_cash_flows(conn)
+        _reconcile_option_expiry_events(conn)
         conn.commit()
     return StatementSyncResult(
         scanned=len(files),
@@ -852,6 +1098,211 @@ def list_monthly_accounts() -> pd.DataFrame:
 def latest_monthly_account() -> dict[str, object] | None:
     accounts = list_monthly_accounts()
     return None if accounts.empty else accounts.iloc[-1].to_dict()
+
+
+def list_futures_cash_flows(*, include_taken_over: bool = True) -> pd.DataFrame:
+    init_db()
+    where = (
+        ""
+        if include_taken_over
+        else "WHERE NOT (source='手工' AND reconciliation_status='已接管')"
+    )
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(
+            f"""
+            SELECT * FROM futures_cash_flows
+            {where}
+            ORDER BY flow_date DESC, id DESC
+            """,
+            conn,
+        )
+
+
+def _effective_cash_flows(*, as_of: object = None) -> pd.DataFrame:
+    rows = list_futures_cash_flows(include_taken_over=False)
+    if rows.empty:
+        return rows
+    account = latest_monthly_account()
+    latest_end = str(account["statement_end_date"]) if account else ""
+    official = rows[rows["source"].eq("月结单")].copy()
+    manual = rows[
+        rows["source"].eq("手工")
+        & ~rows["reconciliation_status"].eq("已接管")
+        & (rows["flow_date"].astype(str) > latest_end)
+    ].copy()
+    result = pd.concat([official, manual], ignore_index=True)
+    cutoff = _date_text(as_of) if as_of is not None else ""
+    if cutoff:
+        result = result[result["flow_date"].astype(str) <= cutoff]
+    return result.sort_values(["flow_date", "id"]).reset_index(drop=True)
+
+
+def add_manual_cash_flow(
+    *,
+    flow_date: object,
+    entry_type: str,
+    amount: float,
+    notes: str = "",
+) -> int:
+    init_db()
+    account = latest_monthly_account()
+    if account is None:
+        raise ValueError("请先导入月结单。")
+    normalized_date = _date_text(flow_date)
+    if not normalized_date:
+        raise ValueError("资金流水日期无效。")
+    if pd.Timestamp(normalized_date) <= pd.Timestamp(account["statement_end_date"]):
+        raise ValueError(
+            f"手工资金流水日期必须晚于最新月结单截止日 {account['statement_end_date']}。"
+        )
+    if entry_type not in CASH_FLOW_TYPES:
+        raise ValueError("资金流水类型只能是入金或出金。")
+    normalized_amount = float(amount)
+    if normalized_amount <= 0:
+        raise ValueError("资金流水金额必须大于0。")
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(get_conn()) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO futures_cash_flows (
+                source, statement_month, flow_date, entry_type, amount, notes,
+                reconciliation_status, matched_statement_flow_id, source_key,
+                source_file, created_at
+            ) VALUES ('手工', NULL, ?, ?, ?, ?, '手工', NULL, NULL, NULL, ?)
+            """,
+            (
+                normalized_date,
+                entry_type,
+                normalized_amount,
+                str(notes or "").strip(),
+                now,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def delete_manual_cash_flow(flow_id: int) -> bool:
+    init_db()
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT source FROM futures_cash_flows WHERE id=?", (int(flow_id),)
+        ).fetchone()
+        if row is None:
+            return False
+        if row[0] != "手工":
+            raise ValueError("月结单资金流水为只读记录，不能删除。")
+        conn.execute("DELETE FROM futures_cash_flows WHERE id=?", (int(flow_id),))
+        conn.commit()
+    return True
+
+
+def list_futures_daily_pnl_overrides() -> pd.DataFrame:
+    init_db()
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT * FROM futures_daily_pnl_overrides
+            ORDER BY trade_date DESC, id DESC
+            """,
+            conn,
+        )
+
+
+def add_manual_daily_pnl(
+    *,
+    trade_date: object,
+    pnl_amount: float,
+    notes: str = "",
+) -> int:
+    init_db()
+    if latest_monthly_account() is None:
+        raise ValueError("请先导入月结单。")
+    normalized_date = _date_text(trade_date)
+    if not normalized_date:
+        raise ValueError("交易日期无效。")
+    latest_completed = completed_futures_daily_cutoff().strftime("%Y-%m-%d")
+    if normalized_date > latest_completed:
+        raise ValueError(f"只能补录不晚于 {latest_completed} 的已完成交易日。")
+    normalized_pnl = pd.to_numeric(pnl_amount, errors="coerce")
+    if pd.isna(normalized_pnl):
+        raise ValueError("当日盈亏金额无效。")
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(get_conn()) as conn:
+        conn.execute(
+            """
+            INSERT INTO futures_daily_pnl_overrides (
+                trade_date, pnl_amount, source, notes,
+                reconciliation_status, formal_pnl, difference, resolution,
+                created_at, updated_at
+            ) VALUES (?, ?, '同花顺手工', ?, '待确认', NULL, NULL, NULL, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                pnl_amount=excluded.pnl_amount,
+                notes=excluded.notes,
+                reconciliation_status='待确认',
+                formal_pnl=NULL,
+                difference=NULL,
+                resolution=NULL,
+                updated_at=excluded.updated_at
+            """,
+            (
+                normalized_date,
+                float(normalized_pnl),
+                str(notes or "").strip(),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM futures_daily_pnl_overrides WHERE trade_date=?",
+            (normalized_date,),
+        ).fetchone()
+        conn.commit()
+    return int(row[0])
+
+
+def delete_manual_daily_pnl(record_id: int) -> bool:
+    init_db()
+    with closing(get_conn()) as conn:
+        cursor = conn.execute(
+            "DELETE FROM futures_daily_pnl_overrides WHERE id=?",
+            (int(record_id),),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def resolve_manual_daily_pnl(record_id: int, resolution: str) -> bool:
+    if resolution not in DAILY_PNL_RESOLUTIONS:
+        raise ValueError("核对结果只能是采用手工或采用正式。")
+    init_db()
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            """
+            SELECT formal_pnl FROM futures_daily_pnl_overrides
+            WHERE id=?
+            """,
+            (int(record_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        if row[0] is None:
+            raise ValueError("正式结算盈亏尚未生成，暂不能确认差异。")
+        conn.execute(
+            """
+            UPDATE futures_daily_pnl_overrides
+            SET reconciliation_status=?, resolution=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                resolution,
+                resolution,
+                datetime.now().isoformat(timespec="seconds"),
+                int(record_id),
+            ),
+        )
+        conn.commit()
+    return True
 
 
 def list_month_end_positions(statement_month: str | None = None) -> pd.DataFrame:
@@ -1011,7 +1462,7 @@ def _apply_manual_to_positions(
     return result, calculated_close_pnl
 
 
-def build_estimated_positions(*, as_of: object = None) -> pd.DataFrame:
+def _build_estimated_positions_base(*, as_of: object = None) -> pd.DataFrame:
     account = latest_monthly_account()
     if account is None:
         return pd.DataFrame()
@@ -1020,6 +1471,315 @@ def build_estimated_positions(*, as_of: object = None) -> pd.DataFrame:
     manual = _effective_manual_trades(trades, str(account["statement_end_date"]))
     positions, _ = _apply_manual_to_positions(official, manual, as_of=as_of)
     return positions
+
+
+def _option_contract_parts(contract: str) -> dict[str, object] | None:
+    matched = re.match(r"^([A-Z]+)(\d{2})(\d{2})([CP])(\d+(?:\.\d+)?)$", contract)
+    if not matched:
+        return None
+    product, year_text, month_text, option_type, strike_text = matched.groups()
+    return {
+        "product": product,
+        "year": 2000 + int(year_text),
+        "month": int(month_text),
+        "option_type": option_type,
+        "strike": float(strike_text),
+        "underlying_contract": f"{product}{year_text}{month_text}",
+    }
+
+
+def iron_ore_option_expiry_date(contract: str) -> str | None:
+    parts = _option_contract_parts(normalize_contract(contract, "期权"))
+    if parts is None or parts["product"] != "I":
+        return None
+    delivery_year = int(parts["year"])
+    delivery_month = int(parts["month"])
+    if delivery_month == 1:
+        expiry_year, expiry_month = delivery_year - 1, 12
+    else:
+        expiry_year, expiry_month = delivery_year, delivery_month - 1
+    market = get_market_window("A股")
+    current = date(expiry_year, expiry_month, 1)
+    trading_days = 0
+    while current.month == expiry_month:
+        if current.weekday() < 5 and (market is None or not is_market_holiday(market, current)):
+            trading_days += 1
+            if trading_days == 12:
+                return current.isoformat()
+        current += timedelta(days=1)
+    return None
+
+
+def list_option_expiry_events() -> pd.DataFrame:
+    init_db()
+    with closing(get_conn()) as conn:
+        return pd.read_sql_query(
+            """
+            SELECT * FROM futures_option_expiry_events
+            ORDER BY event_date DESC, option_contract, id DESC
+            """,
+            conn,
+        )
+
+
+def _effective_option_expiry_events(*, as_of: object = None) -> pd.DataFrame:
+    events = list_option_expiry_events()
+    if events.empty:
+        return events
+    account = latest_monthly_account()
+    latest_end = str(account["statement_end_date"]) if account else ""
+    result = events[
+        events["source"].eq("手工")
+        & events["reconciliation_status"].eq("已确认")
+        & (events["event_date"].astype(str) > latest_end)
+    ].copy()
+    cutoff = _date_text(as_of) if as_of is not None else ""
+    if cutoff:
+        result = result[result["event_date"].astype(str) <= cutoff]
+    return result.sort_values(["event_date", "id"]).reset_index(drop=True)
+
+
+def _apply_option_expiry_events(
+    positions: pd.DataFrame,
+    events: pd.DataFrame,
+) -> pd.DataFrame:
+    if positions.empty or events.empty:
+        return positions
+    states = {
+        (str(row["asset_type"]), str(row["contract"]), str(row["side"])): dict(row)
+        for row in positions.to_dict("records")
+    }
+    for event in events.to_dict("records"):
+        option_contract = str(event["option_contract"])
+        quantity = int(event["quantity"])
+        option_keys = [
+            key
+            for key, state in states.items()
+            if key[0] == "期权"
+            and key[1] == option_contract
+            and int(state.get("estimated_quantity") or 0) > 0
+        ]
+        remaining = quantity
+        for key in option_keys:
+            state = states[key]
+            available = int(state.get("estimated_quantity") or 0)
+            removed = min(available, remaining)
+            state["estimated_quantity"] = available - removed
+            state["post_month_change"] = (
+                int(state["estimated_quantity"]) - int(state.get("official_quantity") or 0)
+            )
+            remaining -= removed
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            raise ValueError(f"{option_contract} 到期数量超过当前预计持仓。")
+        if event["outcome"] != "履约":
+            continue
+        underlying = str(event["underlying_contract"])
+        futures_side = str(event["futures_side"])
+        strike = float(event["strike"])
+        key = ("期货", underlying, futures_side)
+        state = states.get(key)
+        if state is None:
+            account = latest_monthly_account() or {}
+            state = {
+                "statement_month": account.get("statement_month", ""),
+                "statement_end_date": account.get("statement_end_date", ""),
+                "asset_type": "期货",
+                "contract": underlying,
+                "side": futures_side,
+                "average_price": strike,
+                "previous_settlement": None,
+                "settlement_price": None,
+                "floating_pnl": None,
+                "margin": None,
+                "multiplier": _known_multiplier("期货", underlying)
+                or _known_multiplier("期权", option_contract),
+                "trade_code": "",
+                "official_quantity": 0,
+                "post_month_change": quantity,
+                "estimated_quantity": quantity,
+            }
+            states[key] = state
+        else:
+            current_quantity = int(state.get("estimated_quantity") or 0)
+            current_average = _number(state.get("average_price")) or 0.0
+            new_quantity = current_quantity + quantity
+            state["average_price"] = (
+                current_average * current_quantity + strike * quantity
+            ) / new_quantity
+            state["estimated_quantity"] = new_quantity
+            state["post_month_change"] = (
+                new_quantity - int(state.get("official_quantity") or 0)
+            )
+    result = pd.DataFrame(states.values())
+    return result.sort_values(["asset_type", "contract", "side"]).reset_index(drop=True)
+
+
+def build_estimated_positions(*, as_of: object = None) -> pd.DataFrame:
+    positions = _build_estimated_positions_base(as_of=as_of)
+    events = _effective_option_expiry_events(as_of=as_of)
+    return _apply_option_expiry_events(positions, events)
+
+
+def list_option_expiry_candidates(*, as_of: object = None) -> pd.DataFrame:
+    target = _date_text(as_of) if as_of is not None else completed_futures_daily_cutoff().strftime("%Y-%m-%d")
+    positions = _build_estimated_positions_base(as_of=target)
+    if positions.empty:
+        return pd.DataFrame()
+    confirmed = list_option_expiry_events()
+    confirmed_keys = set(
+        zip(
+            confirmed.get("event_date", pd.Series(dtype=str)).astype(str),
+            confirmed.get("option_contract", pd.Series(dtype=str)).astype(str),
+        )
+    )
+    cached = load_daily_closes()
+    rows: list[dict[str, object]] = []
+    option_positions = positions[
+        positions["asset_type"].eq("期权")
+        & pd.to_numeric(positions["estimated_quantity"], errors="coerce").fillna(0).gt(0)
+    ]
+    for position in option_positions.to_dict("records"):
+        contract = str(position["contract"])
+        parts = _option_contract_parts(contract)
+        expiry_date = iron_ore_option_expiry_date(contract)
+        if parts is None or not expiry_date or (expiry_date, contract) in confirmed_keys:
+            continue
+        underlying = str(parts["underlying_contract"])
+        settlement_rows = cached[
+            cached["asset_type"].eq("期货")
+            & cached["contract"].eq(underlying)
+            & cached["trade_date"].eq(expiry_date)
+            & cached["settlement_price"].notna()
+        ]
+        settlement = (
+            float(settlement_rows.iloc[-1]["settlement_price"])
+            if not settlement_rows.empty
+            else None
+        )
+        if expiry_date > target:
+            status = "待到期"
+        elif settlement is None:
+            status = "等待结算价"
+        else:
+            status = "待确认"
+        strike = float(parts["strike"])
+        is_put = parts["option_type"] == "P"
+        in_the_money = (
+            settlement is not None
+            and ((is_put and settlement < strike) or (not is_put and settlement > strike))
+        )
+        option_side = str(position["side"])
+        futures_side = (
+            "空" if is_put and option_side == "多" else
+            "多" if is_put else
+            "多" if option_side == "多" else "空"
+        )
+        rows.append(
+            {
+                "option_contract": contract,
+                "option_side": option_side,
+                "quantity": int(position["estimated_quantity"]),
+                "expiry_date": expiry_date,
+                "underlying_contract": underlying,
+                "strike": strike,
+                "settlement_price": settlement,
+                "expected_outcome": (
+                    "待结算"
+                    if settlement is None
+                    else "履约" if in_the_money else "作废"
+                ),
+                "expected_futures_side": futures_side if in_the_money else "",
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["expiry_date", "option_contract"]).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def confirm_option_expiry_event(
+    *,
+    option_contract: str,
+    outcome: str,
+    quantity: int | None = None,
+    notes: str = "",
+) -> int:
+    if outcome not in OPTION_EXPIRY_OUTCOMES:
+        raise ValueError("到期结果只能是作废或履约。")
+    normalized_contract = normalize_contract(option_contract, "期权")
+    candidates = list_option_expiry_candidates()
+    matching = candidates[candidates["option_contract"].eq(normalized_contract)] if not candidates.empty else candidates
+    if matching.empty:
+        raise ValueError("当前没有可确认的该期权到期记录。")
+    candidate = matching.iloc[0]
+    if candidate["status"] != "待确认":
+        raise ValueError("正式结算价尚未就绪，暂不能确认到期结果。")
+    confirmed_quantity = int(quantity or candidate["quantity"])
+    if confirmed_quantity != int(candidate["quantity"]):
+        raise ValueError("同一期权合约需一次确认全部预计持仓手数。")
+    futures_side = str(candidate["expected_futures_side"])
+    if outcome == "履约" and not futures_side:
+        parts = _option_contract_parts(normalized_contract) or {}
+        is_put = parts.get("option_type") == "P"
+        option_side = str(candidate["option_side"])
+        futures_side = (
+            "空" if is_put and option_side == "多" else
+            "多" if is_put else
+            "多" if option_side == "多" else "空"
+        )
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(get_conn()) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO futures_option_expiry_events (
+                source, event_date, option_contract, outcome, quantity,
+                underlying_contract, futures_side, strike, settlement_price,
+                reconciliation_status, source_file, notes, created_at
+            ) VALUES ('手工', ?, ?, ?, ?, ?, ?, ?, ?, '已确认', NULL, ?, ?)
+            ON CONFLICT(source, event_date, option_contract) DO UPDATE SET
+                outcome=excluded.outcome,
+                quantity=excluded.quantity,
+                underlying_contract=excluded.underlying_contract,
+                futures_side=excluded.futures_side,
+                strike=excluded.strike,
+                settlement_price=excluded.settlement_price,
+                reconciliation_status='已确认',
+                notes=excluded.notes,
+                created_at=excluded.created_at
+            """,
+            (
+                candidate["expiry_date"],
+                normalized_contract,
+                outcome,
+                confirmed_quantity,
+                candidate["underlying_contract"] if outcome == "履约" else None,
+                futures_side if outcome == "履约" else None,
+                float(candidate["strike"]),
+                float(candidate["settlement_price"]),
+                str(notes or "").strip(),
+                now,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+
+
+def delete_manual_option_expiry_event(event_id: int) -> bool:
+    init_db()
+    with closing(get_conn()) as conn:
+        row = conn.execute(
+            "SELECT source FROM futures_option_expiry_events WHERE id=?",
+            (int(event_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        if row[0] != "手工":
+            raise ValueError("月结单到期记录为只读记录，不能删除。")
+        conn.execute(
+            "DELETE FROM futures_option_expiry_events WHERE id=?", (int(event_id),)
+        )
+        conn.commit()
+    return True
 
 
 def add_manual_trade(
@@ -1159,7 +1919,14 @@ def load_daily_closes(asset_type: str | None = None, contract: str | None = None
         )
 
 
-def _save_daily_close_frame(asset_type: str, contract: str, data: pd.DataFrame, source: str) -> int:
+def _save_daily_close_frame(
+    asset_type: str,
+    contract: str,
+    data: pd.DataFrame,
+    source: str,
+    *,
+    max_trade_date: str | None = None,
+) -> int:
     if data is None or data.empty:
         return 0
     now = datetime.now().isoformat(timespec="seconds")
@@ -1169,6 +1936,8 @@ def _save_daily_close_frame(asset_type: str, contract: str, data: pd.DataFrame, 
             trade_date = _date_text(record.get("date"))
             close = _number(record.get("close"))
             if not trade_date or close is None or close <= 0:
+                continue
+            if max_trade_date and trade_date > max_trade_date:
                 continue
             cursor = conn.execute(
                 """
@@ -1219,6 +1988,7 @@ def _save_settlement_price(
             UPDATE futures_daily_closes
             SET settlement_price=?, settlement_source=?, updated_at=?
             WHERE asset_type=? AND contract=? AND trade_date=?
+              AND settlement_price IS NULL
             """,
             (
                 settlement_price,
@@ -1231,6 +2001,95 @@ def _save_settlement_price(
         )
         conn.commit()
         return max(cursor.rowcount, 0)
+
+
+def _save_daily_settlement_frame(
+    asset_type: str,
+    contract: str,
+    data: pd.DataFrame,
+    source: str,
+    *,
+    min_trade_date: str | None = None,
+    max_trade_date: str | None = None,
+) -> dict[str, object]:
+    if data is None or data.empty:
+        return {"updated": 0, "conflicts": []}
+    now = datetime.now().isoformat(timespec="seconds")
+    updated = 0
+    conflicts: list[str] = []
+    with closing(get_conn()) as conn:
+        for record in data.to_dict("records"):
+            trade_date = _date_text(record.get("date"))
+            settlement = _number(record.get("settlement"))
+            close = _number(record.get("close"))
+            if (
+                not trade_date
+                or settlement is None
+                or settlement < 0
+                or (asset_type == "期货" and settlement <= 0)
+            ):
+                continue
+            if min_trade_date and trade_date < min_trade_date:
+                continue
+            if max_trade_date and trade_date > max_trade_date:
+                continue
+            existing = conn.execute(
+                """
+                SELECT close_price, settlement_price
+                FROM futures_daily_closes
+                WHERE asset_type=? AND contract=? AND trade_date=?
+                """,
+                (asset_type, contract, trade_date),
+            ).fetchone()
+            if existing is None:
+                if close is None or close < 0:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO futures_daily_closes (
+                        asset_type, contract, trade_date, close_price,
+                        settlement_price, source, settlement_source, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        asset_type,
+                        contract,
+                        trade_date,
+                        close,
+                        settlement,
+                        source,
+                        source,
+                        now,
+                    ),
+                )
+                updated += 1
+                continue
+            existing_settlement = _number(existing[1])
+            if existing_settlement is None:
+                conn.execute(
+                    """
+                    UPDATE futures_daily_closes
+                    SET settlement_price=?, settlement_source=?, updated_at=?
+                    WHERE asset_type=? AND contract=? AND trade_date=?
+                      AND settlement_price IS NULL
+                    """,
+                    (
+                        settlement,
+                        source,
+                        now,
+                        asset_type,
+                        contract,
+                        trade_date,
+                    ),
+                )
+                updated += 1
+            elif abs(existing_settlement - settlement) > 1e-8:
+                conflicts.append(
+                    f"{contract} {trade_date} 已有结算价 {existing_settlement:g}，"
+                    f"新来源返回 {settlement:g}，已保留原值"
+                )
+        conn.commit()
+    return {"updated": updated, "conflicts": conflicts}
 
 
 def _update_position_settlements(
@@ -1251,8 +2110,7 @@ def _update_position_settlements(
             & cached["trade_date"].eq(target_date)
         ]
         if (
-            not force
-            and not existing.empty
+            not existing.empty
             and pd.notna(existing.iloc[-1].get("settlement_price"))
         ):
             skipped += 1
@@ -1393,7 +2251,13 @@ def update_position_daily_closes(
                     market_now=market_now,
                 )
                 source = "TickFlow/AkShare期货日线"
-            updated += _save_daily_close_frame(asset_type, contract, data, source)
+            updated += _save_daily_close_frame(
+                asset_type,
+                contract,
+                data,
+                source,
+                max_trade_date=target,
+            )
         except Exception as exc:
             errors.append(f"{contract}：{exc}")
     settlement_result = _update_position_settlements(
@@ -1410,6 +2274,457 @@ def update_position_daily_closes(
         "settlement_skipped": settlement_result["skipped"],
         "settlement_errors": settlement_result["errors"],
         "target_date": target,
+    }
+
+
+def _historical_contract_requirements(
+    *, market_now: datetime | None = None
+) -> pd.DataFrame:
+    trades = list_futures_live_trades(include_taken_over=False)
+    if trades.empty:
+        return pd.DataFrame()
+    trades = trades.copy()
+    trades["trade_date"] = pd.to_datetime(trades["trade_date"], errors="coerce")
+    trades = trades.dropna(subset=["trade_date"])
+    latest_target = completed_futures_daily_cutoff(market_now).strftime("%Y-%m-%d")
+    current = build_estimated_positions()
+    active_keys = set()
+    if not current.empty:
+        active = current[
+            pd.to_numeric(current["estimated_quantity"], errors="coerce").fillna(0).gt(0)
+        ]
+        active_keys = set(zip(active["asset_type"], active["contract"]))
+    requirements: dict[tuple[str, str], dict[str, object]] = {}
+    for (asset_type, contract), group in trades.groupby(["asset_type", "contract"]):
+        first_date = group["trade_date"].min().strftime("%Y-%m-%d")
+        last_trade_date = group["trade_date"].max().strftime("%Y-%m-%d")
+        target_date = latest_target if (asset_type, contract) in active_keys else last_trade_date
+        if asset_type == "期权":
+            expiry = iron_ore_option_expiry_date(str(contract))
+            if expiry:
+                target_date = max(last_trade_date, min(expiry, latest_target))
+        requirements[(asset_type, contract)] = {
+            "asset_type": asset_type,
+            "contract": contract,
+            "first_date": first_date,
+            "target_date": target_date,
+        }
+    option_rows = [
+        row for row in requirements.values() if row["asset_type"] == "期权"
+    ]
+    for row in option_rows:
+        parts = _option_contract_parts(str(row["contract"]))
+        if parts is None or parts["product"] != "I":
+            continue
+        key = ("期货", str(parts["underlying_contract"]))
+        existing = requirements.get(key)
+        if existing is None:
+            requirements[key] = {
+                "asset_type": "期货",
+                "contract": key[1],
+                "first_date": row["first_date"],
+                "target_date": row["target_date"],
+            }
+        else:
+            existing["first_date"] = min(
+                str(existing["first_date"]), str(row["first_date"])
+            )
+            existing["target_date"] = max(
+                str(existing["target_date"]), str(row["target_date"])
+            )
+    rows = list(requirements.values())
+    return pd.DataFrame(rows).sort_values(["asset_type", "contract"]).reset_index(drop=True)
+
+
+def update_traded_contract_daily_closes(
+    *,
+    api_key: str = "",
+    force: bool = False,
+    market_now: datetime | None = None,
+) -> dict[str, object]:
+    requirements = _historical_contract_requirements(market_now=market_now)
+    if requirements.empty:
+        return {"updated": 0, "skipped": 0, "errors": [], "contracts": 0}
+    cached = load_daily_closes()
+    updated = skipped = 0
+    errors: list[str] = []
+    for requirement in requirements.to_dict("records"):
+        asset_type = str(requirement["asset_type"])
+        contract = str(requirement["contract"])
+        existing = cached[
+            cached["asset_type"].eq(asset_type) & cached["contract"].eq(contract)
+        ]
+        has_coverage = (
+            not existing.empty
+            and str(existing["trade_date"].min()) <= str(requirement["first_date"])
+            and str(existing["trade_date"].max()) >= str(requirement["target_date"])
+        )
+        if has_coverage and not force:
+            skipped += 1
+            continue
+        try:
+            if asset_type == "期权":
+                data, source, is_chain = fetch_option_from_akshare(
+                    normalize_option_symbol(contract),
+                    "1d",
+                    5000,
+                    prefer_realtime_snapshot=False,
+                    market_now=market_now,
+                )
+                if is_chain:
+                    raise RuntimeError("期权行情返回了期权链而不是合约日线。")
+            else:
+                data = fetch_futures_daily(
+                    contract,
+                    api_key=api_key,
+                    prefer_realtime_snapshot=False,
+                    market_now=market_now,
+                )
+                source = "TickFlow/AkShare期货日线"
+            updated += _save_daily_close_frame(
+                asset_type,
+                contract,
+                data,
+                source,
+                max_trade_date=str(requirement["target_date"]),
+            )
+        except Exception as exc:
+            errors.append(f"{contract}：{exc}")
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "contracts": len(requirements),
+    }
+
+
+def _fetch_futures_settlement_history(
+    contract: str,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> tuple[pd.DataFrame, str]:
+    import akshare as ak
+
+    raw = ak.futures_zh_daily_sina(symbol=contract.lower())
+    source = "新浪期货日线结算价"
+    if raw is None or raw.empty:
+        raise RuntimeError(f"{source}未返回数据。")
+    required = {"date", "close", "settle"}
+    if not required.issubset(raw.columns):
+        raise RuntimeError("新浪期货日线缺少日期、收盘价或结算价字段。")
+    result = pd.DataFrame(
+        {
+            "date": pd.to_datetime(raw["date"], errors="coerce"),
+            "close": pd.to_numeric(raw["close"], errors="coerce"),
+            "settlement": pd.to_numeric(raw["settle"], errors="coerce"),
+        }
+    ).dropna(subset=["date", "settlement"])
+    return result, source
+
+
+def _fetch_cffex_settlement_history(
+    contracts: set[str],
+    start_date: str,
+    end_date: str,
+) -> tuple[pd.DataFrame, str]:
+    from io import BytesIO, StringIO
+    import zipfile
+
+    import requests
+
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    months = pd.period_range(start=start, end=end, freq="M")
+    rows: list[dict[str, object]] = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for month in months:
+        month_text = month.strftime("%Y%m")
+        response = requests.get(
+            f"http://www.cffex.com.cn/sj/historysj/{month_text}/zip/{month_text}.zip",
+            headers=headers,
+            timeout=(3.05, 10),
+        )
+        response.raise_for_status()
+        with zipfile.ZipFile(BytesIO(response.content)) as archive:
+            for file_name in archive.namelist():
+                matched = re.search(r"(\d{8})_1\.csv$", file_name)
+                if not matched:
+                    continue
+                trade_date = pd.Timestamp(matched.group(1))
+                if trade_date < start or trade_date > end:
+                    continue
+                with archive.open(file_name) as file_object:
+                    raw = pd.read_csv(
+                        StringIO(file_object.read().decode("gb2312"))
+                    )
+                if raw.shape[1] < 10:
+                    continue
+                raw_symbols = raw.iloc[:, 0].astype(str).str.strip().str.upper()
+                symbols = raw_symbols.map(
+                    lambda value: normalize_contract(
+                        value,
+                        "期权" if re.search(r"-[CP]-", value) else "期货",
+                    )
+                )
+                selected = raw[symbols.isin(contracts)]
+                for selected_index in selected.index:
+                    rows.append(
+                        {
+                            "date": trade_date,
+                            "contract": symbols.loc[selected_index],
+                            "close": _number(raw.loc[selected_index].iloc[8]),
+                            "settlement": _number(raw.loc[selected_index].iloc[9]),
+                        }
+                    )
+    result = pd.DataFrame(rows)
+    if result.empty:
+        raise RuntimeError("中金所历史日行情未返回所需合约。")
+    return result, "中金所历史日行情结算价"
+
+
+def _parse_dce_option_settlement_payload(
+    payload: object,
+    trade_date: str,
+    contracts: set[str],
+) -> pd.DataFrame:
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise RuntimeError("大商所期权日行情返回格式异常。")
+    rows: list[dict[str, object]] = []
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            contract = normalize_contract(item.get("contractId"), "期权")
+        except ValueError:
+            continue
+        if contract not in contracts:
+            continue
+        settlement = _number(item.get("clearPrice"))
+        close = _number(item.get("close"))
+        if settlement is None or settlement < 0:
+            continue
+        rows.append(
+            {
+                "date": trade_date,
+                "contract": contract,
+                "close": close,
+                "settlement": settlement,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _fetch_dce_option_settlements_for_date(
+    trade_date: str,
+    contracts: set[str],
+) -> tuple[pd.DataFrame, str]:
+    import requests
+
+    request_payload = {
+        "contractId": "",
+        "lang": "zh",
+        "optionSeries": "",
+        "statisticsType": 0,
+        "tradeDate": trade_date.replace("-", ""),
+        "tradeType": "2",
+        "varietyId": "i",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.dce.com.cn/",
+    }
+    failures: list[str] = []
+    for url in (
+        "https://www.dce.com.cn/dcereport/publicweb/dailystat/dayQuotes",
+        "http://www.dce.com.cn/dcereport/publicweb/dailystat/dayQuotes",
+    ):
+        try:
+            response = requests.post(
+                url,
+                json=request_payload,
+                headers=headers,
+                timeout=(3.05, 8),
+            )
+            response.raise_for_status()
+            frame = _parse_dce_option_settlement_payload(
+                response.json(), trade_date, contracts
+            )
+            return frame, "大商所期权日行情结算价"
+        except Exception as exc:
+            failures.append(str(exc))
+    detail = failures[-1] if failures else "未知错误"
+    raise RuntimeError(f"大商所期权日行情不可用：{detail}")
+
+
+def update_traded_contract_daily_settlements(
+    *,
+    force: bool = False,
+    market_now: datetime | None = None,
+) -> dict[str, object]:
+    requirements = _historical_contract_requirements(market_now=market_now)
+    if requirements.empty:
+        return {
+            "updated": 0,
+            "skipped": 0,
+            "errors": [],
+            "conflicts": [],
+            "contracts": 0,
+        }
+    cached = load_daily_closes()
+    existing_settlements = {
+        (str(row.asset_type), str(row.contract), str(row.trade_date))
+        for row in cached.itertuples(index=False)
+        if pd.notna(row.settlement_price)
+    }
+    updated = skipped = 0
+    errors: list[str] = []
+    conflicts: list[str] = []
+
+    option_requirements: list[dict[str, object]] = []
+    cffex_requirements: list[dict[str, object]] = []
+    for requirement in requirements.to_dict("records"):
+        asset_type = str(requirement["asset_type"])
+        contract = str(requirement["contract"])
+        first_date = str(requirement["first_date"])
+        target_date = str(requirement["target_date"])
+        if asset_type == "期权" and re.match(r"^(IO|HO|MO)\d", contract):
+            cffex_requirements.append(requirement)
+            continue
+        if asset_type == "期权":
+            option_requirements.append(requirement)
+            continue
+        if re.match(r"^(IC|IF|IH|IM|T|TF|TS|TL)\d", contract):
+            cffex_requirements.append(requirement)
+            continue
+        required_days = _futures_trading_dates(
+            pd.Timestamp(first_date).date(), pd.Timestamp(target_date).date()
+        )
+        missing_days = [
+            day
+            for day in required_days
+            if (asset_type, contract, day) not in existing_settlements
+        ]
+        if not missing_days and not force:
+            skipped += 1
+            continue
+        try:
+            frame, source = _fetch_futures_settlement_history(
+                contract,
+                start_date=first_date,
+                end_date=target_date,
+            )
+            saved = _save_daily_settlement_frame(
+                asset_type,
+                contract,
+                frame,
+                source,
+                min_trade_date=first_date,
+                max_trade_date=target_date,
+            )
+            updated += int(saved["updated"])
+            conflicts.extend(saved["conflicts"])
+        except Exception as exc:
+            errors.append(f"{contract}历史结算价：{exc}")
+
+    pending_cffex: list[dict[str, object]] = []
+    for requirement in cffex_requirements:
+        asset_type = str(requirement["asset_type"])
+        contract = str(requirement["contract"])
+        required_days = _futures_trading_dates(
+            pd.Timestamp(requirement["first_date"]).date(),
+            pd.Timestamp(requirement["target_date"]).date(),
+        )
+        missing_days = [
+            day
+            for day in required_days
+            if (asset_type, contract, day) not in existing_settlements
+        ]
+        if not missing_days and not force:
+            skipped += 1
+        else:
+            pending_cffex.append(requirement)
+    if pending_cffex:
+        cffex_contracts = {str(item["contract"]) for item in pending_cffex}
+        cffex_start = min(str(item["first_date"]) for item in pending_cffex)
+        cffex_end = max(str(item["target_date"]) for item in pending_cffex)
+        try:
+            cffex_frame, cffex_source = _fetch_cffex_settlement_history(
+                cffex_contracts,
+                cffex_start,
+                cffex_end,
+            )
+            for requirement in pending_cffex:
+                asset_type = str(requirement["asset_type"])
+                contract = str(requirement["contract"])
+                contract_frame = cffex_frame[cffex_frame["contract"].eq(contract)]
+                saved = _save_daily_settlement_frame(
+                    asset_type,
+                    contract,
+                    contract_frame,
+                    cffex_source,
+                    min_trade_date=str(requirement["first_date"]),
+                    max_trade_date=str(requirement["target_date"]),
+                )
+                updated += int(saved["updated"])
+                conflicts.extend(saved["conflicts"])
+                if contract_frame.empty:
+                    errors.append(f"{contract}历史结算价：中金所未返回该合约。")
+        except Exception as exc:
+            errors.append(f"中金所历史结算价：{exc}")
+
+    option_days: dict[str, set[str]] = {}
+    for requirement in option_requirements:
+        contract = str(requirement["contract"])
+        parts = _option_contract_parts(contract)
+        if parts is None or parts["product"] != "I":
+            errors.append(f"{contract}历史结算价：当前仅支持铁矿石期权。")
+            continue
+        first_date = str(requirement["first_date"])
+        target_date = str(requirement["target_date"])
+        required_days = _futures_trading_dates(
+            pd.Timestamp(first_date).date(), pd.Timestamp(target_date).date()
+        )
+        missing_days = [
+            day
+            for day in required_days
+            if ("期权", contract, day) not in existing_settlements
+        ]
+        if not missing_days and not force:
+            skipped += 1
+            continue
+        for day in required_days if force else missing_days:
+            option_days.setdefault(day, set()).add(contract)
+
+    for day in sorted(option_days):
+        contracts = option_days[day]
+        try:
+            frame, source = _fetch_dce_option_settlements_for_date(day, contracts)
+        except Exception as exc:
+            errors.append(f"铁矿石期权 {day} 起历史结算价：{exc}")
+            break
+        returned = set(frame["contract"].astype(str)) if not frame.empty else set()
+        for contract in sorted(contracts):
+            contract_frame = frame[frame["contract"].eq(contract)] if not frame.empty else frame
+            if contract not in returned:
+                errors.append(f"{contract} {day}：大商所未返回正式结算价。")
+                continue
+            saved = _save_daily_settlement_frame(
+                "期权",
+                contract,
+                contract_frame,
+                source,
+                min_trade_date=day,
+                max_trade_date=day,
+            )
+            updated += int(saved["updated"])
+            conflicts.extend(saved["conflicts"])
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "conflicts": conflicts,
+        "contracts": len(requirements),
     }
 
 
@@ -1717,80 +3032,600 @@ def summarize_futures_live_pnl(
     }
 
 
-def build_daily_account_pnl() -> pd.DataFrame:
-    accounts = list_monthly_accounts()
-    if accounts.empty:
-        return pd.DataFrame()
-    trades = list_futures_live_trades(include_taken_over=False)
-    rows: list[dict[str, object]] = []
-    cumulative_fees = 0.0
-    cumulative_futures_realized = 0.0
-    cumulative_option_cashflow = 0.0
+def _futures_trading_dates(start: date, end: date) -> list[str]:
+    market = get_market_window("A股")
+    days: list[str] = []
+    current = start
+    while current <= end:
+        if current.weekday() < 5 and (market is None or not is_market_holiday(market, current)):
+            days.append(current.isoformat())
+        current += timedelta(days=1)
+    return days
+
+
+def _daily_fee_adjustments(
+    accounts: pd.DataFrame,
+    trades: pd.DataFrame,
+    cash_flows: pd.DataFrame,
+    trading_dates: list[str],
+) -> dict[str, float]:
+    adjustments: dict[str, float] = {}
     for account in accounts.to_dict("records"):
         month = str(account["statement_month"])
-        month_trades = trades[trades["statement_month"].eq(month)]
-        cumulative_fees += float(account.get("monthly_fee") or 0)
-        futures_month = month_trades[month_trades["asset_type"].eq("期货")] if not month_trades.empty else month_trades
-        options_month = month_trades[month_trades["asset_type"].eq("期权")] if not month_trades.empty else month_trades
-        cumulative_futures_realized += float(pd.to_numeric(futures_month.get("close_pnl"), errors="coerce").fillna(0).sum()) if not futures_month.empty else 0.0
-        cumulative_option_cashflow += float(_option_cashflow(options_month).sum()) if not options_month.empty else 0.0
-        positions = list_month_end_positions(month)
-        option_market_value = 0.0
-        option_open_basis = 0.0
-        for position in positions[positions["asset_type"].eq("期权")].to_dict("records"):
-            multiplier = _number(position.get("multiplier")) or _known_multiplier("期权", position["contract"])
-            settlement = _number(position.get("settlement_price"))
-            average = _number(position.get("average_price"))
-            if multiplier and settlement is not None and average is not None:
-                sign = 1 if position["side"] == "多" else -1
-                option_market_value += sign * settlement * int(position["quantity"]) * multiplier
-                option_open_basis += -sign * average * int(position["quantity"]) * multiplier
-        realized = cumulative_futures_realized + cumulative_option_cashflow - option_open_basis
-        floating = float(account.get("floating_pnl") or 0) + option_open_basis + option_market_value
-        net = realized + floating - cumulative_fees
-        rows.append(
-            {
-                "date": account["statement_end_date"],
-                "realized_pnl": realized,
-                "floating_pnl": floating,
-                "fee": cumulative_fees,
-                "net_pnl": net,
-                "source": "月结单",
-            }
-        )
-    latest_account = accounts.iloc[-1].to_dict()
-    latest_positions = build_estimated_positions()
-    active_contracts = latest_positions.loc[
-        pd.to_numeric(latest_positions.get("estimated_quantity"), errors="coerce").fillna(0).gt(0),
-        ["asset_type", "contract"],
-    ].drop_duplicates() if not latest_positions.empty else pd.DataFrame()
-    closes = load_daily_closes()
-    common_dates: set[str] | None = None
-    if not active_contracts.empty and not closes.empty:
-        for asset_type, contract in active_contracts.itertuples(index=False, name=None):
-            dates = set(
-                closes.loc[
-                    closes["asset_type"].eq(asset_type)
-                    & closes["contract"].eq(contract)
-                    & closes["trade_date"].gt(str(latest_account["statement_end_date"])),
-                    "trade_date",
-                ].astype(str)
-            )
-            common_dates = dates if common_dates is None else common_dates & dates
-    for valuation_date in sorted(common_dates or set()):
-        current = summarize_futures_live_pnl(as_of=valuation_date)
-        if current.get("valuation_date") != valuation_date:
+        official_trades = trades[
+            trades["source"].eq("月结单") & trades["statement_month"].eq(month)
+        ]
+        detail_fee = float(
+            pd.to_numeric(official_trades.get("fee"), errors="coerce").fillna(0).sum()
+        ) if not official_trades.empty else 0.0
+        month_account_fees = cash_flows[
+            cash_flows["source"].eq("月结单")
+            & cash_flows["statement_month"].eq(month)
+            & cash_flows["entry_type"].isin(["申报费", "账户费用"])
+        ]
+        explicit_account_fee = float(
+            pd.to_numeric(month_account_fees.get("amount"), errors="coerce").fillna(0).sum()
+        ) if not month_account_fees.empty else 0.0
+        residual = float(account.get("monthly_fee") or 0) - detail_fee - explicit_account_fee
+        if abs(residual) <= RECONCILIATION_TOLERANCE:
             continue
+        eligible = [day for day in trading_dates if day.startswith(month)]
+        if eligible:
+            adjustments[max(eligible)] = adjustments.get(max(eligible), 0.0) + residual
+    return adjustments
+
+
+def build_daily_account_pnl(
+    *,
+    as_of: object = None,
+    valuation_mode: str = "close",
+) -> pd.DataFrame:
+    if valuation_mode not in {"close", "settlement"}:
+        raise ValueError("估值口径必须是 close 或 settlement。")
+    accounts = list_monthly_accounts()
+    trades = list_futures_live_trades(include_taken_over=False)
+    if accounts.empty or trades.empty:
+        return pd.DataFrame()
+    trades = trades.copy()
+    trades["trade_date"] = pd.to_datetime(trades["trade_date"], errors="coerce")
+    trades = trades.dropna(subset=["trade_date"]).sort_values(
+        ["trade_date", "trade_time", "id"], na_position="last"
+    )
+    cash_flows = _effective_cash_flows(as_of=as_of)
+    start_candidates = [trades["trade_date"].min().date()]
+    if not cash_flows.empty:
+        first_flow = pd.to_datetime(cash_flows["flow_date"], errors="coerce").min()
+        if pd.notna(first_flow):
+            start_candidates.append(first_flow.date())
+    target = (
+        pd.Timestamp(_date_text(as_of)).date()
+        if as_of is not None and _date_text(as_of)
+        else completed_futures_daily_cutoff().date()
+    )
+    start = min(start_candidates)
+    if target < start:
+        return pd.DataFrame()
+    trading_dates = _futures_trading_dates(start, target)
+    if not trading_dates:
+        return pd.DataFrame()
+
+    cached = load_daily_closes()
+    close_lookup = {
+        (str(row.asset_type), str(row.contract), str(row.trade_date)): float(row.close_price)
+        for row in cached.itertuples(index=False)
+        if pd.notna(row.close_price)
+    }
+    settlement_lookup = {
+        (str(row.asset_type), str(row.contract), str(row.trade_date)): float(row.settlement_price)
+        for row in cached.itertuples(index=False)
+        if pd.notna(row.settlement_price)
+    }
+    valuation_lookup = close_lookup if valuation_mode == "close" else settlement_lookup
+    trade_groups = {
+        day.strftime("%Y-%m-%d"): group
+        for day, group in trades.groupby(trades["trade_date"].dt.normalize())
+    }
+    flow_groups: dict[str, pd.DataFrame] = {}
+    if not cash_flows.empty:
+        dated_flows = cash_flows.copy()
+        dated_flows["_valuation_date"] = dated_flows["flow_date"].astype(str).map(
+            lambda flow_date: next(
+                (day for day in trading_dates if day >= flow_date),
+                None,
+            )
+        )
+        dated_flows = dated_flows.dropna(subset=["_valuation_date"])
+        flow_groups = {
+            str(day): group.drop(columns=["_valuation_date"])
+            for day, group in dated_flows.groupby("_valuation_date")
+        }
+    event_rows = list_option_expiry_events()
+    event_rows = event_rows[
+        event_rows["reconciliation_status"].isin(["已确认", "已接管"])
+    ] if not event_rows.empty else event_rows
+    event_groups = {
+        str(day): group
+        for day, group in event_rows.groupby(event_rows["event_date"].astype(str))
+    } if not event_rows.empty else {}
+    fee_adjustments = _daily_fee_adjustments(
+        accounts, trades, cash_flows, trading_dates
+    )
+    latest_statement_end = str(accounts.iloc[-1]["statement_end_date"])
+
+    futures_states: dict[tuple[str, str], dict[str, float | int]] = {}
+    option_states: dict[str, dict[str, float | int]] = {}
+    futures_realized = 0.0
+    option_realized = 0.0
+    cumulative_fee = 0.0
+    cumulative_net_flow = 0.0
+    rows: list[dict[str, object]] = []
+
+    def add_futures_position(
+        contract: str,
+        side: str,
+        quantity: int,
+        price: float,
+        multiplier: float,
+    ) -> None:
+        key = (contract, side)
+        state = futures_states.setdefault(
+            key, {"quantity": 0, "average": 0.0, "multiplier": multiplier}
+        )
+        current_quantity = int(state["quantity"])
+        new_quantity = current_quantity + quantity
+        state["average"] = (
+            float(state["average"]) * current_quantity + price * quantity
+        ) / new_quantity
+        state["quantity"] = new_quantity
+        state["multiplier"] = multiplier
+
+    def process_expiry(
+        contract: str,
+        quantity: int,
+        outcome: str,
+        underlying: str | None,
+        futures_side: str | None,
+        strike: float,
+    ) -> None:
+        nonlocal option_realized
+        state = option_states.get(contract)
+        if state is None or int(state["quantity"]) == 0:
+            return
+        signed_quantity = int(state["quantity"])
+        closed_quantity = min(abs(signed_quantity), quantity)
+        multiplier = float(state["multiplier"])
+        option_realized += (
+            -float(state["average"]) * closed_quantity * multiplier
+            if signed_quantity > 0
+            else float(state["average"]) * closed_quantity * multiplier
+        )
+        state["quantity"] = (
+            signed_quantity - closed_quantity
+            if signed_quantity > 0
+            else signed_quantity + closed_quantity
+        )
+        if outcome == "履约" and underlying and futures_side:
+            add_futures_position(
+                underlying, futures_side, closed_quantity, strike, multiplier
+            )
+
+    for day in trading_dates:
+        day_trades = trade_groups.get(day, pd.DataFrame())
+        day_trade_fee = 0.0
+        for trade in day_trades.to_dict("records"):
+            asset_type = str(trade["asset_type"])
+            contract = str(trade["contract"])
+            quantity = int(trade["quantity"])
+            price = float(trade["price"])
+            multiplier = _number(trade.get("multiplier")) or _known_multiplier(
+                asset_type, contract
+            )
+            if multiplier is None:
+                continue
+            day_trade_fee += float(trade.get("fee") or 0)
+            if asset_type == "期货":
+                if trade["open_close"] == "开":
+                    side = "多" if trade["buy_sell"] == "买" else "空"
+                    add_futures_position(contract, side, quantity, price, multiplier)
+                    continue
+                side = "多" if trade["buy_sell"] == "卖" else "空"
+                state = futures_states.get((contract, side))
+                available = int(state["quantity"]) if state else 0
+                closed_quantity = min(quantity, available)
+                supplied_pnl = _number(trade.get("close_pnl"))
+                if supplied_pnl is not None:
+                    futures_realized += supplied_pnl
+                elif state is not None and closed_quantity > 0:
+                    futures_realized += (
+                        (price - float(state["average"])) * closed_quantity * multiplier
+                        if side == "多"
+                        else (float(state["average"]) - price) * closed_quantity * multiplier
+                    )
+                if state is not None:
+                    state["quantity"] = max(0, available - quantity)
+                continue
+
+            state = option_states.setdefault(
+                contract, {"quantity": 0, "average": 0.0, "multiplier": multiplier}
+            )
+            signed_quantity = int(state["quantity"])
+            delta = quantity if trade["buy_sell"] == "买" else -quantity
+            if signed_quantity == 0 or signed_quantity * delta > 0:
+                new_quantity = signed_quantity + delta
+                state["average"] = (
+                    float(state["average"]) * abs(signed_quantity) + price * abs(delta)
+                ) / abs(new_quantity)
+                state["quantity"] = new_quantity
+                state["multiplier"] = multiplier
+                continue
+            closed_quantity = min(abs(signed_quantity), abs(delta))
+            option_realized += (
+                (price - float(state["average"])) * closed_quantity * multiplier
+                if signed_quantity > 0
+                else (float(state["average"]) - price) * closed_quantity * multiplier
+            )
+            new_quantity = signed_quantity + delta
+            if signed_quantity * new_quantity < 0:
+                state["average"] = price
+            elif new_quantity == 0:
+                state["average"] = 0.0
+            state["quantity"] = new_quantity
+            state["multiplier"] = multiplier
+
+        pending_expiry: list[str] = []
+        explicit_events = event_groups.get(day, pd.DataFrame())
+        explicit_contracts: set[str] = set()
+        for event in explicit_events.to_dict("records"):
+            explicit_contracts.add(str(event["option_contract"]))
+            process_expiry(
+                str(event["option_contract"]),
+                int(event["quantity"]),
+                str(event["outcome"]),
+                _text(event.get("underlying_contract")) or None,
+                _text(event.get("futures_side")) or None,
+                float(event.get("strike") or 0),
+            )
+        for contract, state in option_states.items():
+            if int(state["quantity"]) == 0:
+                continue
+            expiry_date = iron_ore_option_expiry_date(contract)
+            if not expiry_date or expiry_date > day or contract in explicit_contracts:
+                continue
+            parts = _option_contract_parts(contract) or {}
+            underlying = str(parts.get("underlying_contract") or "")
+            settlement = settlement_lookup.get(("期货", underlying, expiry_date))
+            settlement = settlement or close_lookup.get(("期货", underlying, expiry_date))
+            if expiry_date > latest_statement_end or settlement is None:
+                pending_expiry.append(contract)
+                continue
+            strike = float(parts.get("strike") or 0)
+            is_put = parts.get("option_type") == "P"
+            in_the_money = (
+                (is_put and settlement < strike)
+                or (not is_put and settlement > strike)
+            )
+            signed_quantity = int(state["quantity"])
+            option_side = "多" if signed_quantity > 0 else "空"
+            futures_side = (
+                "空" if is_put and option_side == "多" else
+                "多" if is_put else
+                "多" if option_side == "多" else "空"
+            )
+            process_expiry(
+                contract,
+                abs(signed_quantity),
+                "履约" if in_the_money else "作废",
+                underlying if in_the_money else None,
+                futures_side if in_the_money else None,
+                strike,
+            )
+
+        day_flows = flow_groups.get(day, pd.DataFrame())
+        external = day_flows[day_flows["entry_type"].isin(CASH_FLOW_TYPES)] if not day_flows.empty else day_flows
+        net_flow = 0.0
+        if not external.empty:
+            net_flow = float(
+                pd.to_numeric(external.loc[external["entry_type"].eq("入金"), "amount"], errors="coerce").fillna(0).sum()
+                - pd.to_numeric(external.loc[external["entry_type"].eq("出金"), "amount"], errors="coerce").fillna(0).sum()
+            )
+        account_fee = 0.0
+        if not day_flows.empty:
+            account_fee = float(
+                pd.to_numeric(
+                    day_flows.loc[
+                        day_flows["entry_type"].isin(["申报费", "账户费用"]),
+                        "amount",
+                    ],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
+        cumulative_net_flow += net_flow
+        if valuation_mode == "settlement":
+            cumulative_fee += day_trade_fee
+        else:
+            cumulative_fee += day_trade_fee + account_fee + fee_adjustments.get(day, 0.0)
+
+        floating = 0.0
+        missing: list[str] = [f"{contract}到期处理待确认" for contract in pending_expiry]
+        for (contract, side), state in futures_states.items():
+            quantity = int(state["quantity"])
+            if quantity <= 0:
+                continue
+            valuation_price = valuation_lookup.get(("期货", contract, day))
+            if valuation_price is None:
+                missing.append(contract)
+                continue
+            direction = 1 if side == "多" else -1
+            floating += (
+                (valuation_price - float(state["average"]))
+                * quantity
+                * float(state["multiplier"])
+                * direction
+            )
+        for contract, state in option_states.items():
+            signed_quantity = int(state["quantity"])
+            if signed_quantity == 0:
+                continue
+            valuation_price = valuation_lookup.get(("期权", contract, day))
+            if valuation_price is None:
+                missing.append(contract)
+                continue
+            direction = 1 if signed_quantity > 0 else -1
+            floating += (
+                (valuation_price - float(state["average"]))
+                * abs(signed_quantity)
+                * float(state["multiplier"])
+                * direction
+            )
+        complete = not missing
+        realized = futures_realized + option_realized
+        net_pnl = realized + floating - cumulative_fee if complete else pd.NA
+        economic_equity = cumulative_net_flow + float(net_pnl) if complete else pd.NA
         rows.append(
             {
-                "date": valuation_date,
-                "realized_pnl": current["realized_pnl"],
-                "floating_pnl": current["floating_pnl"],
-                "fee": current["fee"],
-                "net_pnl": current["net_pnl"],
-                "source": "正式收盘估值",
+                "date": day,
+                "realized_pnl": realized,
+                "floating_pnl": floating if complete else pd.NA,
+                "fee": cumulative_fee,
+                "net_pnl": net_pnl,
+                "net_cash_flow": net_flow,
+                "cumulative_net_cash_flow": cumulative_net_flow,
+                "economic_equity": economic_equity,
+                "source": (
+                    "数据不完整"
+                    if not complete
+                    else (
+                        "正式收盘估值"
+                        if valuation_mode == "close"
+                        else "正式结算估值"
+                    )
+                ),
+                "status": "完整" if complete else "数据不完整",
+                "confirmation_status": (
+                    "正式" if day <= latest_statement_end else "待月结单确认"
+                ),
+                "missing_contracts": "、".join(sorted(set(missing))),
             }
         )
-    result = pd.DataFrame(rows).drop_duplicates("date", keep="last").sort_values("date")
-    result["daily_pnl"] = pd.to_numeric(result["net_pnl"], errors="coerce").diff()
+
+    result = pd.DataFrame(rows)
+    if valuation_mode == "settlement":
+        return _apply_manual_daily_pnl_overrides(
+            result,
+            latest_statement_end=latest_statement_end,
+        )
+    result["daily_pnl"] = pd.NA
+    result["return_base"] = pd.NA
+    result["daily_return_pct"] = pd.NA
+    previous_complete = False
+    previous_net = 0.0
+    previous_equity = 0.0
+    for index, row in result.iterrows():
+        if row["status"] != "完整" or pd.isna(row["net_pnl"]):
+            previous_complete = False
+            continue
+        if index == 0:
+            daily_pnl = float(row["net_pnl"])
+            return_base = max(float(row["net_cash_flow"]), 0.0)
+        elif previous_complete:
+            daily_pnl = float(row["net_pnl"]) - previous_net
+            return_base = previous_equity + max(float(row["net_cash_flow"]), 0.0)
+        else:
+            previous_net = float(row["net_pnl"])
+            previous_equity = float(row["economic_equity"])
+            previous_complete = True
+            continue
+        result.at[index, "daily_pnl"] = daily_pnl
+        result.at[index, "return_base"] = return_base
+        result.at[index, "daily_return_pct"] = (
+            daily_pnl / return_base * 100 if return_base > 0 else pd.NA
+        )
+        previous_net = float(row["net_pnl"])
+        previous_equity = float(row["economic_equity"])
+        previous_complete = True
     return result.reset_index(drop=True)
+
+
+def _apply_manual_daily_pnl_overrides(
+    result: pd.DataFrame,
+    *,
+    latest_statement_end: str,
+) -> pd.DataFrame:
+    if result.empty:
+        return result
+    overrides = list_futures_daily_pnl_overrides()
+    override_by_date = {
+        str(row["trade_date"]): row
+        for row in overrides.to_dict("records")
+    } if not overrides.empty else {}
+    result = result.copy()
+    result["formal_net_pnl"] = result["net_pnl"]
+    result["formal_economic_equity"] = result["economic_equity"]
+    result["formal_daily_pnl"] = pd.NA
+    result["manual_daily_pnl"] = pd.NA
+    result["difference"] = pd.NA
+    result["reconciliation_status"] = ""
+    result["daily_pnl"] = pd.NA
+    result["return_base"] = pd.NA
+    result["daily_return_pct"] = pd.NA
+
+    previous_effective_net: float | None = None
+    previous_effective_equity: float | None = None
+    previous_day_has_cumulative = False
+    confirmation_paused = False
+    reconciliation_updates: list[tuple[float, float, str, str | None, str, int]] = []
+
+    for index, row in result.iterrows():
+        day = str(row["date"])
+        formal_complete = row["status"] == "完整" and pd.notna(row["formal_net_pnl"])
+        formal_daily: float | None = None
+        if formal_complete:
+            formal_net = float(row["formal_net_pnl"])
+            if index == 0:
+                formal_daily = formal_net
+            elif previous_day_has_cumulative and previous_effective_net is not None:
+                formal_daily = formal_net - previous_effective_net
+            if formal_daily is not None:
+                result.at[index, "formal_daily_pnl"] = formal_daily
+
+        override = override_by_date.get(day)
+        manual_pnl = float(override["pnl_amount"]) if override is not None else None
+        resolution = (
+            str(override.get("resolution"))
+            if override is not None and str(override.get("resolution")) in DAILY_PNL_RESOLUTIONS
+            else None
+        )
+        reconciliation_status = ""
+        difference: float | None = None
+        if manual_pnl is not None:
+            result.at[index, "manual_daily_pnl"] = manual_pnl
+        if manual_pnl is not None and formal_daily is not None:
+            difference = formal_daily - manual_pnl
+            if abs(difference) <= RECONCILIATION_TOLERANCE:
+                reconciliation_status = "已一致"
+                resolution = "采用正式"
+            elif resolution in DAILY_PNL_RESOLUTIONS:
+                reconciliation_status = resolution
+            else:
+                reconciliation_status = "待核对"
+            reconciliation_updates.append(
+                (
+                    formal_daily,
+                    difference,
+                    reconciliation_status,
+                    resolution,
+                    datetime.now().isoformat(timespec="seconds"),
+                    int(override["id"]),
+                )
+            )
+            result.at[index, "difference"] = difference
+            result.at[index, "reconciliation_status"] = reconciliation_status
+        elif manual_pnl is not None:
+            reconciliation_status = "待确认"
+            result.at[index, "reconciliation_status"] = reconciliation_status
+
+        chosen_daily: float | None = None
+        use_manual = False
+        if manual_pnl is not None:
+            use_manual = formal_daily is None or resolution != "采用正式"
+            chosen_daily = manual_pnl if use_manual else formal_daily
+        elif formal_daily is not None:
+            chosen_daily = formal_daily
+
+        can_extend = index == 0 or (
+            previous_day_has_cumulative and previous_effective_net is not None
+        )
+        if chosen_daily is not None and can_extend:
+            if index == 0:
+                effective_net = chosen_daily
+                return_base = max(float(row["net_cash_flow"]), 0.0)
+            else:
+                effective_net = float(previous_effective_net) + chosen_daily
+                return_base = float(previous_effective_equity) + max(
+                    float(row["net_cash_flow"]), 0.0
+                )
+            effective_equity = float(row["cumulative_net_cash_flow"]) + effective_net
+            result.at[index, "net_pnl"] = effective_net
+            result.at[index, "economic_equity"] = effective_equity
+            result.at[index, "daily_pnl"] = chosen_daily
+            result.at[index, "return_base"] = return_base
+            result.at[index, "daily_return_pct"] = (
+                chosen_daily / return_base * 100 if return_base > 0 else pd.NA
+            )
+            if use_manual:
+                result.at[index, "source"] = "同花顺手工"
+                result.at[index, "status"] = "手工估算"
+            previous_effective_net = effective_net
+            previous_effective_equity = effective_equity
+            previous_day_has_cumulative = True
+        elif chosen_daily is not None and use_manual:
+            result.at[index, "daily_pnl"] = chosen_daily
+            result.at[index, "status"] = "手工估算"
+            if formal_complete:
+                result.at[index, "net_pnl"] = float(row["formal_net_pnl"])
+                result.at[index, "economic_equity"] = float(
+                    row["formal_economic_equity"]
+                )
+                result.at[index, "source"] = "同花顺手工日收益/正式结算累计"
+                previous_effective_net = float(row["formal_net_pnl"])
+                previous_effective_equity = float(row["formal_economic_equity"])
+                previous_day_has_cumulative = True
+            else:
+                result.at[index, "net_pnl"] = pd.NA
+                result.at[index, "economic_equity"] = pd.NA
+                result.at[index, "source"] = "同花顺手工"
+                previous_day_has_cumulative = False
+        elif formal_complete:
+            previous_effective_net = float(row["formal_net_pnl"])
+            previous_effective_equity = float(row["formal_economic_equity"])
+            previous_day_has_cumulative = True
+        else:
+            result.at[index, "net_pnl"] = pd.NA
+            result.at[index, "economic_equity"] = pd.NA
+            previous_day_has_cumulative = False
+
+        unresolved = manual_pnl is not None and (
+            formal_daily is None or reconciliation_status == "待核对"
+        )
+        confirmation_paused = confirmation_paused or unresolved
+        if confirmation_paused:
+            result.at[index, "confirmation_status"] = (
+                "待核对" if unresolved else "待前序核对"
+            )
+        elif day <= latest_statement_end:
+            result.at[index, "confirmation_status"] = "正式"
+        else:
+            result.at[index, "confirmation_status"] = "待月结单确认"
+
+    if reconciliation_updates:
+        with closing(get_conn()) as conn:
+            conn.executemany(
+                """
+                UPDATE futures_daily_pnl_overrides
+                SET formal_pnl=?, difference=?, reconciliation_status=?,
+                    resolution=?, updated_at=?
+                WHERE id=?
+                """,
+                reconciliation_updates,
+            )
+            conn.commit()
+    return result.reset_index(drop=True)
+
+
+def build_futures_daily_returns(daily_pnl: pd.DataFrame) -> pd.DataFrame:
+    required = {"date", "daily_pnl", "return_base", "daily_return_pct", "status"}
+    if daily_pnl is None or daily_pnl.empty or not required.issubset(daily_pnl.columns):
+        return pd.DataFrame()
+    result = daily_pnl[
+        daily_pnl["status"].isin(["完整", "手工估算"])
+        & pd.to_numeric(daily_pnl["daily_pnl"], errors="coerce").notna()
+    ].copy()
+    if result.empty:
+        return pd.DataFrame()
+    result = result.rename(
+        columns={"daily_pnl": "pnl_amount", "daily_return_pct": "return_pct"}
+    )
+    columns = ["date", "pnl_amount", "return_base", "return_pct", "source"]
+    if "confirmation_status" in result.columns:
+        columns.append("confirmation_status")
+    return result[columns].reset_index(drop=True)

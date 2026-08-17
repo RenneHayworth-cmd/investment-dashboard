@@ -204,6 +204,63 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_cash_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                statement_month TEXT,
+                flow_date TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                notes TEXT,
+                reconciliation_status TEXT NOT NULL DEFAULT '不适用',
+                matched_statement_flow_id INTEGER,
+                source_key TEXT UNIQUE,
+                source_file TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(matched_statement_flow_id) REFERENCES futures_cash_flows(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_option_expiry_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                option_contract TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                underlying_contract TEXT,
+                futures_side TEXT,
+                strike REAL,
+                settlement_price REAL,
+                reconciliation_status TEXT NOT NULL DEFAULT '已确认',
+                source_file TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(source, event_date, option_contract)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS futures_daily_pnl_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL UNIQUE,
+                pnl_amount REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT '同花顺手工',
+                notes TEXT,
+                reconciliation_status TEXT NOT NULL DEFAULT '待确认',
+                formal_pnl REAL,
+                difference REAL,
+                resolution TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         close_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(futures_daily_closes)")
         }
@@ -225,6 +282,24 @@ def init_db() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_futures_positions_month
             ON futures_month_end_positions(statement_month, contract)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_futures_cash_flows_date
+            ON futures_cash_flows(flow_date, entry_type)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_futures_option_expiry_date
+            ON futures_option_expiry_events(event_date, option_contract)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_futures_daily_pnl_override_date
+            ON futures_daily_pnl_overrides(trade_date)
             """
         )
         conn.commit()

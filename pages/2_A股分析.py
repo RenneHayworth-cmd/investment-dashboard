@@ -1,4 +1,5 @@
 import os
+import re
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -59,6 +60,41 @@ def _compact_date_range(start: str | None, end: str | None) -> str:
     except Exception:
         pass
     return f"{start} → {end}"
+
+
+def _safe_file_stem(value: object) -> str:
+    normalized = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value).strip())
+    return normalized.strip(" ._") or "A股分析"
+
+
+def _chart_export_config(
+    file_stem: str,
+    *,
+    height: int,
+    scroll_zoom: bool = False,
+) -> dict[str, object]:
+    return {
+        "displayModeBar": True,
+        "displaylogo": False,
+        "scrollZoom": scroll_zoom,
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": _safe_file_stem(file_stem),
+            "width": 1600,
+            "height": height,
+            "scale": 2,
+        },
+    }
+
+
+def _download_dataframe(df: pd.DataFrame, *, label: str, file_name: str) -> None:
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label,
+        data=csv_bytes,
+        file_name=f"{_safe_file_stem(file_name)}.csv",
+        mime="text/csv",
+    )
 
 
 def _text_metric(label: str, display_value: str, tooltip: str) -> None:
@@ -358,6 +394,7 @@ if save_to_cache and fresh_analysis:
     )
 
 summary = result.summary
+download_name = _safe_file_stem(result.fund_name)
 st.subheader(result.fund_name)
 st.caption(f"数据范围：{summary.get('起始日期')} 至 {summary.get('最新日期')}，共 {summary.get('数据行数')} 条")
 
@@ -451,7 +488,16 @@ with tabs[0]:
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     fig.update_yaxes(title_text="涨幅%", row=3, col=1)
     fig.update_yaxes(title_text="年化%", row=4, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config=_chart_export_config(
+            f"{download_name}_走势分析",
+            height=LARGE_CHART_HEIGHT,
+            scroll_zoom=True,
+        ),
+    )
+    st.caption("下载图片：将鼠标移到图表右上角，点击相机图标即可保存高清 PNG。")
 
 with tabs[1]:
     df = result.dataframe.copy()
@@ -550,25 +596,48 @@ with tabs[1]:
         col=1,
     )
     dd_fig.update_yaxes(title_text="回撤%", row=2, col=1)
-    st.plotly_chart(dd_fig, use_container_width=True)
+    st.plotly_chart(
+        dd_fig,
+        use_container_width=True,
+        config=_chart_export_config(
+            f"{download_name}_回撤分析",
+            height=SECONDARY_CHART_HEIGHT,
+        ),
+    )
+    st.caption("下载图片：将鼠标移到图表右上角，点击相机图标即可保存高清 PNG。")
 
     st.subheader("回撤波段")
     if result.drawdown_periods.empty:
         st.info("没有发现独立回撤波段。")
     else:
         st.dataframe(result.drawdown_periods, use_container_width=True, hide_index=True)
+        _download_dataframe(
+            result.drawdown_periods,
+            label="下载回撤波段 CSV",
+            file_name=f"{download_name}_回撤波段",
+        )
 
     st.subheader("年度最大回撤")
     if result.yearly_drawdowns.empty:
         st.info("没有年度回撤数据。")
     else:
         st.dataframe(result.yearly_drawdowns, use_container_width=True, hide_index=True)
+        _download_dataframe(
+            result.yearly_drawdowns,
+            label="下载年度最大回撤 CSV",
+            file_name=f"{download_name}_年度最大回撤",
+        )
 
 with tabs[2]:
     summary_df = pd.DataFrame(
         [{"指标": key, "数值": _format_metric(value)} for key, value in summary.items()]
     )
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    _download_dataframe(
+        summary_df,
+        label="下载摘要 CSV",
+        file_name=f"{download_name}_摘要",
+    )
 
 with tabs[3]:
     display_cols = [
@@ -590,15 +659,18 @@ with tabs[3]:
     for period in ma_periods:
         display_cols.extend([f"ma_{period}", f"ma_{period}_deviation_pct"])
     display_cols = [col for col in display_cols if col in result.dataframe.columns]
-    st.dataframe(result.dataframe[display_cols].sort_values("date", ascending=False), use_container_width=True)
-
-    csv_bytes = result.dataframe.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "下载分析结果 CSV",
-        data=csv_bytes,
-        file_name=f"{result.fund_name}_analysis.csv",
-        mime="text/csv",
+    indicator_df = result.dataframe[display_cols].sort_values("date", ascending=False)
+    st.dataframe(indicator_df, use_container_width=True, hide_index=True)
+    _download_dataframe(
+        indicator_df,
+        label="下载指标数据 CSV",
+        file_name=f"{download_name}_指标数据",
     )
 
 with tabs[4]:
     st.dataframe(source_df, use_container_width=True)
+    _download_dataframe(
+        source_df,
+        label="下载原始数据 CSV",
+        file_name=f"{download_name}_原始数据",
+    )

@@ -302,6 +302,33 @@ before a larger handoff or commit.
   a fee component rather than an unexplained reconciliation difference. Keep
   any remaining unexplained difference visible instead of assigning it to a
   contract.
+  Parse statement cash-transfer and other-funds details into a dedicated daily
+  cash-flow ledger. Official rows are read-only; manual deposits and withdrawals
+  must be later than the latest statement end, remain deletable, and are taken
+  over only by a unique exact statement match. Daily close-based P&L is the
+  change in cumulative close-based net P&L and excludes deposits/withdrawals.
+  Its return denominator is previous completed-session economic equity plus
+  positive same-day net deposits, where economic equity is cumulative net
+  deposits plus cumulative close-based net P&L. Do not reduce the denominator
+  for net withdrawals. Compound daily rates for week, month, and year views,
+  and label post-statement results as `待月结单确认`.
+  The account trend and return calendar must switch between `盯市` and `收盘`,
+  defaulting to `盯市`. Settlement-based daily P&L is the change in cumulative
+  settlement net P&L, deducts execution fees only, and uses settlement economic
+  equity in its own return denominator; never mix close and settlement amounts
+  or denominators. If historical settlements are incomplete, allow an
+  account-level manual daily P&L from 同花顺 without creating contract prices.
+  Reconcile it automatically when formal data arrives: differences within
+  0.05 yuan use the formal value, larger differences require an explicit
+  `采用手工` or `采用正式` choice, and unresolved differences pause formal
+  cumulative confirmation. Manual daily-P&L records remain deletable.
+  Backfill formal daily prices for every historically traded contract, including
+  closed or expired contracts, using append-only date inserts. Iron-ore option
+  expiry requires the underlying contract's official expiry-day settlement.
+  Keep each strike independent; confirmed short-put assignment removes the
+  option and creates the same quantity of long underlying futures at the strike.
+  Pause formal valuations after an unresolved expiry, and let a later statement
+  reconcile and take over confirmed manual expiry records.
 - Analysis pages should follow the same control layout: keep analysis settings
   in the sidebar, and keep data input, upload, API key fields, and run/analyze
   buttons in the main page area.
@@ -386,6 +413,29 @@ For futures:
 For fund rotation:
 
 - The app now has a dedicated `策略回测` page after `A股分析`.
+- The fourth strategy mode is `年度动态组合`. Keep its registry and index-family
+  whitelist versioned under `config/`; the registry is a current-survivor snapshot,
+  so the UI and reports must disclose survivor bias and must not claim to remove it.
+  Historical proxy data may extend research history but must never make an ETF
+  tradable before its listing date. Same-index older ETFs take precedence over an
+  official index proxy, and an official index proxy requires its publication date
+  and source URL before it can be used at an annual decision date.
+- Annual dynamic selection uses only data available through the prior year-end,
+  at most five calendar years, split by actual trading days 70%/30%. Enforce at
+  least 504 screening days and 252 validation days after that exact split. Search
+  MA10/15/20/25/30 and thresholds 0%/0.5%/1%/1.5%/2%, using the documented
+  percentile composite score and the 10% validation annual-return gate.
+- The annual page flow is cache-only preflight, explicit second confirmation for
+  batched network completion, then a separate run action. Persist no new database
+  table. Runtime market data, hash-keyed atomic checkpoints, and reports stay under
+  ignored local data/output directories. A failed fetch must retain the old cache.
+- Annual simulation invests once, never rebalances across directions, applies a
+  same-ETF parameter change from the first close of the new year, and delays a
+  changed-ETF migration until the old signal exits while always replacing the
+  pending destination with the newest annual choice. Keep 512890 sleeves separate
+  by role and leave their pre-2019-01-18 capital in interest-bearing cash.
+  Report the same-close main result, annual immediate-switch hold benchmark,
+  all-512890 benchmark, and frozen-selection next-close stress result.
 - The page also provides a multi-ETF allocation timing mode. Each row configures
   an ETF or cash weight and chooses always-hold, pure MA timing, or half
   always-hold plus half MA timing. Weights must total 100%. Use the latest

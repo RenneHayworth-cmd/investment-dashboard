@@ -98,6 +98,30 @@ class LiveTradingTests(unittest.TestCase):
             )
         )
 
+    def test_close_refresh_rechecks_immediately_when_symbol_scope_changes(self):
+        market_now = datetime(2026, 8, 14, 14, 0)
+
+        self.assertFalse(
+            live_close_refresh_due(
+                target_date="2026-08-13",
+                market_now=market_now,
+                last_attempt="2026-08-14 13:55:00",
+                last_target_date="2026-08-13",
+                refresh_scope="159967",
+                last_refresh_scope="159967",
+            )
+        )
+        self.assertTrue(
+            live_close_refresh_due(
+                target_date="2026-08-13",
+                market_now=market_now,
+                last_attempt="2026-08-14 13:55:00",
+                last_target_date="2026-08-13",
+                refresh_scope="159967|513310",
+                last_refresh_scope="159967",
+            )
+        )
+
     def test_seed_key_is_idempotent_and_record_can_be_deleted(self):
         kwargs = {
             "trade_date": "2026-08-05",
@@ -646,6 +670,9 @@ class LiveTradingTests(unittest.TestCase):
         )
         self.assertIn("adjust=FUND_ADJUST_NONE", page_source)
         self.assertIn("network_refresh_due", page_source)
+        self.assertIn('attempt_scope_key = "live_pnl_close_last_scope"', page_source)
+        self.assertIn("refresh_scope=refresh_scope", page_source)
+        self.assertIn("页面将在下次自动检查时联网补齐", page_source)
         self.assertIn('name="总盈亏"', page_source)
         self.assertIn('name="累计收益率"', page_source)
         self.assertIn('st.subheader("收益日历")', page_source)

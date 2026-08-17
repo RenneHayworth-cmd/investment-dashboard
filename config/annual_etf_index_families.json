@@ -1,0 +1,90 @@
+{
+  "version": "annual-etf-index-families-20260817-v1",
+  "snapshot_date": "2026-08-17",
+  "description": "历史年度ETF动态组合的指数族白名单。只决定研究范围，不代表消除生存者偏差。",
+  "official_sources": [
+    "https://www.sse.com.cn/assortment/fund/list/etf/",
+    "https://www.szse.cn/market/product/list/etfList/index.html"
+  ],
+  "directions": {
+    "us_sp500": {
+      "label": "标普500",
+      "families": ["sp500"]
+    },
+    "us_nasdaq": {
+      "label": "纳斯达克100",
+      "families": ["nasdaq100"]
+    },
+    "a_large": {
+      "label": "A股核心宽基",
+      "families": ["sse50", "csi300", "szse100", "a50", "csi_a500"]
+    },
+    "a_mid_small": {
+      "label": "A股中小盘",
+      "families": ["csi500", "csi1000", "csi2000", "sse380"]
+    },
+    "a_growth": {
+      "label": "A股成长宽基",
+      "families": ["chinext", "chinext50", "star50"]
+    },
+    "smart_beta": {
+      "label": "Smart Beta",
+      "families": ["dividend", "low_volatility", "value", "quality", "fundamental", "free_cash_flow"]
+    },
+    "other_overseas": {
+      "label": "非美国家或区域宽基",
+      "families": ["hang_seng", "hang_seng_china_enterprises", "nikkei225", "topix", "dax"]
+    },
+    "gold": {
+      "label": "黄金现货",
+      "families": ["gold_spot"]
+    }
+  },
+  "excluded_keywords": [
+    "行业",
+    "主题",
+    "科技",
+    "半导体",
+    "芯片",
+    "产业链",
+    "杠杆",
+    "反向",
+    "债券",
+    "货币",
+    "原油",
+    "有色",
+    "豆粕"
+  ],
+  "known_share_splits": {
+    "510500": [
+      {
+        "effective_date": "2015-04-15",
+        "ratio": 0.28032483,
+        "rounding": "floor",
+        "source": "https://www.sse.com.cn/disclosure/fund/announcement/"
+      },
+      {
+        "effective_date": "2022-08-29",
+        "ratio": 1.14539,
+        "rounding": "ceil",
+        "source": "https://www.sse.com.cn/disclosure/fund/announcement/"
+      }
+    ],
+    "512890": [
+      {
+        "effective_date": "2021-10-25",
+        "ratio": 2.0,
+        "rounding": "floor",
+        "source": "https://www.sse.com.cn/disclosure/fund/announcement/"
+      }
+    ],
+    "159967": [
+      {
+        "effective_date": "2020-11-06",
+        "ratio": 3.63839094,
+        "rounding": "floor",
+        "source": "https://www.szse.cn/disclosure/fund/notice/index.html"
+      }
+    ]
+  }
+}

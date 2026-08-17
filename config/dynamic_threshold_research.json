@@ -1,0 +1,41 @@
+{
+  "initial_capital": 100000.0,
+  "commission_rate": 0.00006,
+  "lot_size": 100,
+  "research_end_date": null,
+  "random_seed": 20260815,
+  "execution_mode": "after_close",
+  "after_hours_fill_rate": 1.0,
+  "slippage_bp": 0.0,
+  "cash_annual_rate": 0.0,
+  "known_share_splits": {
+    "510500": [
+      {"effective_date": "2015-04-15", "event_date": "2015-04-14", "ratio": 0.28032483, "rounding": "floor", "source": "南方基金份额折算结果公告"},
+      {"effective_date": "2022-08-29", "event_date": "2022-08-26", "ratio": 1.14539, "rounding": "ceil", "source": "南方基金份额拆分结果公告"}
+    ],
+    "159967": [
+      {"effective_date": "2020-11-06", "event_date": "2020-11-05", "ratio": 3.63839094, "rounding": "floor", "source": "华夏基金份额拆分结果公告"}
+    ]
+  },
+  "allocations": [
+    {"symbol": "513260", "name": "恒生科技ETF汇添富", "weight_pct": 100.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "159915", "name": "创业板ETF易方达", "weight_pct": 100.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "588000", "name": "科创50ETF华夏", "weight_pct": 100.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 1.0},
+    {"symbol": "510500", "name": "中证500ETF南方", "weight_pct": 100.0, "strategy": "timing", "ma_period": 15, "threshold_pct": 1.0},
+    {"symbol": "159201", "name": "自由现金流ETF华夏", "weight_pct": 100.0, "strategy": "timing", "ma_period": 20, "threshold_pct": 0.5},
+    {"symbol": "159655", "name": "标普500ETF华夏", "weight_pct": 100.0, "strategy": "half_timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "159501", "name": "纳指ETF嘉实", "weight_pct": 100.0, "strategy": "half_timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "161128", "name": "标普信息科技LOF易方达", "weight_pct": 100.0, "strategy": "timing", "ma_period": 25, "threshold_pct": 1.5},
+    {"symbol": "159545", "name": "恒生红利低波ETF易方达", "weight_pct": 100.0, "strategy": "timing", "ma_period": 10, "threshold_pct": 1.0},
+    {"symbol": "159967", "name": "创业板成长ETF华夏", "weight_pct": 100.0, "strategy": "timing", "ma_period": 25, "threshold_pct": 2.0},
+    {"symbol": "518850", "name": "黄金ETF华夏", "weight_pct": 100.0, "strategy": "timing", "ma_period": 30, "threshold_pct": 1.5},
+    {"symbol": "159552", "name": "中证2000增强ETF招商", "weight_pct": 100.0, "strategy": "timing", "ma_period": 10, "threshold_pct": 2.5},
+    {"symbol": "513310", "name": "中韩半导体ETF华泰柏瑞", "weight_pct": 100.0, "strategy": "timing", "ma_period": 15, "threshold_pct": 0.5},
+    {"symbol": "513880", "name": "日经225ETF华安", "weight_pct": 100.0, "strategy": "timing", "ma_period": 10, "threshold_pct": 2.0}
+  ],
+  "short_history_proxies": {
+    "159201": {"name": "国证自由现金流980092", "path": "data/raw/index_history/index_raw_980092.SZ_1d.csv"},
+    "159545": {"name": "恒生港股通高息低波HSHYLV", "path": "data/raw/index_history/index_raw_恒生港股通高息低波_1d.csv"},
+    "159552": {"name": "中证2000指数932000", "path": "data/raw/index_history/index_raw_932000.SH_1d.csv"}
+  }
+}

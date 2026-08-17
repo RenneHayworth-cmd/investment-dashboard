@@ -50,6 +50,7 @@ PRICE_KEYWORDS = (
     "复权净值",
     "单位净值",
     "净值",
+    "收盘价",
     "nav",
     "net",
     "close",
@@ -335,10 +336,25 @@ def fetch_tickflow_instrument_name(symbol: str, api_key: str = "") -> str:
 
 
 def _find_column(columns: list[str], keywords: tuple[str, ...]) -> str | None:
+    normalized_columns = [
+        (column, str(column).strip().lower())
+        for column in columns
+    ]
+
+    # Prefer exact names so metadata such as ``_final_close_confirmed`` cannot
+    # win a fuzzy ``close`` match over the actual close-price column.
     for keyword in keywords:
         keyword_lower = keyword.lower()
-        for column in columns:
-            if keyword_lower in str(column).strip().lower():
+        for column, column_lower in normalized_columns:
+            if keyword_lower == column_lower:
+                return column
+
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        for column, column_lower in normalized_columns:
+            if column_lower.startswith("_"):
+                continue
+            if keyword_lower in column_lower:
                 return column
     return None
 
@@ -365,7 +381,9 @@ def normalize_nav_dataframe(df: pd.DataFrame, fallback_name: str = "基金") -> 
     result = normalized[[date_col, price_col]].copy()
     result.columns = ["date", "price"]
     result["date"] = pd.to_datetime(result["date"], errors="coerce")
-    result["price"] = pd.to_numeric(result["price"], errors="coerce")
+    if pd.api.types.is_bool_dtype(result["price"].dtype):
+        raise ValueError(f"识别出的价格列“{price_col}”是布尔列，请检查收盘价/净值列名。")
+    result["price"] = pd.to_numeric(result["price"], errors="coerce").astype(float)
     result = result.dropna(subset=["date", "price"])
     result = result.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
@@ -461,10 +479,11 @@ def analyze_fund_nav(
     result["return_20d_pct"] = (prices / prices.shift(20) - 1) * 100
     result["return_60d_pct"] = (prices / prices.shift(60) - 1) * 100
     result["volatility_20d_pct"] = returns.rolling(window=20).std() * 100
-    result["momentum_volatility_20d"] = np.where(
-        result["volatility_20d_pct"] != 0,
-        (result["return_20d_pct"] / 100) / (result["volatility_20d_pct"] / 100),
-        np.nan,
+    volatility_denominator = (
+        result["volatility_20d_pct"].astype(float).div(100).replace(0.0, np.nan)
+    )
+    result["momentum_volatility_20d"] = (
+        result["return_20d_pct"].astype(float).div(100).div(volatility_denominator)
     )
     result[f"rsi_{rsi_period}"] = calculate_rsi(prices, rsi_period)
     result["price_percentile"] = prices.expanding().rank(pct=True) * 100

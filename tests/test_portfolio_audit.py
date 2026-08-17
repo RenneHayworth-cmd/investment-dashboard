@@ -127,6 +127,93 @@ class PortfolioAuditTests(unittest.TestCase):
         self.assertEqual(buy["execution_price"], 20)
         self.assertEqual(buy["shares"], 50)
 
+    def test_sigma_rule_uses_only_prior_day_deviations(self):
+        prices = [10, 11, 9, 10, 20]
+        frame = market_frame(prices)
+        result = run_portfolio_audit(
+            {"A": frame},
+            [
+                AuditAllocation(
+                    "A",
+                    "A",
+                    100,
+                    "timing",
+                    ma_period=2,
+                    signal_rule="sigma",
+                    sigma_period=2,
+                    buy_k=1.0,
+                    sell_k=1.0,
+                )
+            ],
+            AuditSettings(initial_capital=1000, lot_size=1, commission_rate=0),
+        )
+
+        expected_deviation = pd.Series(prices) / pd.Series(prices).rolling(2).mean() - 1
+        expected_sigma = expected_deviation.rolling(2).std(ddof=1).shift(1)
+        observed = result.component_daily["sigma_prev"].reset_index(drop=True)
+        pd.testing.assert_series_equal(observed, expected_sigma, check_names=False)
+        self.assertAlmostEqual(
+            result.component_daily.iloc[-1]["buy_threshold_pct"],
+            expected_sigma.iloc[-1] * 100,
+        )
+
+    def test_sigma_rule_does_not_backfill_zero_sigma(self):
+        frame = market_frame([10, 10, 10, 10, 12])
+        result = run_portfolio_audit(
+            {"A": frame},
+            [
+                AuditAllocation(
+                    "A",
+                    "A",
+                    100,
+                    "timing",
+                    ma_period=2,
+                    signal_rule="sigma",
+                    sigma_period=2,
+                    buy_k=1.0,
+                    sell_k=1.0,
+                )
+            ],
+            AuditSettings(initial_capital=1000, lot_size=1, commission_rate=0),
+        )
+
+        zero_sigma_row = result.component_daily.iloc[3]
+        self.assertEqual(zero_sigma_row["signal"], "等待均线")
+        self.assertTrue(np.isnan(zero_sigma_row["buy_threshold_pct"]))
+
+    def test_hybrid_sigma_adds_alpha_to_lagged_sigma_threshold(self):
+        prices = [10, 11, 9, 10, 20]
+        frame = market_frame(prices)
+        allocation = AuditAllocation(
+            "A",
+            "A",
+            100,
+            "timing",
+            ma_period=2,
+            signal_rule="hybrid_sigma",
+            sigma_period=2,
+            buy_k=0.5,
+            sell_k=0.75,
+            buy_alpha_pct=0.25,
+            sell_alpha_pct=0.5,
+        )
+        result = run_portfolio_audit(
+            {"A": frame},
+            [allocation],
+            AuditSettings(initial_capital=1000, lot_size=1, commission_rate=0),
+        )
+
+        row = result.component_daily.iloc[-1]
+        self.assertAlmostEqual(
+            row["buy_threshold_pct"], 0.25 + 0.5 * row["sigma_prev"] * 100
+        )
+        self.assertAlmostEqual(
+            row["sell_threshold_pct"], 0.5 + 0.75 * row["sigma_prev"] * 100
+        )
+        self.assertAlmostEqual(
+            row["upper_trigger_line"], row["ma"] * (1 + row["buy_threshold_pct"] / 100)
+        )
+
     def test_next_open_uses_next_trading_day_open(self):
         frame = market_frame(
             raw_close=[10, 10, 12, 12],
