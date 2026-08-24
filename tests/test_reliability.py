@@ -310,18 +310,28 @@ class PageReliabilityTests(unittest.TestCase):
             "2_A股分析.py",
             "3_策略回测.py",
             "4_相关性分析.py",
-            "5_持仓分析.py",
             "7_美股分析.py",
         ):
             source = (root / "pages" / page_name).read_text(encoding="utf-8")
             self.assertIn("FUND_ADJUSTMENT_OPTIONS", source)
+        position_source = (
+            root / "components" / "position" / "coordinator.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("FUND_ADJUSTMENT_OPTIONS", position_source)
         live_source = (root / "pages" / "6_实盘记录.py").read_text(encoding="utf-8")
-        self.assertIn("adjust=FUND_ADJUST_NONE", live_source)
+        self.assertIn("adjustment=FUND_ADJUST_NONE", live_source)
     def test_position_page_imports_realtime_timing_end_constant(self):
-        source = (Path(__file__).parents[1] / "pages" / "5_持仓分析.py").read_text(encoding="utf-8")
+        source = (
+            Path(__file__).parents[1]
+            / "components"
+            / "position"
+            / "realtime.py"
+        ).read_text(encoding="utf-8")
 
-        self.assertIn("ETF_REALTIME_TIMING_END_TIME,", source)
-        self.assertIn("market_now.time() >= ETF_REALTIME_TIMING_END_TIME", source)
+        self.assertIn("position.ETF_REALTIME_TIMING_END_TIME", source)
+        self.assertIn(
+            "market_now.time() >= position.ETF_REALTIME_TIMING_END_TIME", source
+        )
 
     def test_analysis_pages_keep_last_source_in_session_state(self):
         root = Path(__file__).parents[1]

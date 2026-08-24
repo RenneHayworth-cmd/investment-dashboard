@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
+import services.annual_etf_portfolio as annual_etf_portfolio
 from services.annual_etf_portfolio import (
     ALL_SLOTS,
     EXECUTION_NEXT_CLOSE,
@@ -29,6 +31,62 @@ from services.annual_etf_portfolio import (
     stitch_proxy_history,
     validate_registry_against_whitelist,
 )
+
+
+class AnnualEtfFacadeContractTests(unittest.TestCase):
+    def test_compatibility_facade_keeps_exports_and_run_signature(self):
+        expected_exports = {
+            "AnnualBacktestSettings",
+            "AnnualCheckpointStore",
+            "AnnualPortfolioResult",
+            "AnnualQualificationResult",
+            "AnnualSelection",
+            "HistoricalEtfRecord",
+            "build_annual_selections",
+            "data_fingerprint",
+            "normalize_annual_market_data",
+            "preflight_annual_candidates",
+            "run_annual_etf_backtest",
+            "score_metrics",
+            "simulate_annual_portfolio",
+            "stitch_proxy_history",
+            "_simulate_parking_benchmark",
+        }
+        self.assertFalse(expected_exports - set(annual_etf_portfolio.__all__))
+        for name in expected_exports:
+            self.assertTrue(hasattr(annual_etf_portfolio, name), name)
+
+        for type_name in (
+            "HistoricalEtfRecord",
+            "AnnualEtfRegistryEntry",
+            "AnnualBacktestSettings",
+            "AnnualSelection",
+            "AnnualQualificationResult",
+            "AnnualPortfolioResult",
+            "DirectionSleeveState",
+            "AnnualCheckpointStore",
+        ):
+            self.assertEqual(
+                getattr(annual_etf_portfolio, type_name).__module__,
+                "services.annual_etf_portfolio",
+            )
+
+        signature = inspect.signature(annual_etf_portfolio.run_annual_etf_backtest)
+        self.assertEqual(
+            list(signature.parameters),
+            [
+                "records",
+                "whitelist",
+                "market_data",
+                "settings",
+                "proxy_data",
+                "checkpoint_dir",
+                "progress_callback",
+            ],
+        )
+        self.assertIsNone(signature.parameters["proxy_data"].default)
+        self.assertIsNone(signature.parameters["checkpoint_dir"].default)
+        self.assertIsNone(signature.parameters["progress_callback"].default)
 
 
 def make_market(dates, prices, *, amount=1_000_000.0):

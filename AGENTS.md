@@ -147,20 +147,21 @@ before a larger handoff or commit.
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
-  spread, and futures option data. Its default spreads are `I2609 - I2705` and
+  contracts, futures spreads, and reusable futures-option data. Its default
+  futures contract is `I2609`; its default spreads are `I2609 - I2705` and
   `IM2609 - IM2703`, calculated independently with the futures-spread service.
   On an A-share trading day, fetch one ETF quote batch every 10 minutes from
   09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
   lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
   from 14:50 through 15:00. Each batch updates all ETF cards and the transient
   timing-table preview for configured timing symbols. Use the same schedule to
-  refresh the two futures-spread cards and four futures-option cards, retaining
+  refresh the `I2609` futures card and the two futures-spread cards, retaining
   their last successful transient values when one source fails. These previews
   remain transient and must not affect formal history or recent operation guidance.
   It should read local cache on first render
   and fetch after the user clicks the load button. Its timed fragments remain
   network-disabled until that click within the page session. The save checkbox
-  controls all formal ETF, spread, and option cache writes; every intraday
+  controls all formal ETF, futures, spread, and option cache writes; every intraday
   preview remains non-persistent regardless of that checkbox. From the A-share open through
   15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
   it may also incrementally backfill missing completed sessions, but must not
@@ -337,8 +338,22 @@ before a larger handoff or commit.
 
 - `app.py`: Streamlit home page.
 - `pages/`: Streamlit pages. Numeric prefixes control sidebar ordering.
+- `components/backtest/`: strategy-backtest mode components and annual ETF page workflow.
+- `components/live_record/`: ETF live-record valuation, tables, trade forms, and history views.
+- `components/futures_live/`: futures-live refresh, account, manual-entry, and history views.
+- `components/position/`: holdings realtime fragment, cards/tables, detail views, and page coordination.
 - `services/live_trading.py`: local live-trade ledger and position-cost calculations.
-- `services/futures_live_trading.py`: read-only broker statement import, futures/options manual trades, position projection, and P&L calculations.
+- `services/fund_rotation.py`, `services/annual_etf_portfolio.py`,
+  `services/portfolio_audit.py`, and `services/portfolio_audit_analysis.py`:
+  stable compatibility facades; focused implementations use the matching
+  `fund_rotation_*`, `annual_etf_*`, and `portfolio_audit_*` sibling modules.
+- `services/index_ma20.py` and `services/update_tasks.py`: stable compatibility
+  facades; index configuration, source adapters, history/signals, validation,
+  persistence, and orchestration live in `index_*` and `index_update_*` siblings.
+- `services/futures_live_trading.py`: stable compatibility facade for the
+  `futures_live_*` statement, repository, position, price, settlement, and P&L modules.
+- `services/position_analysis.py`: stable compatibility facade for the
+  `position_*` model, session, runtime, timing, market, and derivatives modules.
 - `core/`: shared paths, SQLite setup, cache helpers, small common utilities.
 - `services/`: market data fetching and analysis logic.
 - `data/raw/`: generated raw CSV data.

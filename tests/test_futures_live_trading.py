@@ -583,6 +583,8 @@ class FuturesLiveTradingTests(unittest.TestCase):
         self.assertEqual(compared.loc["2026-07-02", "formal_daily_pnl"], 100)
         self.assertEqual(compared.loc["2026-07-02", "difference"], 10)
         self.assertEqual(compared.loc["2026-07-02", "daily_pnl"], 90)
+        self.assertEqual(compared.loc["2026-07-03", "daily_pnl"], 100)
+        self.assertEqual(compared.loc["2026-07-03", "net_pnl"], 190)
         self.assertEqual(
             compared.loc["2026-07-02", "reconciliation_status"], "待核对"
         )

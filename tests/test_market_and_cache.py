@@ -818,6 +818,56 @@ class MarketAndCacheTests(unittest.TestCase):
         self.assertEqual(latest["铁矿石主连_收盘价"], 729.0)
         self.assertEqual(latest["铁矿石主连_MA20"], 719.5)
 
+    def test_futures_current_contract_ma20_matches_eastmoney_display_rounding(self):
+        closes = [
+            729.5,
+            730.0,
+            730.0,
+            709.5,
+            707.5,
+            692.0,
+            692.0,
+            696.0,
+            707.0,
+            703.0,
+            701.5,
+            707.5,
+            705.5,
+            705.0,
+            710.5,
+            706.5,
+            714.0,
+            712.0,
+            707.0,
+            707.5,
+        ]
+        contract_history = pd.DataFrame(
+            {
+                "trade_date": pd.bdate_range(end="2026-08-21", periods=20),
+                "close": closes,
+            }
+        )
+
+        def load_side_effect(_symbol, source, _data_type):
+            if source == "index_metadata":
+                return pd.DataFrame(
+                    {"index_name": ["铁矿石主连"], "contract": ["I2701"]}
+                ), {}
+            if source == "index_futures_current_contract_history":
+                return contract_history, {}
+            return None, None
+
+        with patch("services.update_tasks.load_dataset", side_effect=load_side_effect):
+            report = build_futures_current_contract_report(
+                "铁矿石主连",
+                contract_history,
+                days=10_000,
+            )
+
+        self.assertIsNotNone(report)
+        latest = report.iloc[-1]
+        self.assertEqual(latest["铁矿石主连_MA20"], 708.67)
+
     def test_futures_main_current_contract_falls_back_when_cache_is_stale(self):
         report_raw = pd.DataFrame(
             {
@@ -1141,7 +1191,6 @@ class MarketAndCacheTests(unittest.TestCase):
         latest_raw = pd.DataFrame(
             {"trade_date": pd.to_datetime(["2026-07-14"]), "close": [102.0]}
         )
-        latest = build_export_df(latest_raw, "测试指数", days=30)
         config = {"source": "akshare_global", "code": "测试指数", "market_group": "日本"}
 
         class ClosedSessionDateTime(datetime):
@@ -1158,9 +1207,10 @@ class MarketAndCacheTests(unittest.TestCase):
         with (
             patch("core.cache.load_dataset", side_effect=load_side_effect),
             patch("core.cache.save_dataset") as save_mock,
-            patch("services.index_ma20.fetch_index_from_source", return_value=latest),
+            patch("services.index_ma20.fetch_index_from_source") as fetch_mock,
             patch("services.index_ma20.datetime", ClosedSessionDateTime),
         ):
+            fetch_mock.return_value = build_export_df(latest_raw, "测试指数", days=30)
             fetch_index_history("测试指数", config, days=10000)
 
         saved_by_source = {call.kwargs["source"]: call.kwargs["df"] for call in save_mock.call_args_list}
@@ -1485,8 +1535,8 @@ class MarketAndCacheTests(unittest.TestCase):
             return None, None
 
         load_dataset_mock.side_effect = load_side_effect
-        fetch_mock.return_value = build_export_df(fetched_raw, "测试指数", days=30)
         with patch("services.index_ma20.datetime", ClosedSessionDateTime):
+            fetch_mock.return_value = build_export_df(fetched_raw, "测试指数", days=30)
             result = fetch_index_report("测试指数", config, "", 30)
 
         self.assertEqual(result.iloc[-1]["测试指数_收盘价"], 102.0)

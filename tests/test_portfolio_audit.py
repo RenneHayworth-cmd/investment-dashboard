@@ -1,3 +1,4 @@
+import inspect
 import tempfile
 import unittest
 from dataclasses import replace
@@ -6,6 +7,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import services.portfolio_audit as portfolio_audit_facade
+import services.portfolio_audit_analysis as portfolio_audit_analysis_facade
+import services.portfolio_audit_analysis_core as portfolio_audit_analysis_core
+import services.portfolio_audit_analysis_full_history as portfolio_audit_analysis_full_history
+import services.portfolio_audit_analysis_missed_orders as portfolio_audit_analysis_missed_orders
+import services.portfolio_audit_engine as portfolio_audit_engine
 from services.portfolio_audit import (
     AuditAllocation,
     AuditSettings,
@@ -53,6 +60,56 @@ def market_frame(
 
 
 class PortfolioAuditTests(unittest.TestCase):
+    def test_split_modules_keep_compatibility_facade_contracts(self):
+        self.assertEqual(
+            list(AuditAllocation.__dataclass_fields__),
+            [
+                "symbol",
+                "name",
+                "weight_pct",
+                "strategy",
+                "ma_period",
+                "threshold_pct",
+                "signal_rule",
+                "atr_k",
+                "sigma_period",
+                "buy_k",
+                "sell_k",
+                "buy_alpha_pct",
+                "sell_alpha_pct",
+            ],
+        )
+        run_signature = inspect.signature(portfolio_audit_facade.run_portfolio_audit)
+        self.assertEqual(
+            list(run_signature.parameters),
+            ["market_data", "allocations", "settings", "blocked_entries"],
+        )
+        self.assertIsNone(run_signature.parameters["settings"].default)
+        self.assertIsNone(run_signature.parameters["blocked_entries"].default)
+        self.assertIsNot(
+            portfolio_audit_facade.run_portfolio_audit,
+            portfolio_audit_engine.run_portfolio_audit_engine,
+        )
+
+        implementation_modules = (
+            portfolio_audit_analysis_core,
+            portfolio_audit_analysis_missed_orders,
+            portfolio_audit_analysis_full_history,
+        )
+        for name in portfolio_audit_analysis_facade.__all__:
+            facade_function = getattr(portfolio_audit_analysis_facade, name)
+            implementation_function = next(
+                getattr(module, name)
+                for module in implementation_modules
+                if hasattr(module, name)
+            )
+            self.assertEqual(
+                inspect.signature(facade_function),
+                inspect.signature(implementation_function),
+                name,
+            )
+            self.assertIsNot(facade_function, implementation_function, name)
+
     def test_normalization_keeps_raw_adjusted_and_official_dividend_separate(self):
         dates = pd.bdate_range("2026-01-01", periods=3)
         raw = pd.DataFrame({"date": dates, "open": [10, 9, 10], "close": [10, 9, 10]})

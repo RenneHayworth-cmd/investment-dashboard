@@ -655,107 +655,84 @@ class LiveTradingTests(unittest.TestCase):
         self.assertTrue(pd.isna(total["valuation_date"]))
 
     def test_live_page_renders_close_based_pnl_curve(self):
-        page_source = (Path(__file__).parents[1] / "pages" / "6_实盘记录.py").read_text(
+        root = Path(__file__).parents[1]
+        page_source = (root / "pages" / "6_实盘记录.py").read_text(encoding="utf-8")
+        valuation_source = (root / "components" / "live_record" / "valuation.py").read_text(
+            encoding="utf-8"
+        )
+        tables_source = (root / "components" / "live_record" / "tables.py").read_text(
+            encoding="utf-8"
+        )
+        history_source = (root / "components" / "live_record" / "history.py").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn('@st.fragment(run_every="120s")', page_source)
-        self.assertIn('st.subheader("每日收盘盈亏")', page_source)
-        self.assertIn('st.subheader(f"每日收盘盈亏（{valuation_date}）")', page_source)
-        self.assertNotIn('("估值日期",', page_source)
-        self.assertIn("build_live_daily_pnl(current_trades, price_histories)", page_source)
-        self.assertIn(
-            "build_live_position_performance(\n        current_trades,",
-            page_source,
-        )
-        self.assertIn("adjust=FUND_ADJUST_NONE", page_source)
-        self.assertIn("network_refresh_due", page_source)
-        self.assertIn('attempt_scope_key = "live_pnl_close_last_scope"', page_source)
-        self.assertIn("refresh_scope=refresh_scope", page_source)
-        self.assertIn("页面将在下次自动检查时联网补齐", page_source)
-        self.assertIn('name="总盈亏"', page_source)
-        self.assertIn('name="累计收益率"', page_source)
-        self.assertIn('st.subheader("收益日历")', page_source)
-        self.assertIn("build_live_daily_returns(daily_pnl)", page_source)
-        self.assertIn(
-            "period_returns = build_live_period_returns(\n"
-            "        daily_returns,\n"
-            "        period=period,\n"
-            "        excluded_dates=holiday_dates,",
-            page_source,
-        )
-        self.assertIn(
-            '"日收益": "day",\n    "周收益": "week",\n    "月收益": "month",\n    "年收益": "year",',
-            page_source,
-        )
-        self.assertIn('LIVE_RETURN_VALUE_OPTIONS = ("收益金额", "收益率")', page_source)
-        self.assertIn(
-            "render_live_return_calendar(daily_pnl, first_trade_date=first_trade_date)",
-            page_source,
+        self.assertLessEqual(len(page_source.splitlines()), 250)
+        self.assertEqual(page_source.count('@st.fragment(run_every="120s")'), 2)
+        self.assertIn("list_trades=list_live_trades", page_source)
+        self.assertIn("load_etf=load_or_fetch_etf", page_source)
+        self.assertLess(
+            page_source.rindex("render_daily_close_pnl()"),
+            page_source.rindex("_render_live_trade_form("),
         )
         self.assertLess(
-            page_source.index(
-                "render_live_return_calendar(daily_pnl, first_trade_date=first_trade_date)"
-            ),
-            page_source.index('figure = make_subplots(specs=[[{"secondary_y": True}]])'),
-        )
-        self.assertIn("当前期间没有完整的正式收盘估值，日历保持空白。", page_source)
-        self.assertIn("grid-template-columns: repeat(5, minmax(88px, 1fr));", page_source)
-        self.assertNotIn("<div>六</div>", page_source)
-        self.assertNotIn("<div>日</div>", page_source)
-        self.assertIn("build_live_return_month_grid(selected_year, selected_month)", page_source)
-        self.assertIn("get_market_holiday_label(a_share_market, calendar_date)", page_source)
-        self.assertIn("live-return-holiday-name", page_source)
-        self.assertIn("rgb(190, 18, 60)", page_source)
-        self.assertIn("rgb(22, 101, 52)", page_source)
-        self.assertIn("不包含账户未投资现金", page_source)
-        self.assertNotIn("上证指数", page_source)
-        self.assertIn('"现价",', page_source)
-        self.assertIn('"市值",', page_source)
-        self.assertIn('"成本",', page_source)
-        self.assertIn('"当日盈亏",', page_source)
-        self.assertIn('"累计盈亏",', page_source)
-        self.assertIn('"累计盈亏",\n        "仓位",', page_source)
-        self.assertIn(
-            '"代码",\n        "市值",\n        "现价",\n        "持仓数量",',
-            page_source,
-        )
-        self.assertIn("format_live_number(row.average_cost, 3)", page_source)
-        self.assertIn("pnl_cell(row.daily_pnl, row.daily_return_pct)", page_source)
-        self.assertIn(
-            "pnl_cell(row.cumulative_pnl, row.cumulative_return_pct)",
-            page_source,
-        )
-        self.assertIn("render_live_positions_table(position_performance)", page_source)
-        self.assertIn("float(market_value) / float(total_market_value) * 100", page_source)
-        self.assertIn('"<td>100.00%</td>"', page_source)
-        self.assertIn('live-total-label">合计</td>', page_source)
-        self.assertNotIn("¥", page_source)
-        self.assertIn("收盘价更新失败，当前继续使用本地缓存", page_source)
-        self.assertIn("页面保持打开时将在10分钟后重试", page_source)
-        self.assertIn('failure_state_key = "live_pnl_close_failures"', page_source)
-        self.assertIn("st.session_state.pop(failure_state_key, None)", page_source)
-        self.assertIn('st.subheader("历史盈亏")', page_source)
-        self.assertIn("build_live_symbol_pnl_history(all_trades, price_histories)", page_source)
-        self.assertIn("append_live_symbol_pnl_total(", page_source)
-        self.assertIn("render_live_symbol_history_table(history_display)", page_source)
-        self.assertIn("text-align: center", page_source)
-        self.assertIn("live-symbol-history-total", page_source)
-        self.assertIn("background: rgba(49, 51, 63, 0.035)", page_source)
-        self.assertIn("color: rgb(190, 18, 60)", page_source)
-        self.assertIn("color: rgb(22, 101, 52)", page_source)
-        self.assertIn("包含当前持仓和已清仓标的", page_source)
-        self.assertGreater(
+            page_source.rindex("_render_live_trade_details("),
             page_source.rindex("render_live_symbol_pnl_history()"),
-            page_source.index('st.subheader("成交明细")'),
         )
-        warning_position = page_source.index("if update_failures:")
+
+        self.assertIn('st.subheader("每日收盘盈亏")', valuation_source)
+        self.assertIn('st.subheader(f"每日收盘盈亏（{valuation_date}）")', valuation_source)
+        self.assertIn("build_daily_pnl(current_trades, price_histories)", valuation_source)
+        self.assertIn("build_position_performance(\n        current_trades,", valuation_source)
+        self.assertIn("adjust=adjustment", valuation_source)
+        self.assertIn("adjustment=FUND_ADJUST_NONE", page_source)
+        self.assertIn('attempt_scope_key = "live_pnl_close_last_scope"', valuation_source)
+        self.assertIn("refresh_scope=refresh_scope", valuation_source)
+        self.assertIn("页面将在下次自动检查时联网补齐", valuation_source)
+        self.assertIn('name="总盈亏"', valuation_source)
+        self.assertIn('name="累计收益率"', valuation_source)
+        self.assertIn("build_daily_returns(daily_pnl)", valuation_source)
+        self.assertIn("不包含账户未投资现金", valuation_source)
+        self.assertIn("render_calendar(daily_pnl, first_trade_date=first_trade_date)", valuation_source)
         self.assertLess(
-            page_source.index("收盘价更新失败", warning_position),
-            page_source.index(
+            valuation_source.index(
+                "render_calendar(daily_pnl, first_trade_date=first_trade_date)"
+            ),
+            valuation_source.index('figure = make_subplots(specs=[[{"secondary_y": True}]])'),
+        )
+        self.assertIn("收盘价更新失败，当前继续使用本地缓存", valuation_source)
+        self.assertIn("页面保持打开时将在10分钟后重试", valuation_source)
+        self.assertIn('failure_state_key = "live_pnl_close_failures"', valuation_source)
+        self.assertIn("st.session_state.pop(failure_state_key, None)", valuation_source)
+        warning_position = valuation_source.index("if update_failures:")
+        self.assertLess(
+            valuation_source.index("收盘价更新失败", warning_position),
+            valuation_source.index(
                 'st.subheader("当前实盘持仓")', warning_position
             ),
         )
+
+        self.assertIn('"累计盈亏",\n        "仓位",', tables_source)
+        self.assertIn("format_live_number(row.average_cost, 3)", tables_source)
+        self.assertIn("pnl_cell(row.daily_pnl, row.daily_return_pct)", tables_source)
+        self.assertIn("float(market_value) / float(total_market_value) * 100", tables_source)
+        self.assertIn('"<td>100.00%</td>"', tables_source)
+        self.assertIn('live-total-label">合计</td>', tables_source)
+        self.assertIn("live-symbol-history-total", tables_source)
+        self.assertIn("text-align: center", tables_source)
+        self.assertIn("color: rgb(190, 18, 60)", tables_source)
+        self.assertIn("color: rgb(22, 101, 52)", tables_source)
+        self.assertNotIn("¥", tables_source)
+
+        self.assertIn('st.subheader("历史盈亏")', history_source)
+        self.assertIn("build_history(all_trades, price_histories)", history_source)
+        self.assertIn("append_total(build_history", history_source)
+        self.assertIn("render_history_table(history_display)", history_source)
+        self.assertIn("包含当前持仓和已清仓标的", history_source)
+
+        # 被后一个同名函数覆盖的旧收益日历实现已经删除，继续复用共享日历。
+        self.assertNotIn("def _live_return_tile", page_source + valuation_source)
+        self.assertNotIn("build_live_period_returns", page_source + valuation_source)
 
 
 if __name__ == "__main__":

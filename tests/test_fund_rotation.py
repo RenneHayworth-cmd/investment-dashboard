@@ -1,8 +1,10 @@
+import inspect
 import unittest
 
 import numpy as np
 import pandas as pd
 
+import services.fund_rotation as fund_rotation_service
 from services.fund_rotation import (
     EXECUTION_AFTER_CLOSE,
     EXECUTION_NEXT_OPEN,
@@ -25,6 +27,114 @@ from services.fund_rotation import (
 
 
 class FundRotationTests(unittest.TestCase):
+    def test_compatibility_facade_keeps_existing_exports_and_signatures(self):
+        expected_exports = {
+            "DATE_COLUMNS",
+            "PRICE_COLUMNS",
+            "OPEN_COLUMNS",
+            "BUY_SLIPPAGE",
+            "SELL_SLIPPAGE",
+            "LOT_SIZE",
+            "STANDARD_BACKTEST_PERIODS",
+            "EXECUTION_AFTER_CLOSE",
+            "EXECUTION_NEXT_OPEN",
+            "EXECUTION_MODES",
+            "PORTFOLIO_STRATEGY_HOLD",
+            "PORTFOLIO_STRATEGY_TIMING",
+            "PORTFOLIO_STRATEGY_HALF_TIMING",
+            "PORTFOLIO_STRATEGY_CASH",
+            "PORTFOLIO_STRATEGIES",
+            "RotationInput",
+            "RotationResult",
+            "TimingBacktestResult",
+            "PortfolioTimingAllocation",
+            "PortfolioTimingResult",
+            "normalize_rotation_dataframe",
+            "build_standard_backtest_periods",
+            "run_ma20_timing_backtest",
+            "run_portfolio_timing_backtest",
+            "run_fund_rotation_backtest",
+            "_normalize_date_range",
+            "_find_column",
+            "_first_text",
+            "_prepare_merged_data",
+            "_get_start_date",
+            "_align_rebalance_start",
+            "_find_valid_date",
+            "_next_rebalance_date",
+            "_build_rebalance_dates",
+            "_build_rotation_plan",
+            "_find_tradeable_date",
+            "_calculate_momentum",
+            "_select_top_symbols",
+            "_row_price",
+            "_trade_price",
+            "_has_execution_price",
+            "_execution_mode_label",
+            "_trade_lot_size",
+            "_trade_uses_slippage",
+            "_round_lot_shares",
+            "_portfolio_value",
+            "_holding_amount_detail",
+            "_calculate_drawdown",
+            "_calculate_individual_results",
+            "_calculate_individual_nav_data",
+            "_calculate_yearly_stats",
+            "_calculate_sharpe_ratio",
+            "_calculate_nav_returns",
+            "_calculate_trade_win_stats",
+            "_build_summary",
+            "_build_timing_summary",
+        }
+
+        self.assertEqual(set(fund_rotation_service.__all__), expected_exports)
+        self.assertEqual(RotationInput.__module__, "services.fund_rotation")
+        self.assertEqual(PortfolioTimingAllocation.__module__, "services.fund_rotation")
+        self.assertEqual(
+            str(inspect.signature(fund_rotation_service.normalize_rotation_dataframe)),
+            "(df: 'pd.DataFrame', fallback_name: 'str') -> 'RotationInput'",
+        )
+        self.assertEqual(
+            str(inspect.signature(fund_rotation_service.build_standard_backtest_periods)),
+            (
+                "(end_date: 'str | pd.Timestamp') -> "
+                "'list[tuple[str, pd.Timestamp | None]]'"
+            ),
+        )
+        self.assertEqual(
+            str(inspect.signature(fund_rotation_service.run_ma20_timing_backtest)),
+            (
+                "(fund: 'RotationInput', ma_period: 'int' = 20, "
+                "threshold_pct: 'float' = 0.0, initial_capital: 'float' = 100000.0, "
+                "transaction_cost: 'float' = 6e-05, lot_size: 'int' = 100, "
+                "start_date: 'str | pd.Timestamp | None' = None, "
+                "end_date: 'str | pd.Timestamp | None' = None) -> 'TimingBacktestResult'"
+            ),
+        )
+        self.assertEqual(
+            str(inspect.signature(fund_rotation_service.run_portfolio_timing_backtest)),
+            (
+                "(funds: 'list[RotationInput]', "
+                "allocations: 'list[PortfolioTimingAllocation]', "
+                "initial_capital: 'float' = 100000.0, "
+                "transaction_cost: 'float' = 6e-05, lot_size: 'int' = 100, "
+                "start_date: 'str | pd.Timestamp | None' = None, "
+                "end_date: 'str | pd.Timestamp | None' = None) "
+                "-> 'PortfolioTimingResult'"
+            ),
+        )
+        self.assertEqual(
+            str(inspect.signature(fund_rotation_service.run_fund_rotation_backtest)),
+            (
+                "(funds: 'list[RotationInput]', frequency: 'str' = 'week', "
+                "lookback_period: 'int' = 22, num_positions: 'int' = 1, "
+                "initial_capital: 'float' = 100000.0, transaction_cost: 'float' = 6e-05, "
+                "start_date: 'str | pd.Timestamp | None' = None, "
+                "end_date: 'str | pd.Timestamp | None' = None, "
+                "execution_mode: 'str' = 'after_close') -> 'RotationResult'"
+            ),
+        )
+
     def test_portfolio_timing_rejects_weights_above_one_hundred_percent(self):
         dates = pd.bdate_range("2026-01-01", periods=5)
         fund = RotationInput(
