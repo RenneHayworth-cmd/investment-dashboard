@@ -29,6 +29,7 @@ from services.index_update_models import (
 )
 
 from services.index_frames import extract_raw_from_export_df
+from services.index_sources_sina import fetch_hsi_official_completed_close
 
 def _verification_report(
     index_name: str,
@@ -47,6 +48,11 @@ def _verification_report(
         yahoo_symbol = "^VIX"
     elif index_name == "恒生科技":
         yahoo_symbol = "^HSTECH"
+    elif index_name == "恒生港股通高息低波":
+        official_row = fetch_hsi_official_completed_close("hshylv")
+        if official_row is None or official_row.empty:
+            return None, "恒生指数公司官方收盘"
+        return build_export_df(official_row, index_name, days=days), "恒生指数公司官方收盘"
     if yahoo_symbol:
         return get_index_data_from_yahoo(yahoo_symbol, index_name, days=days), "Yahoo Finance 日线"
     return None, "暂无独立日线复核源"

@@ -24,6 +24,8 @@ from services.market_calendar import (
     latest_settled_trade_date,
     previous_trading_day,
 )
+from services.index_sources_sina import fetch_sina_hk_realtime_quote
+from services.index_sources_mx import fetch_mx_realtime_quote
 
 
 EASTMONEY_QUOTE_SECIDS = {
@@ -498,6 +500,8 @@ def index_update_source_labels(index_name: str, *, tickflow_enabled: bool = True
         verifier = "Yahoo Finance 日线"
     elif index_name == "恒生科技":
         verifier = "Yahoo Finance 日线"
+    elif index_name == "恒生港股通高息低波":
+        verifier = "恒生指数公司官方收盘"
     else:
         verifier = "暂无独立日线复核源"
     return primary, verifier
@@ -582,6 +586,10 @@ def _normalize_timestamp(value, timezone_name: str) -> datetime:
 
 
 def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | None:
+    if index_name == "恒生港股通高息低波":
+        sina_quote = fetch_sina_hk_realtime_quote("HSHYLV")
+        if sina_quote is not None:
+            return sina_quote
     import requests
 
     config = INDEX_CONFIG.get(index_name, {})
@@ -632,6 +640,16 @@ def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | N
                 "quote_time": quote_time,
                 "source": "东方财富",
             }
+    if index_name == "恒生港股通高息低波":
+        config = INDEX_CONFIG[index_name]
+        try:
+            return fetch_mx_realtime_quote(
+                str(config["mx_query_name"]),
+                str(config["mx_expected_code"]),
+                "港股",
+            )
+        except Exception:
+            return None
     return None
 
 

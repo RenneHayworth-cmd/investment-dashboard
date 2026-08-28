@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import calendar
+import json
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -106,6 +108,17 @@ FUTURES_EXCHANGES = {
 }
 
 SPREAD_CALCULATION_VERSION = "futures_spread_v2"
+logger = logging.getLogger(__name__)
+
+_SINA_FUTURES_SPOT_URL = "https://hq.sinajs.cn/list=nf_{contract}"
+_SINA_FUTURES_DAILY_URL = (
+    "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/"
+    "var%20_V21052021_4_12=/InnerFuturesNewService.getDailyKLine"
+)
+_SINA_HEADERS = {
+    "Referer": "https://vip.stock.finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0",
+}
 
 
 def parse_contracts(text: str) -> list[str]:
@@ -249,6 +262,87 @@ def _spot_market_for_contract(contract: str) -> str:
     return "CFFEX" if exchange == "CFX" else "CF"
 
 
+def _sina_get_without_environment_proxy(
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+):
+    """Use the same Sina source without inheriting a dead desktop proxy."""
+    import requests
+
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        url,
+        params=params,
+        headers=_SINA_HEADERS,
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response
+
+
+def _fetch_futures_spot_from_sina_direct(contract: str) -> pd.DataFrame:
+    contract = contract.strip().upper()
+    response = _sina_get_without_environment_proxy(
+        _SINA_FUTURES_SPOT_URL.format(contract=contract)
+    )
+    text = response.content.decode("gb18030", errors="replace")
+    match = re.search(
+        rf'hq_str_nf_{re.escape(contract)}="([^"]*)"',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match is None or not match.group(1):
+        raise ValueError("新浪期货实时接口未返回合约数据")
+
+    values = match.group(1).split(",")
+    if _spot_market_for_contract(contract) == "CFFEX":
+        price_index, date_index, time_index = 3, 36, 37
+    else:
+        price_index, date_index, time_index = 8, 17, 1
+    if len(values) <= max(price_index, date_index, time_index):
+        raise ValueError("新浪期货实时接口字段数量异常")
+
+    return pd.DataFrame(
+        [
+            {
+                "current_price": values[price_index],
+                "quote_date": values[date_index],
+                "quote_time": values[time_index],
+            }
+        ]
+    )
+
+
+def _fetch_futures_daily_from_sina_direct(contract: str) -> pd.DataFrame:
+    response = _sina_get_without_environment_proxy(
+        _SINA_FUTURES_DAILY_URL,
+        params={"symbol": contract.strip().upper(), "type": "2021_04_12"},
+    )
+    text = response.text
+    if "=(" not in text or ");" not in text:
+        raise ValueError("新浪期货日线接口响应格式异常")
+    payload = json.loads(text.split("=(", 1)[1].split(");", 1)[0])
+    raw = pd.DataFrame(payload)
+    if raw.empty:
+        raise ValueError("新浪期货日线接口返回空数据")
+    if {"d", "c"}.issubset(raw.columns):
+        raw = raw.rename(columns={"d": "date", "c": "close"})
+    elif len(raw.columns) == 8:
+        raw.columns = [
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "hold",
+            "settle",
+        ]
+    return normalize_futures_daily(raw)
+
+
 def append_futures_spot_row(
     df: pd.DataFrame,
     contract: str,
@@ -283,8 +377,17 @@ def append_futures_spot_row(
             market=_spot_market_for_contract(contract),
             adjust="0",
         )
-    except Exception:
-        return result
+    except Exception as akshare_exc:
+        try:
+            spot_df = _fetch_futures_spot_from_sina_direct(contract)
+        except Exception as direct_exc:
+            logger.warning(
+                "期货实时行情获取失败，合约=%s，AkShare=%s，新浪直连=%s",
+                contract,
+                akshare_exc,
+                direct_exc,
+            )
+            return result
 
     if spot_df is None or spot_df.empty:
         return result
@@ -296,6 +399,13 @@ def append_futures_spot_row(
             break
     if price_col is None:
         return result
+
+    if "quote_date" in spot_df.columns:
+        quote_date = pd.to_datetime(
+            spot_df.iloc[0]["quote_date"], errors="coerce"
+        )
+        if pd.isna(quote_date) or quote_date.normalize() != today:
+            return result
 
     latest_price = pd.to_numeric(spot_df.iloc[0][price_col], errors="coerce")
     if pd.isna(latest_price) or latest_price <= 0:
@@ -344,8 +454,16 @@ def fetch_futures_daily_from_tickflow(contract: str, api_key: str = "") -> pd.Da
 def fetch_futures_daily_from_akshare(contract: str) -> pd.DataFrame:
     import akshare as ak
 
-    df = ak.futures_zh_daily_sina(symbol=contract)
-    return normalize_futures_daily(df)
+    try:
+        df = ak.futures_zh_daily_sina(symbol=contract)
+        return normalize_futures_daily(df)
+    except Exception as akshare_exc:
+        try:
+            return _fetch_futures_daily_from_sina_direct(contract)
+        except Exception as direct_exc:
+            raise RuntimeError(
+                f"AkShare期货日线失败：{akshare_exc}；新浪直连失败：{direct_exc}"
+            ) from direct_exc
 
 
 def fetch_futures_daily(

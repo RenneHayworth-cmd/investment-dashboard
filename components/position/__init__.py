@@ -33,6 +33,7 @@ from components.position.formatting import (
     round_numeric_columns,
 )
 from components.position.realtime import render_etf_timing_section_impl
+from components.position.performance import render_position_timing_performance
 
 __all__ = [
     "build_overview_table",
@@ -58,6 +59,7 @@ __all__ = [
     "render_position_cards",
     "render_position_detail",
     "render_position_page",
+    "render_position_timing_performance",
     "render_spread_detail",
     "render_summary_table",
     "rolling_annual_label",

@@ -101,6 +101,7 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
 
     adjust_map = fund.FUND_ADJUSTMENT_OPTIONS
     etf_codes = position.parse_position_codes(etf_text)
+    quote_codes = sorted(set(etf_codes))
     futures_codes = position.parse_position_codes(futures_text)
     spread_groups = position.parse_spread_groups(spread_text)
     allow_fetch = bool(update_clicked)
@@ -134,14 +135,14 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     intraday_quote_error = ""
     if intraday_quote_mode:
         try:
-            intraday_quotes = position.fetch_tickflow_etf_quotes(
-                etf_codes,
+            intraday_quotes = position.refresh_runtime_etf_quotes(
+                quote_codes,
                 api_key=api_key,
                 market_now=market_now,
             )
             missing_quote_codes = [
                 code
-                for code in etf_codes
+                for code in quote_codes
                 if position.normalize_etf_base_code(code) not in intraday_quotes
             ]
             if missing_quote_codes:
@@ -242,13 +243,6 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         )
 
     overview_df = build_overview_table(items)
-    selected_key = get_query_position_detail(items)
-    selected_item = next(
-        (item for item in items if position_key(item) == selected_key), None
-    )
-    if selected_item is not None:
-        render_position_detail(selected_item)
-
     available_count = sum(
         1
         for item in items
@@ -267,15 +261,23 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "-"
     )
 
-    st.subheader(f"持仓摘要 · {latest_date_text}")
+    st.subheader(f"分析数据状态 · {latest_date_text}")
     status_cols = st.columns(4)
-    status_cols[0].metric("持仓标的", len(items))
+    status_cols[0].metric("分析标的", len(items))
     status_cols[1].metric("可用数据", available_count)
     status_cols[2].metric("缺失缓存", missing_count)
     status_cols[3].metric("获取失败", failed_count)
 
+    selected_key = get_query_position_detail(items)
+    selected_item = next(
+        (item for item in items if position_key(item) == selected_key), None
+    )
+    if selected_item is not None:
+        render_position_detail(selected_item)
+
     timing_renderer(
         etf_codes,
+        quote_codes=quote_codes,
         position_items=items,
         show_cache_caption=not update_clicked,
         api_key=api_key,

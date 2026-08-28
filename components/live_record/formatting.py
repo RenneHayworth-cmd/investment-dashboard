@@ -4,6 +4,8 @@ import pandas as pd
 
 
 def money(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "-"
     return f"{float(value):,.2f}"
 
 

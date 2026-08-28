@@ -40,7 +40,7 @@ def render_live_trade_form(
 ) -> None:
     st.subheader("新增成交")
     with st.form("live_trade_form", clear_on_submit=True):
-        row1 = st.columns([1.1, 1, 1.6, 1])
+        row1 = st.columns([1.1, 1.2, 1, 1.6, 1])
         with row1[0]:
             trade_date = st.date_input(
                 "成交日期",
@@ -51,10 +51,17 @@ def render_live_trade_form(
                 ),
             )
         with row1[1]:
-            side = st.selectbox("成交方向", ["买入", "卖出"])
+            record_trade_time = st.checkbox("记录成交时间", value=False)
+            trade_time = st.time_input(
+                "成交时间",
+                value=datetime.now(ZoneInfo("Asia/Shanghai")).time().replace(microsecond=0),
+                disabled=not record_trade_time,
+            )
         with row1[2]:
-            symbol = st.text_input("代码", placeholder="例如：159501")
+            side = st.selectbox("成交方向", ["买入", "卖出"])
         with row1[3]:
+            symbol = st.text_input("代码", placeholder="例如：159501")
+        with row1[4]:
             quantity = st.number_input("数量", min_value=0, value=0, step=100)
 
         row2 = st.columns([1.4, 1, 1, 2])
@@ -85,6 +92,7 @@ def render_live_trade_form(
         try:
             add_trade(
                 trade_date=trade_date,
+                trade_time=trade_time if record_trade_time else None,
                 symbol=symbol,
                 name=name,
                 side=side,
@@ -105,8 +113,11 @@ def render_live_trade_details(
     *,
     enrich_trades=enrich_live_trades,
     delete_trade=delete_live_trade,
+    title: str = "成交明细",
+    allow_delete: bool = True,
+    show_download: bool = True,
 ) -> None:
-    st.subheader("成交明细")
+    st.subheader(title)
     if trades.empty:
         st.info("暂无成交记录。")
         return
@@ -115,6 +126,7 @@ def render_live_trade_details(
         columns={
             "id": "记录ID",
             "trade_date": "成交日期",
+            "trade_time": "成交时间",
             "symbol": "代码",
             "name": "标的名称",
             "side": "方向",
@@ -124,6 +136,7 @@ def render_live_trade_details(
             "gross_amount": "成交金额",
             "fee_amount": "手续费",
             "cash_amount": "实际收付金额",
+            "realized_pnl": "本次已实现盈亏",
             "strategy": "策略说明",
             "notes": "备注",
             "created_at": "记录时间",
@@ -133,6 +146,7 @@ def render_live_trade_details(
         [
             "记录ID",
             "成交日期",
+            "成交时间",
             "代码",
             "标的名称",
             "方向",
@@ -142,6 +156,7 @@ def render_live_trade_details(
             "成交金额",
             "手续费",
             "实际收付金额",
+            "本次已实现盈亏",
             "策略说明",
             "备注",
         ]
@@ -157,29 +172,39 @@ def render_live_trade_details(
             "成交金额": st.column_config.NumberColumn(format="%.2f"),
             "手续费": st.column_config.NumberColumn(format="%.2f"),
             "实际收付金额": st.column_config.NumberColumn(format="%.2f"),
+            "本次已实现盈亏": st.column_config.NumberColumn(format="%.2f"),
         },
     )
-    st.download_button(
-        "导出成交记录",
-        data=detail.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-        file_name="实盘成交记录.csv",
-        mime="text/csv",
-    )
+    if show_download:
+        st.download_button(
+            "导出成交记录",
+            data=detail.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
+            file_name="实盘成交记录.csv",
+            mime="text/csv",
+        )
 
+    if not allow_delete:
+        return
     with st.expander("删除误录记录"):
-        trade_options = {
-            int(row.id): (
-                f"#{int(row.id)}｜{row.trade_date}｜{row.symbol}｜{row.side} "
-                f"{int(row.quantity)}份 @ {float(row.price):.3f}"
+        trade_options = {}
+        for row in trades.itertuples(index=False):
+            raw_trade_time = getattr(row, "trade_time", None)
+            trade_time_text = "" if pd.isna(raw_trade_time) else str(raw_trade_time)
+            trade_options[int(row.id)] = (
+                f"#{int(row.id)}｜{row.trade_date} {trade_time_text}｜"
+                f"{row.symbol}｜{row.side} {int(row.quantity)}份 @ {float(row.price):.3f}"
             )
-            for row in trades.itertuples(index=False)
-        }
         selected_id = st.selectbox(
             "选择记录",
             options=list(trade_options),
             format_func=trade_options.get,
         )
-        if st.button("删除所选记录", type="secondary"):
+        confirmed = st.checkbox(
+            "确认删除所选成交记录",
+            value=False,
+            key=f"live_trade_delete_confirm_{selected_id}",
+        )
+        if st.button("删除所选记录", type="secondary", disabled=not confirmed):
             try:
                 if delete_trade(int(selected_id)):
                     st.success("记录已删除。")

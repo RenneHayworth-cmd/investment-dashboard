@@ -9,6 +9,7 @@ import pandas as pd
 from services.index_ma20 import INDEX_CONFIG
 from services.index_realtime import (
     _daily_update_target,
+    _fetch_eastmoney_quote,
     _futures_market_is_open,
     _fetch_futures_quote,
     _infer_main_contract_symbol,
@@ -29,6 +30,56 @@ from services.index_realtime import (
 
 
 class IndexRealtimeTests(unittest.TestCase):
+    def test_only_hshylv_enables_miaoxiang_backup_after_entity_audit(self):
+        self.assertEqual(INDEX_CONFIG["恒生港股通高息低波"]["mx_expected_code"], "HSHYLV.HI")
+        self.assertNotIn("mx_expected_code", INDEX_CONFIG["微盘股"])
+
+    @patch("services.index_realtime.fetch_mx_realtime_quote")
+    @patch("services.index_realtime.fetch_sina_hk_realtime_quote", return_value=None)
+    @patch("requests.Session")
+    def test_hshylv_realtime_uses_miaoxiang_after_sina_and_eastmoney_fail(
+        self,
+        session_factory,
+        _sina_quote_mock,
+        mx_quote_mock,
+    ):
+        class FailedSession:
+            trust_env = False
+
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError("东方财富不可用")
+
+        session_factory.return_value = FailedSession()
+        mx_quote_mock.return_value = {
+            "price": 4357.89,
+            "previous_close": 4351.97,
+            "change_pct": 0.136,
+            "quote_time": datetime(2026, 8, 25, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+            "source": "东方财富妙想",
+        }
+
+        result = _fetch_eastmoney_quote("恒生港股通高息低波", "124.HSHYLV")
+
+        self.assertEqual(result["source"], "东方财富妙想")
+        mx_quote_mock.assert_called_once()
+
+    @patch("services.index_realtime.fetch_sina_hk_realtime_quote")
+    def test_hshylv_realtime_prefers_sina_quote(self, sina_quote_mock):
+        quote_time = datetime(2026, 8, 25, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        sina_quote_mock.return_value = {
+            "price": 4357.89,
+            "previous_close": 4351.97,
+            "change_pct": 0.136,
+            "quote_time": quote_time,
+            "source": "新浪财经",
+        }
+
+        result = _fetch_eastmoney_quote("恒生港股通高息低波", "124.HSHYLV")
+
+        self.assertEqual(result["price"], 4357.89)
+        self.assertEqual(result["source"], "新浪财经")
+        sina_quote_mock.assert_called_once_with("HSHYLV")
+
     @patch("services.index_realtime.missing_recent_market_trade_dates", return_value=[])
     @patch("services.index_realtime.load_dataset")
     @patch("services.index_realtime._daily_update_target")

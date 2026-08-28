@@ -15,12 +15,14 @@ from components.position.cards_tables import (
     render_position_cards,
 )
 from components.position.formatting import position_key
+from components.position.performance import render_position_timing_performance
 from services import position_analysis as position
 
 
 def render_etf_timing_section_impl(
     etf_codes: list[str],
     *,
+    quote_codes: list[str] | None = None,
     position_items: list[position.PositionItem],
     show_cache_caption: bool,
     api_key: str,
@@ -33,6 +35,7 @@ def render_etf_timing_section_impl(
     value_formatter: Callable[[str, object], str],
 ) -> None:
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    quote_codes = sorted(set(quote_codes or etf_codes))
     formal_items = [
         position.load_or_fetch_etf(
             code,
@@ -135,8 +138,8 @@ def render_etf_timing_section_impl(
             if api_key:
                 previous_quotes = morning_quotes
                 try:
-                    morning_quotes = position.fetch_tickflow_etf_quotes(
-                        etf_codes,
+                    morning_quotes = position.refresh_runtime_etf_quotes(
+                        quote_codes,
                         api_key=api_key,
                         market_now=market_now,
                     )
@@ -213,8 +216,8 @@ def render_etf_timing_section_impl(
         if api_key:
             previous_quotes = lunch_quotes
             try:
-                lunch_quotes = position.fetch_tickflow_etf_quotes(
-                    etf_codes,
+                lunch_quotes = position.refresh_runtime_etf_quotes(
+                    quote_codes,
                     api_key=api_key,
                     market_now=market_now,
                 )
@@ -279,8 +282,8 @@ def render_etf_timing_section_impl(
                     preview_state.get("quotes", {}) if same_preview_date else {}
                 )
                 try:
-                    realtime_quotes = position.fetch_tickflow_etf_quotes(
-                        etf_codes,
+                    realtime_quotes = position.refresh_runtime_etf_quotes(
+                        quote_codes,
                         api_key=api_key,
                         market_now=market_now,
                     )
@@ -520,3 +523,5 @@ def render_etf_timing_section_impl(
             value_formatter=value_formatter,
         )
     st.caption("依据正式收盘日线计算；盘中实时报价不参与，展示窗口以最新正式交易日为截止日。")
+
+    render_position_timing_performance(formal_items)

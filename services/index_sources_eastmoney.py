@@ -10,14 +10,19 @@ from services.index_config import (
     YAHOO_CHART_HOSTS, YAHOO_REQUEST_GATE,
 )
 from services.index_frames import (
-    build_export_df, extract_raw_from_export_df, filter_market_trading_dates,
-    is_sparse_daily_history, merge_newer_index_rows, merge_raw_index_data,
-    normalize_akshare_index_df,
+    build_export_df, extract_raw_from_export_df, filter_completed_market_dates,
+    filter_market_trading_dates, is_sparse_daily_history, merge_newer_index_rows,
+    merge_raw_index_data, normalize_akshare_index_df,
 )
 from services.market_calendar import (
     expected_latest_trade_date, get_market_window, is_market_holiday,
     is_market_trading_day, latest_completed_trade_date, latest_settled_trade_date,
 )
+from services.index_sources_sina import (
+    fetch_hsi_official_completed_close,
+    get_sina_hk_index_history,
+)
+from services.index_sources_mx import get_mx_index_history
 
 def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
@@ -276,6 +281,10 @@ def get_index_data_from_eastmoney_kline(
     fqt: str = "0",
     akshare_board_symbol: str | None = None,
     akshare_hk_em_symbol: str | None = None,
+    sina_hk_symbol: str | None = None,
+    hsi_official_series: str | None = None,
+    mx_query_name: str | None = None,
+    mx_expected_code: str | None = None,
 ) -> pd.DataFrame | None:
     import requests
 
@@ -329,6 +338,10 @@ def get_index_data_from_eastmoney_kline(
             board_symbol=akshare_board_symbol,
             hk_em_symbol=akshare_hk_em_symbol,
             last_error=last_error,
+            sina_hk_symbol=sina_hk_symbol,
+            hsi_official_series=hsi_official_series,
+            mx_query_name=mx_query_name,
+            mx_expected_code=mx_expected_code,
         )
     data = payload.get("data") or {}
     klines = data.get("klines") or []
@@ -352,6 +365,10 @@ def get_index_data_from_eastmoney_kline(
             board_symbol=akshare_board_symbol,
             hk_em_symbol=akshare_hk_em_symbol,
             last_error=last_error,
+            sina_hk_symbol=sina_hk_symbol,
+            hsi_official_series=hsi_official_series,
+            mx_query_name=mx_query_name,
+            mx_expected_code=mx_expected_code,
         )
     df = normalize_akshare_index_df(pd.DataFrame(rows))
     import akshare as ak
@@ -363,7 +380,66 @@ def get_index_data_from_eastmoney_kline(
         board_symbol=akshare_board_symbol,
         hk_em_symbol=akshare_hk_em_symbol,
     )
+    df = _supplement_hk_independent_rows(
+        df,
+        sina_hk_symbol=sina_hk_symbol,
+        hsi_official_series=hsi_official_series,
+        mx_query_name=mx_query_name,
+        mx_expected_code=mx_expected_code,
+        days=days,
+    )
     return build_export_df(df, index_name, days=days)
+
+
+def _supplement_hk_independent_rows(
+    df: pd.DataFrame,
+    *,
+    sina_hk_symbol: str | None,
+    hsi_official_series: str | None,
+    mx_query_name: str | None = None,
+    mx_expected_code: str | None = None,
+    days: int = 30,
+) -> pd.DataFrame:
+    normalized = normalize_akshare_index_df(df)
+    normalized = filter_completed_market_dates(normalized, "港股")
+    market = get_market_window("港股")
+    market_now = datetime.now(ZoneInfo(market.timezone)) if market is not None else None
+    target_date = (
+        latest_settled_trade_date(market, market_now) if market is not None else None
+    )
+
+    def needs_target() -> bool:
+        dates = pd.to_datetime(normalized["trade_date"], errors="coerce").dropna()
+        return target_date is not None and (dates.empty or dates.max().date() < target_date)
+
+    if sina_hk_symbol and needs_target():
+        try:
+            sina_raw = get_sina_hk_index_history(sina_hk_symbol, now=market_now)
+            normalized = merge_newer_index_rows(normalized, sina_raw)
+        except Exception:
+            pass
+    if mx_query_name and mx_expected_code and needs_target():
+        try:
+            mx_raw = get_mx_index_history(
+                mx_query_name,
+                mx_expected_code,
+                "港股",
+                days=days,
+                now=market_now,
+            )
+            normalized = merge_newer_index_rows(normalized, mx_raw)
+        except Exception:
+            pass
+    if hsi_official_series and needs_target():
+        try:
+            official_row = fetch_hsi_official_completed_close(
+                hsi_official_series,
+                now=market_now,
+            )
+            normalized = merge_newer_index_rows(normalized, official_row)
+        except Exception:
+            pass
+    return normalized
 
 def get_index_data_from_akshare_eastmoney_fallback(
     secid: str,
@@ -373,11 +449,47 @@ def get_index_data_from_akshare_eastmoney_fallback(
     board_symbol: str | None,
     hk_em_symbol: str | None,
     last_error: Exception | None,
+    sina_hk_symbol: str | None = None,
+    hsi_official_series: str | None = None,
+    mx_query_name: str | None = None,
+    mx_expected_code: str | None = None,
 ) -> pd.DataFrame | None:
     import akshare as ak
 
     start_date = (datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d")
     end_date = "20500101"
+    independent_errors: list[str] = []
+    independent_raw: pd.DataFrame | None = None
+    if sina_hk_symbol:
+        try:
+            sina_raw = get_sina_hk_index_history(sina_hk_symbol)
+            if sina_raw is not None and not sina_raw.empty:
+                independent_raw = sina_raw
+        except Exception as exc:
+            independent_errors.append(f"新浪日线失败：{exc}")
+    required_rows = min(max(int(days), 30), 252)
+    if mx_query_name and mx_expected_code and (
+        independent_raw is None or len(independent_raw) < required_rows
+    ):
+        try:
+            mx_raw = get_mx_index_history(
+                mx_query_name,
+                mx_expected_code,
+                "港股",
+                days=days,
+            )
+            independent_raw = merge_raw_index_data(mx_raw, independent_raw) if independent_raw is not None else mx_raw
+        except Exception as exc:
+            independent_errors.append(f"妙想日线失败：{exc}")
+    if hsi_official_series:
+        try:
+            official_row = fetch_hsi_official_completed_close(hsi_official_series)
+            if official_row is not None and not official_row.empty:
+                independent_raw = merge_raw_index_data(independent_raw, official_row)
+        except Exception as exc:
+            independent_errors.append(f"恒生官网失败：{exc}")
+    if independent_raw is not None and not independent_raw.empty:
+        return build_export_df(independent_raw, index_name, days=days)
     try:
         if board_symbol:
             adjust = {"0": "", "1": "qfq", "2": "hfq"}.get(str(fqt), "")
@@ -409,7 +521,12 @@ def get_index_data_from_akshare_eastmoney_fallback(
             )
             return build_export_df(df, index_name, days=days)
     except Exception as exc:
-        raise RuntimeError(f"东方财富K线失败：{last_error}；AkShare兜底失败：{exc}") from exc
+        independent_text = "；".join(independent_errors)
+        if independent_text:
+            independent_text = f"；{independent_text}"
+        raise RuntimeError(
+            f"东方财富K线失败：{last_error}{independent_text}；AkShare东方财富兜底失败：{exc}"
+        ) from exc
 
     raise RuntimeError(f"东方财富K线获取失败：{last_error}")
 

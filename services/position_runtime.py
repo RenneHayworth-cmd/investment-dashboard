@@ -10,8 +10,18 @@ from services.fund_analysis import infer_tickflow_symbol
 from services.market_calendar import get_market_window, is_market_trading_day
 from services.position_market import _fetch_sina_exchange_fund_quote
 from services.position_models import (
+    ETF_AFTERNOON_TIMING_START_TIME,
     ETF_FINAL_CLOSE_READY_TIME,
+    ETF_LUNCH_TIMING_FETCH_END_TIME,
+    ETF_LUNCH_TIMING_START_TIME,
+    ETF_MIDSESSION_TIMING_REFRESH_SECONDS,
+    ETF_MORNING_FAST_REFRESH_END_TIME,
+    ETF_MORNING_TIMING_PREVIEW_END_TIME,
+    ETF_MORNING_TIMING_REFRESH_SECONDS,
+    ETF_MORNING_TIMING_START_TIME,
     ETF_REALTIME_TIMING_END_TIME,
+    ETF_REALTIME_TIMING_REFRESH_SECONDS,
+    ETF_REALTIME_TIMING_START_TIME,
     ETF_SINA_REALTIME_FALLBACK_CODES,
     ETF_TIMING_STRATEGIES,
     PositionItem,
@@ -30,6 +40,130 @@ from services.position_timing import calculate_etf_timing_snapshot
 
 _RUNTIME_ETF_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_ETF_QUOTE_CACHE_LOCK = Lock()
+_RUNTIME_ETF_QUOTE_FETCH_STATE: dict[str, object] = {}
+
+
+def _runtime_quote_refresh_band(market_now: datetime) -> tuple[str, int] | None:
+    market = get_market_window("A股")
+    if market is None or not is_market_trading_day(market, market_now):
+        return None
+    current_time = market_now.time()
+    if ETF_MORNING_TIMING_START_TIME <= current_time < ETF_MORNING_FAST_REFRESH_END_TIME:
+        return "早盘", ETF_MORNING_TIMING_REFRESH_SECONDS
+    if ETF_MORNING_FAST_REFRESH_END_TIME <= current_time < ETF_MORNING_TIMING_PREVIEW_END_TIME:
+        return "上午", ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+    if ETF_LUNCH_TIMING_START_TIME <= current_time < ETF_LUNCH_TIMING_FETCH_END_TIME:
+        return "午间", 600
+    if ETF_AFTERNOON_TIMING_START_TIME <= current_time < ETF_REALTIME_TIMING_START_TIME:
+        return "下午", ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+    if ETF_REALTIME_TIMING_START_TIME <= current_time < ETF_REALTIME_TIMING_END_TIME:
+        return "尾盘", ETF_REALTIME_TIMING_REFRESH_SECONDS
+    return None
+
+
+def refresh_runtime_etf_quotes(
+    codes: list[str],
+    *,
+    api_key: str,
+    market_now: datetime | None = None,
+) -> dict[str, dict[str, object]]:
+    """Refresh one process-wide ETF quote batch and reuse it across pages."""
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    requested_scope = {
+        normalize_etf_base_code(code) for code in codes if str(code or "").strip()
+    }
+    if not requested_scope:
+        return {}
+    band = _runtime_quote_refresh_band(market_now)
+    if band is None:
+        return filter_current_etf_realtime_quotes(
+            load_runtime_etf_quotes(),
+            market_now=market_now,
+            retain_after_close=True,
+        )
+
+    band_name, refresh_seconds = band
+    market_now_naive = market_now.replace(tzinfo=None)
+    trade_date = market_now.date().isoformat()
+    with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        same_date = _RUNTIME_ETF_QUOTE_FETCH_STATE.get("trade_date") == trade_date
+        existing_scope = (
+            set(_RUNTIME_ETF_QUOTE_FETCH_STATE.get("scope") or []) if same_date else set()
+        )
+        last_attempt = pd.to_datetime(
+            _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_attempt"), errors="coerce"
+        )
+        same_band = _RUNTIME_ETF_QUOTE_FETCH_STATE.get("band") == band_name
+        scope_covered = requested_scope.issubset(existing_scope)
+        successful_scope = set(
+            _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_scope") or []
+        )
+        lunch_already_succeeded = bool(
+            band_name == "午间"
+            and _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_trade_date")
+            == trade_date
+            and _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_band")
+            == band_name
+            and requested_scope.issubset(successful_scope)
+        )
+        due = bool(
+            not same_date
+            or not same_band
+            or not scope_covered
+            or pd.isna(last_attempt)
+            or (
+                not lunch_already_succeeded
+                and (market_now_naive - pd.Timestamp(last_attempt)).total_seconds()
+                >= refresh_seconds
+            )
+        )
+        if not due:
+            return {
+                code: dict(quote)
+                for code, quote in _RUNTIME_ETF_QUOTE_CACHE.items()
+                if code in requested_scope
+            }
+        fetch_scope = sorted(requested_scope | existing_scope)
+        _RUNTIME_ETF_QUOTE_FETCH_STATE.update(
+            {
+                "trade_date": trade_date,
+                "scope": fetch_scope,
+                "band": band_name,
+                "last_attempt": market_now_naive.isoformat(),
+            }
+        )
+
+    try:
+        quotes = fetch_tickflow_etf_quotes(
+            fetch_scope,
+            api_key=api_key,
+            market_now=market_now,
+        )
+    except Exception as exc:
+        with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+            _RUNTIME_ETF_QUOTE_FETCH_STATE["error"] = str(exc)
+        raise
+    remember_runtime_etf_quotes(quotes)
+    with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        _RUNTIME_ETF_QUOTE_FETCH_STATE.update(
+            {
+                "last_success": market_now_naive.isoformat(),
+                "last_success_trade_date": trade_date,
+                "last_success_band": band_name,
+                "last_success_scope": fetch_scope,
+                "error": "",
+            }
+        )
+        return {
+            code: dict(quote)
+            for code, quote in _RUNTIME_ETF_QUOTE_CACHE.items()
+            if code in requested_scope
+        }
+
+
+def load_runtime_etf_quote_state() -> dict[str, object]:
+    with _RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        return dict(_RUNTIME_ETF_QUOTE_FETCH_STATE)
 
 def _tickflow_quote_datetime(row: pd.Series) -> datetime | None:
     timestamp = pd.to_numeric(row.get("timestamp"), errors="coerce")

@@ -19,6 +19,7 @@ def render_live_positions_table(
         "代码",
         "市值",
         "现价",
+        "行情状态",
         "持仓数量",
         "成本",
         "当日盈亏",
@@ -64,6 +65,10 @@ def render_live_positions_table(
             f"<td>{html.escape(str(row.symbol))}</td>",
             f"<td>{html.escape(format_live_number(row.market_value))}</td>",
             f"<td>{html.escape(format_live_number(row.latest_price, 3))}</td>",
+            (
+                f"<td title=\"{html.escape(str(getattr(row, 'price_time', '') or ''))}\">"
+                f"{html.escape(str(getattr(row, 'price_status', '-') or '-'))}</td>"
+            ),
             f"<td>{int(row.quantity):,}</td>",
             f"<td>{html.escape(format_live_number(row.average_cost, 3))}</td>",
             pnl_cell(row.daily_pnl, row.daily_return_pct),
@@ -80,6 +85,7 @@ def render_live_positions_table(
         '<td class="live-total-label">合计</td>',
         "<td>-</td>",
         f"<td>{html.escape(format_live_number(total['market_value']))}</td>",
+        "<td>-</td>",
         "<td>-</td>",
         "<td>-</td>",
         "<td>-</td>",
@@ -104,7 +110,7 @@ def render_live_positions_table(
         }}
         .live-position-table {{
             width: 100%;
-            min-width: 1120px;
+            min-width: 1220px;
             border-collapse: collapse;
             font-size: 0.9rem;
         }}

@@ -28,6 +28,7 @@ from services.futures_spread import (
     SPREAD_CALCULATION_VERSION,
     append_futures_spot_row,
     fetch_futures_daily,
+    fetch_futures_daily_from_akshare,
 )
 from services.position_analysis import (
     DEFAULT_ETF_CODES,
@@ -54,6 +55,7 @@ from services.position_analysis import (
     _merge_current_day_refresh,
     apply_etf_realtime_quote,
     apply_etf_realtime_quotes_to_items,
+    build_position_timing_performance,
     apply_etf_realtime_quote_to_timing,
     build_recent_etf_operation_guidance,
     build_etf_timing_table,
@@ -74,13 +76,19 @@ from services.position_analysis import (
     filter_final_etf_rows,
     latest_final_etf_trade_date,
     load_runtime_etf_quotes,
+    load_runtime_etf_quote_state,
     load_or_fetch_etf,
     load_or_fetch_futures_contract,
     load_or_fetch_option,
     load_or_fetch_spread,
     parse_spread_groups,
     refresh_position_derivative_items,
+    refresh_runtime_etf_quotes,
     remember_runtime_etf_quotes,
+)
+from services.position_performance import (
+    _build_current_positions,
+    _normalize_trade_display_names,
 )
 
 
@@ -89,6 +97,153 @@ def _v2_adjusted_history(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class PositionAnalysisTests(unittest.TestCase):
+    @staticmethod
+    def _position_performance_items() -> list[PositionItem]:
+        buy_codes = {"159501", "518850", "510500", "513310"}
+        hold_codes = {"159201", "159655", "159552", "513880"}
+        empty_codes = {"159545", "159967", "512890"}
+        warmup_dates = pd.bdate_range(end="2026-08-04", periods=40)
+        valuation_dates = pd.to_datetime(["2026-08-05", "2026-08-06"])
+        items: list[PositionItem] = []
+        for code in [*ETF_PORTFOLIO_WEIGHTS_PCT, "512890"]:
+            warmup_prices = [100.0] * len(warmup_dates)
+            if code in hold_codes:
+                warmup_prices[-1] = 120.0
+                valuation_prices = [120.0, 120.0]
+            elif code in buy_codes:
+                valuation_prices = [120.0, 120.0]
+            elif code in empty_codes:
+                valuation_prices = [100.0, 100.0]
+            else:
+                raise AssertionError(code)
+            frame = pd.DataFrame(
+                {
+                    "date": warmup_dates.append(pd.DatetimeIndex(valuation_dates)),
+                    "price": warmup_prices + valuation_prices,
+                }
+            )
+            items.append(
+                PositionItem(
+                    "ETF",
+                    code,
+                    ETF_DISPLAY_NAMES[code],
+                    "缓存",
+                    latest_date="2026-08-06",
+                    dataframe=frame,
+                    formal_history_valid=True,
+                )
+            )
+        return items
+
+    def test_position_performance_builds_only_fresh_buy_initial_positions(self):
+        result = build_position_timing_performance(
+            self._position_performance_items(),
+            market_now=datetime(2026, 8, 7, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.summary["初始建仓代码"], ["159501", "510500", "513310", "518850"])
+        first_day_trades = result.trades[
+            pd.to_datetime(result.trades["日期"]).dt.normalize()
+            == pd.Timestamp("2026-08-05")
+        ]
+        self.assertEqual(
+            set(first_day_trades["交易标的"]),
+            {"159501", "510500", "513310", "518850"},
+        )
+        self.assertNotIn("512890", set(first_day_trades["交易标的"]))
+        self.assertFalse((result.trades["代码"] == "159967").any())
+        first = result.daily.iloc[0]
+        self.assertEqual(first["账户资产"], 500_000.0)
+        self.assertEqual(first["每日盈亏"], 0.0)
+        self.assertEqual(first["每日收益率(%)"], 0.0)
+        self.assertEqual(first["净值"], 1.0)
+        self.assertGreater(result.summary["初始手续费"], 0)
+        self.assertEqual(
+            set(result.positions["代码"]),
+            {"159501", "510500", "513310", "518850"},
+        )
+        self.assertNotIn("512890", set(result.positions["代码"]))
+        self.assertAlmostEqual(
+            float(result.positions["持仓市值"].sum()),
+            float(result.daily.iloc[-1]["持仓市值"]),
+            places=2,
+        )
+
+    def test_position_performance_stops_before_first_incomplete_formal_session(self):
+        result = build_position_timing_performance(
+            self._position_performance_items(),
+            market_now=datetime(2026, 8, 10, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.summary["正式数据截止日"], "2026-08-06")
+        self.assertTrue(any("2026-08-07 正式日线不完整" in item for item in result.warnings))
+
+    def test_position_performance_keeps_upstream_confirmed_same_day_close(self):
+        result = build_position_timing_performance(
+            self._position_performance_items(),
+            market_now=datetime(2026, 8, 6, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(result.summary["正式数据截止日"], "2026-08-06")
+        self.assertEqual(len(result.daily), 2)
+
+    def test_position_performance_rejects_invalid_adjusted_cache(self):
+        items = self._position_performance_items()
+        items[0].formal_history_valid = False
+
+        result = build_position_timing_performance(
+            items,
+            market_now=datetime(2026, 8, 7, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertTrue(result.daily.empty)
+        self.assertIn("前复权缓存校验未通过", result.errors[0])
+
+    def test_position_performance_parking_position_uses_full_fund_name(self):
+        trades = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(["2026-08-06"]),
+                "代码": ["510500"],
+                "交易标的": ["512890"],
+                "交易标的名称": ["512890"],
+                "操作": ["买入"],
+                "份额": [100],
+                "成交金额": [100.0],
+                "手续费": [0.01],
+            }
+        )
+        positions = _build_current_positions(
+            trades,
+            {
+                "512890": pd.DataFrame(
+                    {"trade_date": pd.to_datetime(["2026-08-06"]), "close": [1.0]}
+                )
+            },
+            valuation_date=pd.Timestamp("2026-08-06"),
+            account_assets=500_000.0,
+        )
+
+        self.assertEqual(positions.iloc[0]["代码"], "512890")
+        self.assertEqual(positions.iloc[0]["基金名称"], "红利低波ETF华泰柏瑞")
+
+    def test_position_performance_trade_detail_uses_full_parking_fund_name(self):
+        trades = _normalize_trade_display_names(
+            pd.DataFrame(
+                {
+                    "交易标的": ["512890"],
+                    "交易标的名称": ["512890"],
+                    "操作": ["买入"],
+                }
+            )
+        )
+
+        self.assertEqual(trades.iloc[0]["交易标的"], "512890")
+        self.assertEqual(trades.iloc[0]["交易标的名称"], "红利低波ETF华泰柏瑞")
+
     def test_adjusted_overlap_change_detection_distinguishes_append_from_rebuild(self):
         old = _v2_adjusted_history(
             pd.DataFrame(
@@ -148,12 +303,12 @@ class PositionAnalysisTests(unittest.TestCase):
                 )
 
     def test_default_spread_uses_current_iron_ore_contracts(self):
-        self.assertEqual(DEFAULT_SPREAD_CONTRACTS, ["I2609", "I2705"])
+        self.assertEqual(DEFAULT_SPREAD_CONTRACTS, ["I2701", "I2705"])
 
     def test_default_spread_groups_include_iron_ore_and_csi_1000(self):
         self.assertEqual(
             DEFAULT_SPREAD_GROUPS,
-            [["I2609", "I2705"], ["IM2609", "IM2703"]],
+            [["I2701", "I2705"], ["IM2609", "IM2703"]],
         )
 
     def test_parse_spread_groups_keeps_each_line_independent(self):
@@ -195,17 +350,17 @@ class PositionAnalysisTests(unittest.TestCase):
     def test_missing_default_spread_keeps_full_contract_names(self, _load_mock):
         item = load_or_fetch_spread(DEFAULT_SPREAD_CONTRACTS, allow_fetch=False)
 
-        self.assertEqual(item.code, "I2609 - I2705")
-        self.assertEqual(item.name, "I2609 - I2705 (铁矿石)")
+        self.assertEqual(item.code, "I2701 - I2705")
+        self.assertEqual(item.name, "I2701 - I2705 (铁矿石)")
 
     @patch("services.position_analysis._load_dataset_if_ready", return_value=(None, None))
     def test_default_derivative_holdings_use_iron_ore_futures_without_options(self, _load_mock):
         item = load_or_fetch_futures_contract(DEFAULT_FUTURES_CONTRACTS[0], allow_fetch=False)
 
-        self.assertEqual(DEFAULT_FUTURES_CONTRACTS, ["I2609"])
+        self.assertEqual(DEFAULT_FUTURES_CONTRACTS, ["I2701"])
         self.assertEqual(DEFAULT_OPTION_CODES, [])
-        self.assertEqual(item.code, "I2609")
-        self.assertEqual(item.name, "I2609 (铁矿石期货)")
+        self.assertEqual(item.code, "I2701")
+        self.assertEqual(item.name, "I2701 (铁矿石期货)")
 
     @patch("services.position_analysis._load_dataset_if_ready", return_value=(None, None))
     def test_missing_csi_1000_spread_keeps_full_contract_names(self, _load_mock):
@@ -568,6 +723,83 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(request_sizes, [5, 5, 5])
         self.assertEqual(set(quotes), set(DEFAULT_ETF_CODES))
 
+    def test_runtime_quote_batch_is_shared_and_only_refetches_for_new_scope(self):
+        market_now = datetime(2026, 7, 15, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        def quotes_for(codes, **_kwargs):
+            return {
+                code: {
+                    "symbol": code,
+                    "price": 1.0,
+                    "quote_time": market_now,
+                }
+                for code in codes
+            }
+
+        position_runtime._RUNTIME_ETF_QUOTE_CACHE.clear()
+        position_runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear()
+        with patch(
+            "services.position_runtime.fetch_tickflow_etf_quotes",
+            side_effect=quotes_for,
+        ) as fetch_mock:
+            first = refresh_runtime_etf_quotes(
+                ["159501", "518850"], api_key="key", market_now=market_now
+            )
+            second = refresh_runtime_etf_quotes(
+                ["159501"], api_key="key", market_now=market_now
+            )
+            expanded = refresh_runtime_etf_quotes(
+                ["159501", "510500"], api_key="key", market_now=market_now
+            )
+
+        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(set(first), {"159501", "518850"})
+        self.assertEqual(set(second), {"159501"})
+        self.assertEqual(set(expanded), {"159501", "510500"})
+        self.assertEqual(load_runtime_etf_quote_state()["band"], "上午")
+
+    def test_failed_first_lunch_fetch_retries_after_ten_minutes(self):
+        morning_now = datetime(2026, 7, 15, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        first_lunch = datetime(2026, 7, 15, 11, 31, tzinfo=ZoneInfo("Asia/Shanghai"))
+        retry_lunch = datetime(2026, 7, 15, 11, 41, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        def quotes_for(codes, *, market_now, **_kwargs):
+            return {
+                code: {"symbol": code, "price": 1.0, "quote_time": market_now}
+                for code in codes
+            }
+
+        position_runtime._RUNTIME_ETF_QUOTE_CACHE.clear()
+        position_runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear()
+        with patch(
+            "services.position_runtime.fetch_tickflow_etf_quotes",
+            side_effect=quotes_for,
+        ):
+            refresh_runtime_etf_quotes(
+                ["159501"], api_key="key", market_now=morning_now
+            )
+        with patch(
+            "services.position_runtime.fetch_tickflow_etf_quotes",
+            side_effect=RuntimeError("lunch failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lunch failed"):
+                refresh_runtime_etf_quotes(
+                    ["159501"], api_key="key", market_now=first_lunch
+                )
+        with patch(
+            "services.position_runtime.fetch_tickflow_etf_quotes",
+            side_effect=quotes_for,
+        ) as retry_mock:
+            result = refresh_runtime_etf_quotes(
+                ["159501"], api_key="key", market_now=retry_lunch
+            )
+
+        retry_mock.assert_called_once()
+        self.assertEqual(result["159501"]["quote_time"], retry_lunch)
+        state = load_runtime_etf_quote_state()
+        self.assertEqual(state["last_success_band"], "午间")
+        self.assertEqual(state["last_success_trade_date"], "2026-07-15")
+
     @patch("services.position_analysis._fetch_sina_exchange_fund_quote")
     @patch("tickflow.TickFlow")
     def test_fetch_tickflow_etf_quotes_uses_sina_when_lof_is_missing(
@@ -768,6 +1000,86 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(unchanged.iloc[-1]["close"], 710.0)
         self.assertEqual(preview.iloc[-1]["close"], 719.0)
 
+    @patch("services.futures_spread._fetch_futures_spot_from_sina_direct")
+    @patch("akshare.futures_zh_spot")
+    def test_futures_spot_falls_back_to_direct_sina_after_proxy_failure(
+        self,
+        spot_mock,
+        direct_mock,
+    ):
+        market_now = datetime(2026, 8, 25, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+        history = pd.DataFrame(
+            {"date": [pd.Timestamp("2026-08-24")], "close": [729.5]}
+        )
+        spot_mock.side_effect = requests.exceptions.ProxyError("dead proxy")
+        direct_mock.return_value = pd.DataFrame(
+            {
+                "current_price": [727.0],
+                "quote_date": ["2026-08-25"],
+                "quote_time": ["09:40:00"],
+            }
+        )
+
+        result = append_futures_spot_row(
+            history,
+            "I2609",
+            replace_current_day=True,
+            market_now=market_now,
+        )
+
+        self.assertEqual(result.iloc[-1]["date"], pd.Timestamp("2026-08-25"))
+        self.assertEqual(result.iloc[-1]["close"], 727.0)
+
+    @patch("services.futures_spread._fetch_futures_spot_from_sina_direct")
+    @patch("akshare.futures_zh_spot")
+    def test_futures_spot_rejects_stale_direct_snapshot(
+        self,
+        spot_mock,
+        direct_mock,
+    ):
+        market_now = datetime(2026, 8, 25, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        history = pd.DataFrame(
+            {"date": [pd.Timestamp("2026-08-24")], "close": [7425.8]}
+        )
+        spot_mock.side_effect = requests.exceptions.ProxyError("dead proxy")
+        direct_mock.return_value = pd.DataFrame(
+            {
+                "current_price": [7425.8],
+                "quote_date": ["2026-08-24"],
+                "quote_time": ["15:00:00"],
+            }
+        )
+
+        result = append_futures_spot_row(
+            history,
+            "IM2609",
+            replace_current_day=True,
+            market_now=market_now,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[-1]["date"], pd.Timestamp("2026-08-24"))
+
+    @patch("services.futures_spread._fetch_futures_daily_from_sina_direct")
+    @patch("akshare.futures_zh_daily_sina")
+    def test_futures_daily_falls_back_to_direct_sina_after_proxy_failure(
+        self,
+        daily_mock,
+        direct_mock,
+    ):
+        daily_mock.side_effect = requests.exceptions.ProxyError("dead proxy")
+        direct_mock.return_value = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-21", "2026-08-24"]),
+                "close": [719.5, 729.5],
+            }
+        )
+
+        result = fetch_futures_daily_from_akshare("I2609")
+
+        self.assertEqual(result.iloc[-1]["date"], pd.Timestamp("2026-08-24"))
+        self.assertEqual(result.iloc[-1]["close"], 729.5)
+
     @patch("akshare.option_commodity_contract_table_sina")
     def test_option_spot_preview_replaces_same_day_daily_value(self, chain_mock):
         today = pd.Timestamp("2026-08-07")
@@ -879,6 +1191,65 @@ class PositionAnalysisTests(unittest.TestCase):
         save_mock.assert_called_once()
         self.assertEqual(save_mock.call_args.kwargs["symbol"], "futures_contract_I2609")
         self.assertEqual(save_mock.call_args.kwargs["data_type"], "futures_contract")
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_futures_daily")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_futures_contract_stale_formal_response_is_not_saved_as_success(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-21"]), "close": [719.5]}
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-08-21T16:00:00"})
+        fetch_mock.return_value = cached.copy()
+
+        item = load_or_fetch_futures_contract(
+            "I2609",
+            force_refresh=True,
+            save_to_cache=True,
+            market_now=datetime(2026, 8, 24, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(item.status, "缓存")
+        self.assertIn("正式日线最新到 2026-08-21", item.error)
+        self.assertIn("预期 2026-08-24", item.error)
+        save_mock.assert_not_called()
+
+    @patch("services.position_analysis.save_dataset")
+    @patch("services.position_analysis.fetch_futures_daily")
+    @patch("services.position_analysis._load_dataset_if_ready")
+    def test_futures_contract_accepts_previous_completed_day_during_session(
+        self,
+        load_mock,
+        fetch_mock,
+        save_mock,
+    ):
+        cached = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-21"]), "close": [719.5]}
+        )
+        fetched = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-08-21", "2026-08-24"]),
+                "close": [719.5, 729.5],
+            }
+        )
+        load_mock.return_value = (cached, {"last_update_time": "2026-08-21T16:00:00"})
+        fetch_mock.return_value = fetched
+
+        item = load_or_fetch_futures_contract(
+            "I2609",
+            force_refresh=True,
+            save_to_cache=True,
+            market_now=datetime(2026, 8, 25, 9, 40, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(item.status, "已增量更新")
+        self.assertEqual(item.latest_date, "2026-08-24")
+        save_mock.assert_called_once()
 
     @patch("services.position_analysis.save_dataset")
     @patch("services.position_analysis.fetch_futures_daily")
@@ -2587,7 +2958,11 @@ class PositionAnalysisTests(unittest.TestCase):
         load_mock.return_value = (cached, {"last_update_time": "2026-07-02T16:00:00"})
         calculate_mock.return_value = latest
 
-        item = load_or_fetch_spread(["I2609", "I2701"], force_refresh=True)
+        item = load_or_fetch_spread(
+            ["I2609", "I2701"],
+            force_refresh=True,
+            market_now=datetime(2026, 7, 3, 16, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
 
         self.assertEqual(item.status, "已增量更新")
         self.assertEqual(len(item.dataframe), 3)
@@ -2605,7 +2980,10 @@ class PositionFacadeContractTests(unittest.TestCase):
         "ETF_MORNING_TIMING_REFRESH_SECONDS", "ETF_PORTFOLIO_WEIGHTS_PCT",
         "ETF_POSITION_STRATEGIES", "ETF_REALTIME_TIMING_END_TIME",
         "ETF_REALTIME_TIMING_REFRESH_SECONDS", "ETF_TIMING_STRATEGIES",
-        "PositionItem", "_adjusted_history_has_overlap_changes",
+        "POSITION_TIMING_INITIAL_CAPITAL", "POSITION_TIMING_LOT_SIZE",
+        "POSITION_TIMING_PARKING_SYMBOL", "POSITION_TIMING_START_DATE",
+        "POSITION_TIMING_TRANSACTION_COST", "PositionItem",
+        "PositionTimingPerformanceResult", "_adjusted_history_has_overlap_changes",
         "_append_sina_final_close", "_cache_has_expected_trade_date",
         "_fetch_eastmoney_exchange_fund_close", "_fetch_exchange_fund_close",
         "_fetch_sina_exchange_fund_close", "_fetch_sina_exchange_fund_final_close",
@@ -2613,6 +2991,7 @@ class PositionFacadeContractTests(unittest.TestCase):
         "_merge_current_day_refresh", "_request_sina_realtime_snapshot",
         "apply_etf_realtime_quote", "apply_etf_realtime_quote_to_timing",
         "apply_etf_realtime_quotes_to_items", "build_etf_timing_table",
+        "build_position_timing_performance",
         "build_recent_etf_operation_guidance", "calculate_512890_parking_snapshot",
         "calculate_etf_timing_snapshot", "etf_afternoon_timing_fetch_ready",
         "etf_cache_has_latest_final_close", "etf_final_close_ready",
@@ -2624,11 +3003,14 @@ class PositionFacadeContractTests(unittest.TestCase):
         "latest_final_etf_trade_date", "load_or_fetch_etf",
         "load_or_fetch_futures_contract", "load_or_fetch_option",
         "load_or_fetch_spread", "load_runtime_etf_quotes",
+        "load_runtime_etf_quote_state",
         "normalize_etf_base_code", "parse_position_codes", "parse_spread_groups",
         "refresh_position_derivative_items", "remember_runtime_etf_quotes",
+        "refresh_runtime_etf_quotes",
     }
     EXPECTED_SIGNATURES = {
         "fetch_tickflow_etf_quotes": "(codes: 'list[str]', *, api_key: 'str', market_now: 'datetime | None' = None) -> 'dict[str, dict[str, object]]'",
+        "refresh_runtime_etf_quotes": "(codes: 'list[str]', *, api_key: 'str', market_now: 'datetime | None' = None) -> 'dict[str, dict[str, object]]'",
         "load_or_fetch_etf": "(code: 'str', *, api_key: 'str' = '', count: 'int' = 5000, adjust: 'str | None' = 'forward_additive', ma_periods: 'list[int] | tuple[int, ...]' = (20, 60, 120, 250), rsi_period: 'int' = 14, base_date: 'str' = '2024-09-24', allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, allow_unfinished_session: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "load_or_fetch_futures_contract": "(contract: 'str', *, api_key: 'str' = '', count: 'int' = 500, ma_periods: 'list[int] | tuple[int, ...]' = (5, 20, 60), allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "load_or_fetch_spread": "(contracts: 'list[str]', *, base_contract: 'str | None' = None, api_key: 'str' = '', max_workers: 'int' = 2, allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",

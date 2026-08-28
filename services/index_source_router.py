@@ -77,6 +77,10 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
             fqt=str(index_config.get("fqt", "0")),
             akshare_board_symbol=index_config.get("akshare_board_symbol"),
             akshare_hk_em_symbol=index_config.get("akshare_hk_em_symbol"),
+            sina_hk_symbol=index_config.get("sina_hk_symbol"),
+            hsi_official_series=index_config.get("hsi_official_series"),
+            mx_query_name=index_config.get("mx_query_name"),
+            mx_expected_code=index_config.get("mx_expected_code"),
         )
     if source == "yahoo":
         return get_index_data_from_yahoo(code, index_name, days=days)

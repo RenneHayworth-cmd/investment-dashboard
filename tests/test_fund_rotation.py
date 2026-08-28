@@ -8,6 +8,12 @@ import services.fund_rotation as fund_rotation_service
 from services.fund_rotation import (
     EXECUTION_AFTER_CLOSE,
     EXECUTION_NEXT_OPEN,
+    PORTFOLIO_EMPTY_ACTIVATION_AFTER_PRIMARY_ENTRY,
+    PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE,
+    PORTFOLIO_EMPTY_ACTIVATIONS,
+    PORTFOLIO_INITIAL_ENTRY_FOLLOW_STATE,
+    PORTFOLIO_INITIAL_ENTRY_FRESH_BUY,
+    PORTFOLIO_INITIAL_ENTRY_POLICIES,
     PORTFOLIO_STRATEGY_CASH,
     PORTFOLIO_STRATEGY_HALF_TIMING,
     PORTFOLIO_STRATEGY_HOLD,
@@ -44,6 +50,12 @@ class FundRotationTests(unittest.TestCase):
             "PORTFOLIO_STRATEGY_HALF_TIMING",
             "PORTFOLIO_STRATEGY_CASH",
             "PORTFOLIO_STRATEGIES",
+            "PORTFOLIO_INITIAL_ENTRY_FOLLOW_STATE",
+            "PORTFOLIO_INITIAL_ENTRY_FRESH_BUY",
+            "PORTFOLIO_INITIAL_ENTRY_POLICIES",
+            "PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE",
+            "PORTFOLIO_EMPTY_ACTIVATION_AFTER_PRIMARY_ENTRY",
+            "PORTFOLIO_EMPTY_ACTIVATIONS",
             "RotationInput",
             "RotationResult",
             "TimingBacktestResult",
@@ -252,6 +264,100 @@ class FundRotationTests(unittest.TestCase):
 
         self.assertEqual(result.start_date, late_dates[0])
         self.assertEqual(result.end_date, late_dates[-1])
+
+    def test_delayed_entry_parks_only_after_primary_has_been_bought_and_sold(self):
+        dates = pd.bdate_range("2026-07-30", periods=7)
+        primary = RotationInput(
+            "A",
+            "来源ETF",
+            pd.DataFrame(
+                {
+                    "trade_date": dates,
+                    "close": [10.0, 10.0, 9.0, 11.0, 12.0, 8.0, 8.0],
+                }
+            ),
+        )
+        parking = RotationInput(
+            "P",
+            "承接ETF",
+            pd.DataFrame({"trade_date": dates, "close": [10.0] * len(dates)}),
+        )
+        allocation = PortfolioTimingAllocation(
+            "A",
+            "来源ETF",
+            100,
+            PORTFOLIO_STRATEGY_TIMING,
+            ma_period=2,
+            threshold_pct=0,
+            initial_entry_policy=PORTFOLIO_INITIAL_ENTRY_FRESH_BUY,
+            empty_position_symbol="P",
+            empty_position_activation=PORTFOLIO_EMPTY_ACTIVATION_AFTER_PRIMARY_ENTRY,
+        )
+
+        result = run_portfolio_timing_backtest(
+            [primary, parking],
+            [allocation],
+            initial_capital=100_000,
+            transaction_cost=0,
+            lot_size=100,
+            start_date=dates[2],
+            end_date=dates[-1],
+        )
+
+        trades = result.trades[["日期", "交易标的", "操作"]].reset_index(drop=True)
+        self.assertEqual(
+            trades.to_dict("records"),
+            [
+                {"日期": dates[3], "交易标的": "A", "操作": "买入"},
+                {"日期": dates[5], "交易标的": "A", "操作": "卖出"},
+                {"日期": dates[5], "交易标的": "P", "操作": "买入"},
+            ],
+        )
+        self.assertNotIn(dates[2], set(result.trades["日期"]))
+        self.assertEqual(result.component_results.iloc[0]["最新状态"], "空仓承接")
+        self.assertIn("策略现金", result.nav_data.columns)
+        self.assertIn("策略持仓市值", result.nav_data.columns)
+
+    def test_delayed_half_timing_waits_then_enters_full_and_later_reduces_to_half(self):
+        dates = pd.bdate_range("2026-07-30", periods=7)
+        fund = RotationInput(
+            "A",
+            "半仓ETF",
+            pd.DataFrame(
+                {
+                    "trade_date": dates,
+                    "close": [10.0, 11.0, 11.0, 9.0, 11.0, 12.0, 8.0],
+                }
+            ),
+        )
+        allocation = PortfolioTimingAllocation(
+            "A",
+            "半仓ETF",
+            100,
+            PORTFOLIO_STRATEGY_HALF_TIMING,
+            ma_period=2,
+            threshold_pct=0,
+            initial_entry_policy=PORTFOLIO_INITIAL_ENTRY_FRESH_BUY,
+        )
+
+        result = run_portfolio_timing_backtest(
+            [fund],
+            [allocation],
+            initial_capital=100_000,
+            transaction_cost=0,
+            lot_size=100,
+            start_date=dates[2],
+            end_date=dates[-1],
+        )
+
+        start_trades = result.trades[result.trades["日期"] == dates[2]]
+        first_entry = result.trades[
+            (result.trades["日期"] == dates[4]) & (result.trades["操作"] == "买入")
+        ]
+        self.assertTrue(start_trades.empty)
+        self.assertEqual(len(first_entry), 2)
+        self.assertEqual(result.component_results.iloc[0]["最新状态"], "半仓")
+        self.assertEqual(result.component_results.iloc[0]["当前理论仓位(%)"], 50.0)
 
     def test_normalize_rotation_rejects_empty_input(self):
         with self.assertRaisesRegex(ValueError, "没有可回测的数据"):

@@ -19,6 +19,7 @@ from services.futures_spread import (
     append_futures_spot_row,
     build_spread_summary,
     calculate_spreads,
+    completed_futures_daily_cutoff,
     contract_name,
     fetch_contracts,
     fetch_futures_daily,
@@ -45,6 +46,59 @@ from services.position_models import (
 )
 from services.position_sessions import _cache_has_expected_trade_date
 
+
+def _china_trade_date(market_now: datetime | None = None):
+    now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    else:
+        now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    return now.date()
+
+
+def _latest_date_text(df: pd.DataFrame, date_column: str = "date") -> str:
+    if df is None or df.empty or date_column not in df.columns:
+        return "无有效日期"
+    dates = pd.to_datetime(df[date_column], errors="coerce").dropna()
+    return dates.max().strftime("%Y-%m-%d") if not dates.empty else "无有效日期"
+
+
+def _has_latest_completed_futures_date(
+    df: pd.DataFrame,
+    *,
+    market_now: datetime | None,
+) -> bool:
+    if df is None or df.empty or "date" not in df.columns:
+        return False
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+    if dates.empty:
+        return False
+    return dates.max().normalize() >= completed_futures_daily_cutoff(market_now)
+
+
+def _require_current_derivative_data(
+    df: pd.DataFrame,
+    *,
+    realtime_preview: bool,
+    market_now: datetime | None,
+) -> None:
+    if realtime_preview:
+        expected_date = _china_trade_date(market_now)
+        dates = pd.to_datetime(df.get("date"), errors="coerce").dropna()
+        if dates.empty or dates.max().date() != expected_date:
+            raise RuntimeError(
+                f"实时源最新到 {_latest_date_text(df)}，预期 {expected_date:%Y-%m-%d}"
+            )
+        return
+
+    if not _has_latest_completed_futures_date(df, market_now=market_now):
+        expected_date = completed_futures_daily_cutoff(market_now).strftime(
+            "%Y-%m-%d"
+        )
+        raise RuntimeError(
+            f"正式日线最新到 {_latest_date_text(df)}，预期 {expected_date}"
+        )
+
 def load_or_fetch_futures_contract(
     contract: str,
     *,
@@ -69,7 +123,7 @@ def load_or_fetch_futures_contract(
     refresh_stale_cache = (
         allow_fetch
         and cache_ready
-        and not _cache_has_expected_trade_date(cached_df, "date", market_now)
+        and not _has_latest_completed_futures_date(cached_df, market_now=market_now)
     )
     source = "本地缓存"
     status = "缓存"
@@ -104,6 +158,11 @@ def load_or_fetch_futures_contract(
                 )
             else:
                 result_df = latest_df
+            _require_current_derivative_data(
+                result_df,
+                realtime_preview=realtime_preview,
+                market_now=market_now,
+            )
             source = "TickFlow/AkShare"
             status = "已增量更新" if cache_ready else "已更新"
         except Exception as exc:
@@ -206,7 +265,9 @@ def load_or_fetch_spread(
     cache_symbol = f"futures_spread_{base_contract}"
     cached_df, cache_meta = _load_dataset_if_ready(cache_symbol, "akshare", "futures_spread")
     cache_ready = _spread_cache_matches_contracts(cached_df, contracts, base_contract)
-    refresh_stale_cache = allow_fetch and cache_ready and not _cache_has_expected_trade_date(cached_df, "date")
+    refresh_stale_cache = allow_fetch and cache_ready and not _has_latest_completed_futures_date(
+        cached_df, market_now=market_now
+    )
     source = "本地缓存"
     status = "缓存"
     error = ""
@@ -221,7 +282,7 @@ def load_or_fetch_spread(
             if realtime_preview and cached_df is not None and cache_ready:
                 data = {}
                 errors = []
-                today = pd.Timestamp.now(tz="Asia/Shanghai").date()
+                today = _china_trade_date(market_now)
                 for contract in contracts:
                     close_col = f"{contract}_close"
                     contract_df = cached_df[["date", close_col]].rename(
@@ -255,6 +316,11 @@ def load_or_fetch_spread(
                 _merge_current_day_refresh(cached_df, latest_spread_df, "date")
                 if cached_df is not None and cache_ready
                 else latest_spread_df
+            )
+            _require_current_derivative_data(
+                spread_df,
+                realtime_preview=realtime_preview,
+                market_now=market_now,
             )
             source = "TickFlow/AkShare"
             status = "已增量更新" if cached_df is not None and cache_ready else "已更新"

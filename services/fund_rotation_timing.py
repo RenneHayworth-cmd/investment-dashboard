@@ -12,6 +12,11 @@ from services.fund_rotation_metrics import (
     _round_lot_shares,
 )
 from services.fund_rotation_models import (
+    PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE,
+    PORTFOLIO_EMPTY_ACTIVATIONS,
+    PORTFOLIO_INITIAL_ENTRY_FOLLOW_STATE,
+    PORTFOLIO_INITIAL_ENTRY_FRESH_BUY,
+    PORTFOLIO_INITIAL_ENTRY_POLICIES,
     PORTFOLIO_STRATEGIES,
     PORTFOLIO_STRATEGY_CASH,
     PORTFOLIO_STRATEGY_HALF_TIMING,
@@ -23,6 +28,323 @@ from services.fund_rotation_models import (
     TimingBacktestResult,
 )
 from services.fund_rotation_summary import _build_timing_summary
+
+
+def _build_timing_signal_frame(
+    data: pd.DataFrame,
+    common_dates: pd.DatetimeIndex,
+    *,
+    ma_period: int,
+    threshold_pct: float,
+) -> pd.DataFrame:
+    signal_data = data[["trade_date", "close"]].copy()
+    signal_data[f"MA{ma_period}"] = signal_data["close"].rolling(window=ma_period).mean()
+    threshold = float(threshold_pct) / 100
+    position = 0
+    rows: list[dict[str, object]] = []
+    for _, row in signal_data.iterrows():
+        ma_value = pd.to_numeric(row[f"MA{ma_period}"], errors="coerce")
+        if pd.isna(ma_value):
+            desired_position = position
+            action = "等待均线"
+        else:
+            close_price = float(row["close"])
+            desired_position = (
+                1
+                if close_price > float(ma_value) * (1 + threshold)
+                else 0
+                if close_price < float(ma_value) * (1 - threshold)
+                else position
+            )
+            if desired_position != position:
+                action = "买入" if desired_position else "卖出"
+            else:
+                action = "持有" if position else "空仓"
+        position = desired_position
+        rows.append(
+            {
+                "日期": pd.Timestamp(row["trade_date"]),
+                "信号仓位": int(position),
+                "原始信号": action,
+            }
+        )
+    return pd.DataFrame(rows).set_index("日期").reindex(common_dates)
+
+
+def _run_delayed_timing_sleeve(
+    *,
+    item: PortfolioTimingAllocation,
+    capital: float,
+    primary_prices: pd.Series,
+    fallback_prices: pd.Series | None,
+    signal_frame: pd.DataFrame,
+    transaction_cost: float,
+    lot_size: int,
+) -> dict[str, object]:
+    is_half_timing = item.strategy == PORTFOLIO_STRATEGY_HALF_TIMING
+    fresh_entry = item.initial_entry_policy == PORTFOLIO_INITIAL_ENTRY_FRESH_BUY
+    cash = float(capital)
+    primary_shares = 0.0
+    primary_cost_basis = 0.0
+    fallback_shares = 0.0
+    fallback_cost_basis = 0.0
+    long_shares = 0.0
+    has_primary_entry = False
+    initial_wait_completed = False
+    activated = False
+    total_cost = 0.0
+    rows: list[dict[str, object]] = []
+    trades: list[dict[str, object]] = []
+
+    def record_buy(
+        *,
+        trade_date: pd.Timestamp,
+        symbol: str,
+        name: str,
+        price: float,
+        available_cash: float,
+        reason: str,
+    ) -> tuple[float, float, float]:
+        nonlocal cash, total_cost
+        affordable = available_cash / (price * (1 + transaction_cost)) if price > 0 else 0.0
+        shares = _round_lot_shares(affordable, lot_size=lot_size)
+        gross_value = shares * price
+        fee = gross_value * transaction_cost
+        if shares <= 0:
+            return 0.0, 0.0, 0.0
+        cash -= gross_value + fee
+        total_cost += fee
+        cost_basis = gross_value + fee
+        trades.append(
+            {
+                "日期": trade_date,
+                "交易标的": symbol,
+                "交易标的名称": name,
+                "操作": "买入",
+                "成交价": round(price, 4),
+                "份额": round(shares, 2),
+                "成交金额": round(gross_value, 2),
+                "手续费": round(fee, 2),
+                "本次交易盈亏金额": None,
+                "本次交易盈亏率(%)": None,
+                "现金余额": round(cash, 2),
+                "原因": reason,
+            }
+        )
+        return shares, cost_basis, fee
+
+    def record_sell(
+        *,
+        trade_date: pd.Timestamp,
+        symbol: str,
+        name: str,
+        price: float,
+        shares: float,
+        cost_basis: float,
+        reason: str,
+    ) -> None:
+        nonlocal cash, total_cost
+        gross_value = shares * price
+        fee = gross_value * transaction_cost
+        net_value = gross_value - fee
+        realized_pnl = net_value - cost_basis
+        realized_return = realized_pnl / cost_basis * 100 if cost_basis > 0 else 0.0
+        cash += net_value
+        total_cost += fee
+        trades.append(
+            {
+                "日期": trade_date,
+                "交易标的": symbol,
+                "交易标的名称": name,
+                "操作": "卖出",
+                "成交价": round(price, 4),
+                "份额": round(shares, 2),
+                "成交金额": round(gross_value, 2),
+                "手续费": round(fee, 2),
+                "本次交易盈亏金额": round(realized_pnl, 2),
+                "本次交易盈亏率(%)": round(realized_return, 2),
+                "现金余额": round(cash, 2),
+                "原因": reason,
+            }
+        )
+
+    for row_index, trade_date in enumerate(primary_prices.index):
+        trade_date = pd.Timestamp(trade_date)
+        primary_price = float(primary_prices.loc[trade_date])
+        fallback_price = (
+            float(fallback_prices.loc[trade_date])
+            if fallback_prices is not None
+            else np.nan
+        )
+        raw_action = str(signal_frame.loc[trade_date, "原始信号"])
+        signal_position = int(signal_frame.loc[trade_date, "信号仓位"])
+
+        if not activated:
+            if row_index == 0:
+                if fresh_entry:
+                    initial_wait_completed = raw_action in {"空仓", "等待均线"}
+                    should_enter = raw_action == "买入"
+                else:
+                    initial_wait_completed = signal_position == 0
+                    should_enter = signal_position == 1
+            else:
+                if signal_position == 0:
+                    initial_wait_completed = True
+                should_enter = raw_action == "买入" and initial_wait_completed
+
+            if should_enter:
+                if fallback_shares > 0:
+                    record_sell(
+                        trade_date=trade_date,
+                        symbol=item.empty_position_symbol,
+                        name=item.empty_position_symbol,
+                        price=fallback_price,
+                        shares=fallback_shares,
+                        cost_basis=fallback_cost_basis,
+                        reason=f"{item.symbol} 首次买入，退出空仓承接标的",
+                    )
+                    fallback_shares = 0.0
+                    fallback_cost_basis = 0.0
+                if is_half_timing:
+                    long_budget = capital / 2
+                    timing_budget = capital - long_budget
+                    long_shares, _, _ = record_buy(
+                        trade_date=trade_date,
+                        symbol=item.symbol,
+                        name=item.name or item.symbol,
+                        price=primary_price,
+                        available_cash=long_budget,
+                        reason="首次有效买入，建立长期半仓",
+                    )
+                    primary_shares, primary_cost_basis, _ = record_buy(
+                        trade_date=trade_date,
+                        symbol=item.symbol,
+                        name=item.name or item.symbol,
+                        price=primary_price,
+                        available_cash=timing_budget,
+                        reason="首次有效买入，建立择时半仓",
+                    )
+                    activated = long_shares > 0 or primary_shares > 0
+                else:
+                    primary_shares, primary_cost_basis, _ = record_buy(
+                        trade_date=trade_date,
+                        symbol=item.symbol,
+                        name=item.name or item.symbol,
+                        price=primary_price,
+                        available_cash=cash,
+                        reason="首次有效买入，建立来源ETF仓位",
+                    )
+                    activated = primary_shares > 0
+                has_primary_entry = activated
+            elif (
+                signal_position == 0
+                and fallback_prices is not None
+                and item.empty_position_activation == PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE
+                and fallback_shares <= 0
+            ):
+                fallback_shares, fallback_cost_basis, _ = record_buy(
+                    trade_date=trade_date,
+                    symbol=item.empty_position_symbol,
+                    name=item.empty_position_symbol,
+                    price=fallback_price,
+                    available_cash=cash,
+                    reason=f"{item.symbol} 空仓，转入承接标的",
+                )
+        else:
+            if signal_position == 0 and primary_shares > 0:
+                record_sell(
+                    trade_date=trade_date,
+                    symbol=item.symbol,
+                    name=item.name or item.symbol,
+                    price=primary_price,
+                    shares=primary_shares,
+                    cost_basis=primary_cost_basis,
+                    reason="收盘信号转为空仓",
+                )
+                primary_shares = 0.0
+                primary_cost_basis = 0.0
+                fallback_enabled = (
+                    fallback_prices is not None
+                    and (
+                        item.empty_position_activation == PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE
+                        or has_primary_entry
+                    )
+                )
+                if fallback_enabled and not is_half_timing:
+                    fallback_shares, fallback_cost_basis, _ = record_buy(
+                        trade_date=trade_date,
+                        symbol=item.empty_position_symbol,
+                        name=item.empty_position_symbol,
+                        price=fallback_price,
+                        available_cash=cash,
+                        reason=f"{item.symbol} 卖出后转入空仓承接标的",
+                    )
+            elif signal_position == 1 and primary_shares <= 0:
+                if fallback_shares > 0:
+                    record_sell(
+                        trade_date=trade_date,
+                        symbol=item.empty_position_symbol,
+                        name=item.empty_position_symbol,
+                        price=fallback_price,
+                        shares=fallback_shares,
+                        cost_basis=fallback_cost_basis,
+                        reason=f"{item.symbol} 重新买入，退出空仓承接标的",
+                    )
+                    fallback_shares = 0.0
+                    fallback_cost_basis = 0.0
+                timing_budget = cash if not is_half_timing else min(cash, capital / 2)
+                primary_shares, primary_cost_basis, _ = record_buy(
+                    trade_date=trade_date,
+                    symbol=item.symbol,
+                    name=item.name or item.symbol,
+                    price=primary_price,
+                    available_cash=timing_budget,
+                    reason="收盘信号重新买入",
+                )
+                has_primary_entry = has_primary_entry or primary_shares > 0
+
+        primary_value = (primary_shares + long_shares) * primary_price
+        fallback_value = fallback_shares * fallback_price if fallback_shares > 0 else 0.0
+        market_value = primary_value + fallback_value
+        rows.append(
+            {
+                "日期": trade_date,
+                "账户净值": cash + market_value,
+                "现金余额": cash,
+                "持仓市值": market_value,
+                "来源ETF份额": primary_shares + long_shares,
+                "承接ETF份额": fallback_shares,
+            }
+        )
+
+    result = pd.DataFrame(rows).set_index("日期")
+    if fallback_shares > 0:
+        latest_signal = "空仓承接"
+        current_weight = float(item.weight_pct)
+    elif not activated:
+        latest_signal = "等待建仓"
+        current_weight = 0.0
+    elif is_half_timing and primary_shares <= 0:
+        latest_signal = "半仓"
+        current_weight = float(item.weight_pct) / 2
+    elif is_half_timing:
+        latest_signal = "满仓"
+        current_weight = float(item.weight_pct)
+    elif primary_shares > 0:
+        latest_signal = "持仓"
+        current_weight = float(item.weight_pct)
+    else:
+        latest_signal = "现金"
+        current_weight = 0.0
+    return {
+        "nav": result["账户净值"],
+        "cash": result["现金余额"],
+        "market": result["持仓市值"],
+        "trades": pd.DataFrame(trades),
+        "total_cost": total_cost,
+        "latest_signal": latest_signal,
+        "current_weight": current_weight,
+    }
 
 def run_ma20_timing_backtest(
     fund: RotationInput,
@@ -251,18 +573,39 @@ def run_portfolio_timing_backtest(
                 strategy=cash_item.strategy,
                 ma_period=cash_item.ma_period,
                 threshold_pct=cash_item.threshold_pct,
+                initial_entry_policy=cash_item.initial_entry_policy,
+                empty_position_symbol=cash_item.empty_position_symbol,
+                empty_position_activation=cash_item.empty_position_activation,
             )
     if any(item.strategy not in PORTFOLIO_STRATEGIES for item in allocations):
         raise ValueError("存在不支持的组合策略类型。")
+    if any(item.initial_entry_policy not in PORTFOLIO_INITIAL_ENTRY_POLICIES for item in allocations):
+        raise ValueError("存在不支持的初始建仓规则。")
+    if any(item.empty_position_activation not in PORTFOLIO_EMPTY_ACTIVATIONS for item in allocations):
+        raise ValueError("存在不支持的空仓承接启用规则。")
+    if any(
+        item.empty_position_symbol
+        and item.strategy not in (PORTFOLIO_STRATEGY_TIMING, PORTFOLIO_STRATEGY_HALF_TIMING)
+        for item in allocations
+    ):
+        raise ValueError("空仓承接标的只能用于均线择时策略。")
+    if any(item.empty_position_symbol == item.symbol for item in allocations if item.symbol):
+        raise ValueError("空仓承接标的不能与来源标的相同。")
 
     fund_by_symbol = {fund.symbol: fund for fund in funds}
-    required_symbols = [
+    primary_symbols = [
         item.symbol
         for item in allocations
         if item.strategy != PORTFOLIO_STRATEGY_CASH
     ]
-    if len(required_symbols) != len(set(required_symbols)):
+    if len(primary_symbols) != len(set(primary_symbols)):
         raise ValueError("同一标的只能配置一次。")
+    required_symbols = list(
+        dict.fromkeys(
+            primary_symbols
+            + [item.empty_position_symbol for item in allocations if item.empty_position_symbol]
+        )
+    )
     missing_symbols = [symbol for symbol in required_symbols if symbol not in fund_by_symbol]
     if missing_symbols:
         raise ValueError(f"缺少以下标的数据：{'、'.join(missing_symbols)}")
@@ -310,16 +653,18 @@ def run_portfolio_timing_backtest(
             raise ValueError("开始日期不能晚于结束日期。")
         common_dates = pd.DatetimeIndex([actual_start, actual_end]).unique().sort_values()
 
-    def buy_and_hold_nav(capital: float, prices: pd.Series) -> tuple[pd.Series, float]:
+    def buy_and_hold_nav(capital: float, prices: pd.Series) -> tuple[pd.Series, float, pd.Series]:
         first_price = float(prices.iloc[0])
         affordable = capital / (first_price * (1 + transaction_cost))
         shares = _round_lot_shares(affordable, lot_size=lot_size)
         gross_value = shares * first_price
         fee = gross_value * transaction_cost
         cash = capital - gross_value - fee
-        return cash + shares * prices, fee
+        return cash + shares * prices, fee, pd.Series(cash, index=prices.index, dtype=float)
 
     strategy_parts: list[pd.Series] = []
+    cash_parts: list[pd.Series] = []
+    market_parts: list[pd.Series] = []
     benchmark_parts: list[pd.Series] = []
     trade_frames: list[pd.DataFrame] = []
     component_rows: list[dict[str, object]] = []
@@ -329,6 +674,8 @@ def run_portfolio_timing_backtest(
         capital = initial_capital * float(item.weight_pct) / 100
         if item.strategy == PORTFOLIO_STRATEGY_CASH:
             strategy_nav = pd.Series(capital, index=common_dates, dtype=float)
+            strategy_cash = strategy_nav.copy()
+            strategy_market = pd.Series(0.0, index=common_dates, dtype=float)
             benchmark_nav = strategy_nav.copy()
             current_weight = float(item.weight_pct)
             latest_signal = "现金"
@@ -337,10 +684,50 @@ def run_portfolio_timing_backtest(
             benchmark_nav = prices / float(prices.iloc[0]) * capital
             timing_result = None
             if item.strategy == PORTFOLIO_STRATEGY_HOLD:
-                strategy_nav, hold_fee = buy_and_hold_nav(capital, prices)
+                strategy_nav, hold_fee, strategy_cash = buy_and_hold_nav(capital, prices)
+                strategy_market = strategy_nav - strategy_cash
                 total_cost += hold_fee
                 current_weight = float(item.weight_pct)
                 latest_signal = "一直持有"
+            elif (
+                item.initial_entry_policy != PORTFOLIO_INITIAL_ENTRY_FOLLOW_STATE
+                or bool(item.empty_position_symbol)
+            ):
+                signal_frame = _build_timing_signal_frame(
+                    source_data[item.symbol],
+                    common_dates,
+                    ma_period=int(item.ma_period),
+                    threshold_pct=float(item.threshold_pct),
+                )
+                fallback_prices = (
+                    source_data[item.empty_position_symbol]
+                    .set_index("trade_date")["close"]
+                    .reindex(common_dates)
+                    if item.empty_position_symbol
+                    else None
+                )
+                sleeve_result = _run_delayed_timing_sleeve(
+                    item=item,
+                    capital=capital,
+                    primary_prices=prices,
+                    fallback_prices=fallback_prices,
+                    signal_frame=signal_frame,
+                    transaction_cost=transaction_cost,
+                    lot_size=lot_size,
+                )
+                strategy_nav = sleeve_result["nav"]
+                strategy_cash = sleeve_result["cash"]
+                strategy_market = sleeve_result["market"]
+                total_cost += float(sleeve_result["total_cost"])
+                current_weight = float(sleeve_result["current_weight"])
+                latest_signal = str(sleeve_result["latest_signal"])
+                sleeve_trades = sleeve_result["trades"]
+                if not sleeve_trades.empty:
+                    trades = sleeve_trades.copy()
+                    trades.insert(0, "标的名称", item.name or item.symbol)
+                    trades.insert(1, "代码", item.symbol)
+                    trades.insert(2, "配置比例(%)", float(item.weight_pct))
+                    trade_frames.append(trades)
             elif item.strategy == PORTFOLIO_STRATEGY_TIMING:
                 timing_result = timing_runner(
                     fund=fund_by_symbol[item.symbol],
@@ -352,7 +739,10 @@ def run_portfolio_timing_backtest(
                     start_date=actual_start,
                     end_date=actual_end,
                 )
-                strategy_nav = timing_result.data.set_index("日期")["账户净值"].reindex(common_dates)
+                timing_data = timing_result.data.set_index("日期").reindex(common_dates)
+                strategy_nav = timing_data["账户净值"]
+                strategy_cash = timing_data["现金余额"]
+                strategy_market = strategy_nav - strategy_cash
                 total_cost += float(timing_result.summary.get("累计总成本", 0))
                 timing_held = float(timing_result.data.iloc[-1]["持仓份额"]) > 0
                 current_weight = float(item.weight_pct) if timing_held else 0.0
@@ -360,7 +750,7 @@ def run_portfolio_timing_backtest(
             else:
                 hold_capital = capital / 2
                 timing_capital = capital - hold_capital
-                hold_nav, hold_fee = buy_and_hold_nav(hold_capital, prices)
+                hold_nav, hold_fee, hold_cash = buy_and_hold_nav(hold_capital, prices)
                 timing_result = timing_runner(
                     fund=fund_by_symbol[item.symbol],
                     ma_period=int(item.ma_period),
@@ -371,8 +761,11 @@ def run_portfolio_timing_backtest(
                     start_date=actual_start,
                     end_date=actual_end,
                 )
-                timing_nav = timing_result.data.set_index("日期")["账户净值"].reindex(common_dates)
+                timing_data = timing_result.data.set_index("日期").reindex(common_dates)
+                timing_nav = timing_data["账户净值"]
                 strategy_nav = hold_nav + timing_nav
+                strategy_cash = hold_cash + timing_data["现金余额"]
+                strategy_market = strategy_nav - strategy_cash
                 total_cost += hold_fee + float(timing_result.summary.get("累计总成本", 0))
                 timing_held = float(timing_result.data.iloc[-1]["持仓份额"]) > 0
                 current_weight = float(item.weight_pct) if timing_held else float(item.weight_pct) / 2
@@ -386,6 +779,8 @@ def run_portfolio_timing_backtest(
                 trade_frames.append(trades)
 
         strategy_parts.append(strategy_nav.rename(item.symbol or "现金"))
+        cash_parts.append(strategy_cash.rename(item.symbol or "现金"))
+        market_parts.append(strategy_market.rename(item.symbol or "现金"))
         benchmark_parts.append(benchmark_nav.rename(item.symbol or "现金"))
         component_rows.append(
             {
@@ -401,6 +796,8 @@ def run_portfolio_timing_backtest(
         )
 
     strategy_frame = pd.concat(strategy_parts, axis=1)
+    cash_frame = pd.concat(cash_parts, axis=1)
+    market_frame = pd.concat(market_parts, axis=1)
     benchmark_frame = pd.concat(benchmark_parts, axis=1)
     account_values = strategy_frame.sum(axis=1)
     benchmark_values = benchmark_frame.sum(axis=1)
@@ -408,6 +805,8 @@ def run_portfolio_timing_backtest(
         {
             "日期": common_dates,
             "账户净值": account_values.values,
+            "策略持仓市值": market_frame.sum(axis=1).values,
+            "策略现金": cash_frame.sum(axis=1).values,
             "策略累计收益率(%)": (account_values.values / initial_capital - 1) * 100,
             "一直持有净值": benchmark_values.values,
             "一直持有收益率(%)": (benchmark_values.values / initial_capital - 1) * 100,

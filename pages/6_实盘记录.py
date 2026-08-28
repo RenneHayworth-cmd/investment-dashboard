@@ -11,6 +11,9 @@ from components.live_record import (
     format_live_number as _format_live_number,
     money as _money,
     render_daily_close_pnl as _render_daily_close_pnl,
+    render_live_account_dashboard as _render_live_account_dashboard,
+    render_live_cash_flow_details as _render_live_cash_flow_details,
+    render_live_cash_flow_form as _render_live_cash_flow_form,
     render_live_positions_table as _render_live_positions_table,
     render_live_return_calendar as _render_live_return_calendar,
     render_live_symbol_history_table as _render_live_symbol_history_table,
@@ -31,8 +34,10 @@ from services.live_trading import (
     build_live_position_performance,
     build_live_symbol_pnl_history,
     delete_live_trade,
+    delete_live_cash_flow,
     enrich_live_trades,
     list_live_trades,
+    list_live_cash_flows,
     live_close_refresh_due,
     summarize_live_position_performance,
     summarize_live_trades,
@@ -90,19 +95,13 @@ def render_live_symbol_history_table(history: pd.DataFrame) -> None:
 
 @st.fragment(run_every="120s")
 def render_daily_close_pnl() -> None:
-    """缓存优先渲染正式收盘估值；到期时才允许联网补齐。"""
-    _render_daily_close_pnl(
-        list_trades=list_live_trades,
-        load_etf=load_or_fetch_etf,
-        latest_trade_date=latest_final_etf_trade_date,
-        refresh_due=live_close_refresh_due,
-        build_position_performance=build_live_position_performance,
-        build_daily_pnl=build_live_daily_pnl,
-        render_positions=render_live_positions_table,
-        render_calendar=render_live_return_calendar,
-        market_now_provider=lambda: datetime.now(ZoneInfo("Asia/Shanghai")),
-        api_key_provider=lambda: os.getenv("TICKFLOW_API_KEY", ""),
-        adjustment=FUND_ADJUST_NONE,
+    """共享账户模型；本页只使用正式收盘历史。"""
+    _render_live_account_dashboard(
+        api_key=os.getenv("TICKFLOW_API_KEY", ""),
+        formal_fetch_enabled=True,
+        save_to_cache=True,
+        readonly=False,
+        key_prefix="live_record",
     )
 
 
@@ -120,17 +119,24 @@ def render_live_symbol_pnl_history() -> None:
         adjustment=FUND_ADJUST_NONE,
     )
 
-
-trades = list_live_trades()
-_render_live_trade_summary(trades, summarize_trades=summarize_live_trades)
 render_daily_close_pnl()
-_render_live_trade_form(
-    add_trade=add_live_trade,
-    trade_date_value=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
-)
-_render_live_trade_details(
-    trades,
-    enrich_trades=enrich_live_trades,
-    delete_trade=delete_live_trade,
-)
+
+st.subheader("实盘数据维护")
+trade_tab, cash_tab = st.tabs(["新增成交", "账户资金"])
+with trade_tab:
+    trades = list_live_trades()
+    _render_live_trade_summary(trades, summarize_trades=summarize_live_trades)
+    _render_live_trade_form(
+        add_trade=add_live_trade,
+        trade_date_value=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
+    )
+with cash_tab:
+    cash_flows = list_live_cash_flows()
+    _render_live_cash_flow_form(
+        flow_date_value=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
+    )
+    _render_live_cash_flow_details(
+        cash_flows,
+        delete_cash_flow=delete_live_cash_flow,
+    )
 render_live_symbol_pnl_history()

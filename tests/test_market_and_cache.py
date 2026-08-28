@@ -37,6 +37,12 @@ from services.market_calendar import (
     latest_completed_trade_date,
 )
 from services.position_analysis import _cache_has_expected_trade_date
+from services.index_sources_sina import (
+    fetch_hsi_official_completed_close,
+    fetch_sina_hk_realtime_quote,
+    get_sina_hk_index_history,
+)
+from services.index_sources_mx import get_mx_index_history, fetch_mx_realtime_quote
 from services.update_tasks import (
     append_cached_index_rows,
     build_futures_current_contract_report,
@@ -116,6 +122,218 @@ class _FakeSession:
 
 
 class MarketAndCacheTests(unittest.TestCase):
+    @staticmethod
+    def _mx_dto(code, title, headers, fields):
+        indicator_order = [f"field_{index}" for index in range(len(fields))]
+        return {
+            "code": code,
+            "title": title,
+            "table": {
+                "headName": headers,
+                **{
+                    key: values
+                    for key, (_, values) in zip(indicator_order, fields)
+                },
+            },
+            "nameMap": {
+                key: label
+                for key, (label, _) in zip(indicator_order, fields)
+            },
+            "indicatorOrder": indicator_order,
+        }
+
+    @patch("services.index_sources_mx._request_mx_data")
+    def test_mx_history_accepts_only_the_exact_expected_entity(self, request_mock):
+        request_mock.return_value = [
+            self._mx_dto(
+                "HSHYLV.HI",
+                "恒生港股通高股息低波动指数的收盘价",
+                ["2026-08-21(日)", "2026-08-20(日)"],
+                [("收盘价", ["4381.41点", "4343.94点"])],
+            )
+        ]
+
+        result = get_mx_index_history(
+            "恒生港股通高股息低波动指数HSHYLV",
+            "HSHYLV.HI",
+            "港股",
+            days=30,
+        )
+
+        self.assertEqual(result["trade_date"].dt.strftime("%Y-%m-%d").tolist(), ["2026-08-20", "2026-08-21"])
+        self.assertEqual(result["close"].tolist(), [4343.94, 4381.41])
+
+    @patch("services.index_sources_mx._request_mx_data")
+    def test_mx_history_rejects_bk1158_when_service_resolves_861520(self, request_mock):
+        request_mock.return_value = [
+            self._mx_dto(
+                "861520.EI",
+                "微盘股指数的收盘价",
+                ["2026-08-21(日)", "2026-08-20(日)"],
+                [("收盘价", ["3464.686点", "3461.8662点"])],
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "90.BK1158"):
+            get_mx_index_history("微盘股BK1158", "90.BK1158", "A股", days=30)
+
+    @patch("services.index_sources_mx._request_mx_data")
+    def test_mx_realtime_quote_parses_exact_hshylv_snapshot(self, request_mock):
+        request_mock.return_value = [
+            self._mx_dto(
+                "HSHYLV.HI",
+                "恒生港股通高股息低波动指数当前行情",
+                ["2026-08-25 10:00"],
+                [
+                    ("最新价", ["4357.89"]),
+                    ("涨跌幅", ["0.136%"]),
+                    ("开盘价", ["4355.00"]),
+                ],
+            )
+        ]
+
+        result = fetch_mx_realtime_quote(
+            "恒生港股通高股息低波动指数HSHYLV",
+            "HSHYLV.HI",
+            "港股",
+            now=datetime(2026, 8, 25, 10, 1, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+        )
+
+        self.assertEqual(result["price"], 4357.89)
+        self.assertEqual(result["change_pct"], 0.136)
+        self.assertEqual(result["source"], "东方财富妙想")
+
+    @patch("akshare.stock_hk_index_daily_sina")
+    def test_sina_hk_history_excludes_unsettled_current_session(self, history_mock):
+        history_mock.return_value = pd.DataFrame(
+            {
+                "date": ["2026-08-24", "2026-08-25"],
+                "open": [4367.0, 4355.0],
+                "high": [4367.48, 4370.0],
+                "low": [4344.3, 4340.0],
+                "close": [4351.97, 4360.0],
+                "volume": [0, 0],
+            }
+        )
+
+        result = get_sina_hk_index_history(
+            "HSHYLV",
+            now=datetime(2026, 8, 25, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+        )
+
+        self.assertEqual(result["trade_date"].dt.strftime("%Y-%m-%d").tolist(), ["2026-08-24"])
+        self.assertEqual(result.iloc[0]["close"], 4351.97)
+
+    @patch("requests.Session")
+    def test_hsi_official_close_requires_completed_target_session(self, session_factory):
+        class OfficialResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "indexSeriesList": [
+                        {
+                            "indexList": [
+                                {
+                                    "indexValue": "4351.97",
+                                    "lastUpdate": "2026-08-24 16:08:42",
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+        class OfficialSession:
+            trust_env = False
+
+            def get(self, *_args, **_kwargs):
+                return OfficialResponse()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = OfficialSession()
+
+        result = fetch_hsi_official_completed_close(
+            "hshylv",
+            now=datetime(2026, 8, 25, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+        )
+
+        self.assertEqual(result.iloc[0]["trade_date"], pd.Timestamp("2026-08-24"))
+        self.assertEqual(result.iloc[0]["close"], 4351.97)
+
+    @patch("requests.Session")
+    def test_hsi_official_close_uses_previous_close_after_next_session_opens(self, session_factory):
+        class OfficialResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "indexSeriesList": [
+                        {
+                            "indexList": [
+                                {
+                                    "indexValue": "4360.31",
+                                    "previousClose": "4351.97",
+                                    "lastUpdate": "2026-08-25 09:32:00",
+                                }
+                            ]
+                        }
+                    ]
+                }
+
+        class OfficialSession:
+            trust_env = False
+
+            def get(self, *_args, **_kwargs):
+                return OfficialResponse()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = OfficialSession()
+
+        result = fetch_hsi_official_completed_close(
+            "hshylv",
+            now=datetime(2026, 8, 25, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+        )
+
+        self.assertEqual(result.iloc[0]["trade_date"], pd.Timestamp("2026-08-24"))
+        self.assertEqual(result.iloc[0]["close"], 4351.97)
+
+    @patch("requests.Session")
+    def test_sina_hk_realtime_quote_parser(self, session_factory):
+        payload = (
+            'var hq_str_rt_hkHSHYLV="HSHYLV,恒生港股通高息低波,4355.00,'
+            '4351.97,4370.00,4340.00,4357.89,5.92,0.136,0,0,123456,0,0,0,0,0,'
+            '2026/08/25,10:00:01";'
+        ).encode("gb18030")
+
+        class RealtimeResponse:
+            content = payload
+
+            def raise_for_status(self):
+                return None
+
+        class RealtimeSession:
+            trust_env = False
+
+            def get(self, *_args, **_kwargs):
+                return RealtimeResponse()
+
+            def close(self):
+                return None
+
+        session_factory.return_value = RealtimeSession()
+
+        result = fetch_sina_hk_realtime_quote("HSHYLV")
+
+        self.assertEqual(result["price"], 4357.89)
+        self.assertEqual(result["previous_close"], 4351.97)
+        self.assertEqual(result["source"], "新浪财经")
+
     @patch("requests.Session")
     def test_yahoo_chart_retries_alternate_host(self, session_factory):
         calls = []

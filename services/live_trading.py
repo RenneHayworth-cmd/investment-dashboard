@@ -14,6 +14,7 @@ LIVE_TRADE_SIDES = ("买入", "卖出")
 LIVE_TRADE_COLUMNS = [
     "id",
     "trade_date",
+    "trade_time",
     "symbol",
     "name",
     "side",
@@ -139,9 +140,24 @@ def _normalized_trade_date(value: date | datetime | str | pd.Timestamp) -> str:
     return pd.Timestamp(trade_date).strftime("%Y-%m-%d")
 
 
+def _normalized_optional_time(value: object) -> str | None:
+    if value is None or str(value).strip() == "":
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%H:%M:%S")
+        except (TypeError, ValueError):
+            pass
+    parsed = pd.to_datetime(str(value).strip(), errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError("成交时间无效。")
+    return pd.Timestamp(parsed).strftime("%H:%M:%S")
+
+
 def add_live_trade(
     *,
     trade_date: date | datetime | str | pd.Timestamp,
+    trade_time: object = None,
     symbol: str,
     name: str,
     side: str,
@@ -154,6 +170,8 @@ def add_live_trade(
 ) -> tuple[int, bool]:
     init_db()
     normalized_symbol = normalize_live_trade_symbol(symbol)
+    if len(normalized_symbol) != 6 or not normalized_symbol.isdigit():
+        raise ValueError("实盘记录首期仅支持六位ETF代码。")
     normalized_name = str(name or "").strip() or normalized_symbol
     normalized_side = str(side or "").strip()
     if normalized_side not in LIVE_TRADE_SIDES:
@@ -168,37 +186,25 @@ def add_live_trade(
     if fee_rate_pct < 0:
         raise ValueError("手续费率不能为负数。")
     normalized_trade_date = _normalized_trade_date(trade_date)
+    normalized_trade_time = _normalized_optional_time(trade_time)
     normalized_strategy = str(strategy or "").strip()
     normalized_notes = str(notes or "").strip()
     normalized_record_key = str(record_key).strip() if record_key else None
 
     with closing(get_conn()) as conn:
-        if normalized_side == "卖出":
-            current_quantity = conn.execute(
-                """
-                SELECT COALESCE(SUM(CASE WHEN side='买入' THEN quantity ELSE -quantity END), 0)
-                FROM live_trades
-                WHERE symbol=? AND trade_date<=?
-                """,
-                (normalized_symbol, normalized_trade_date),
-            ).fetchone()[0]
-            if int(current_quantity) < quantity:
-                raise ValueError(
-                    f"卖出数量超过当前记录持仓，最多可卖出 {int(current_quantity)} 份。"
-                )
-
         created_at = datetime.now().isoformat(timespec="seconds")
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO live_trades (
-                record_key, trade_date, symbol, name, side, price, quantity,
+                record_key, trade_date, trade_time, symbol, name, side, price, quantity,
                 fee_rate_pct, strategy, notes, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized_record_key,
                 normalized_trade_date,
+                normalized_trade_time,
                 normalized_symbol,
                 normalized_name,
                 normalized_side,
@@ -213,10 +219,52 @@ def add_live_trade(
         created = cursor.rowcount > 0
         if created:
             trade_id = int(cursor.lastrowid)
+            if normalized_side == "卖出":
+                candidate_trades = pd.read_sql_query(
+                    """
+                    SELECT id, trade_date, trade_time, symbol, name, side, price, quantity,
+                           fee_rate_pct, strategy, notes, created_at
+                    FROM live_trades
+                    ORDER BY trade_date, COALESCE(trade_time, ''), id
+                    """,
+                    conn,
+                )
+                try:
+                    build_live_positions(candidate_trades)
+                except ValueError as exc:
+                    ordered_candidates = candidate_trades.assign(
+                        _trade_time=candidate_trades["trade_time"].fillna("").astype(str)
+                    ).sort_values(["trade_date", "_trade_time", "id"])
+                    candidate_offset = next(
+                        offset
+                        for offset, row_id in enumerate(ordered_candidates["id"])
+                        if int(row_id) == trade_id
+                    )
+                    prior_symbol_trades = ordered_candidates.iloc[:candidate_offset]
+                    prior_symbol_trades = prior_symbol_trades[
+                        prior_symbol_trades["symbol"].astype(str).eq(normalized_symbol)
+                    ]
+                    available_quantity = int(
+                        prior_symbol_trades["quantity"]
+                        .where(
+                            prior_symbol_trades["side"].eq("买入"),
+                            -prior_symbol_trades["quantity"],
+                        )
+                        .sum()
+                    )
+                    conn.rollback()
+                    if available_quantity < quantity:
+                        raise ValueError(
+                            "卖出数量超过该成交时点的记录持仓，"
+                            f"最多可卖出 {max(0, available_quantity)} 份；本次记录未保存。"
+                        ) from exc
+                    raise ValueError(
+                        "本次卖出会造成后续历史持仓为负，本次记录未保存。"
+                    ) from exc
         elif normalized_record_key:
             row = conn.execute(
                 """
-                SELECT id, trade_date, symbol, name, side, price, quantity,
+                SELECT id, trade_date, trade_time, symbol, name, side, price, quantity,
                        fee_rate_pct, strategy, notes
                 FROM live_trades WHERE record_key=?
                 """,
@@ -227,6 +275,7 @@ def add_live_trade(
             existing = tuple(row[1:])
             requested = (
                 normalized_trade_date,
+                normalized_trade_time,
                 normalized_symbol,
                 normalized_name,
                 normalized_side,
@@ -250,10 +299,10 @@ def list_live_trades() -> pd.DataFrame:
     with closing(get_conn()) as conn:
         result = pd.read_sql_query(
             """
-            SELECT id, trade_date, symbol, name, side, price, quantity,
+            SELECT id, trade_date, trade_time, symbol, name, side, price, quantity,
                    fee_rate_pct, strategy, notes, created_at
             FROM live_trades
-            ORDER BY trade_date DESC, id DESC
+            ORDER BY trade_date DESC, COALESCE(trade_time, '') DESC, id DESC
             """,
             conn,
         )
@@ -270,10 +319,10 @@ def delete_live_trade(trade_id: int) -> bool:
             return False
         remaining = pd.read_sql_query(
             """
-            SELECT id, trade_date, symbol, name, side, price, quantity,
+            SELECT id, trade_date, trade_time, symbol, name, side, price, quantity,
                    fee_rate_pct, strategy, notes, created_at
             FROM live_trades
-            ORDER BY trade_date DESC, id DESC
+            ORDER BY trade_date DESC, COALESCE(trade_time, '') DESC, id DESC
             """,
             conn,
         )
@@ -289,9 +338,12 @@ def delete_live_trade(trade_id: int) -> bool:
 def enrich_live_trades(trades: pd.DataFrame) -> pd.DataFrame:
     if trades is None or trades.empty:
         return pd.DataFrame(
-            columns=LIVE_TRADE_COLUMNS + ["gross_amount", "fee_amount", "cash_amount"]
+            columns=LIVE_TRADE_COLUMNS
+            + ["gross_amount", "fee_amount", "cash_amount", "realized_pnl"]
         )
     result = trades.copy()
+    if "trade_time" not in result.columns:
+        result["trade_time"] = None
     result["price"] = pd.to_numeric(result["price"], errors="coerce")
     result["quantity"] = pd.to_numeric(result["quantity"], errors="coerce")
     result["fee_rate_pct"] = pd.to_numeric(result["fee_rate_pct"], errors="coerce")
@@ -302,6 +354,27 @@ def enrich_live_trades(trades: pd.DataFrame) -> pd.DataFrame:
     result.loc[sell_mask, "cash_amount"] = (
         result.loc[sell_mask, "gross_amount"] - result.loc[sell_mask, "fee_amount"]
     )
+    result["realized_pnl"] = pd.Series(pd.NA, index=result.index, dtype="Float64")
+    ordered = result.assign(
+        _trade_date=pd.to_datetime(result["trade_date"], errors="coerce"),
+        _trade_time=result["trade_time"].fillna("").astype(str),
+    ).sort_values(["_trade_date", "_trade_time", "id"])
+    states: dict[str, dict[str, float | int]] = {}
+    for index, row in ordered.iterrows():
+        symbol = normalize_live_trade_symbol(row["symbol"])
+        state = states.setdefault(symbol, {"quantity": 0, "cost_basis": 0.0})
+        if row["side"] == "买入":
+            state["quantity"] = int(state["quantity"]) + int(row["quantity"])
+            state["cost_basis"] = float(state["cost_basis"]) + float(row["cash_amount"])
+            continue
+        held_quantity = int(state["quantity"])
+        if held_quantity < int(row["quantity"]):
+            continue
+        average_cost = float(state["cost_basis"]) / held_quantity if held_quantity else 0.0
+        removed_cost = average_cost * int(row["quantity"])
+        state["quantity"] = held_quantity - int(row["quantity"])
+        state["cost_basis"] = max(0.0, float(state["cost_basis"]) - removed_cost)
+        result.loc[index, "realized_pnl"] = float(row["cash_amount"]) - removed_cost
     return result
 
 
@@ -347,7 +420,9 @@ def build_live_positions(trades: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
 
     states: dict[str, dict[str, object]] = {}
-    ordered = enriched.sort_values(["trade_date", "id"])
+    ordered = enriched.assign(
+        _trade_time=enriched["trade_time"].fillna("").astype(str)
+    ).sort_values(["trade_date", "_trade_time", "id"])
     for row in ordered.itertuples(index=False):
         state = states.setdefault(
             str(row.symbol),
@@ -430,7 +505,10 @@ def build_live_daily_pnl(
     enriched["trade_date"] = pd.to_datetime(
         enriched["trade_date"], errors="coerce"
     ).dt.normalize()
-    enriched = enriched.dropna(subset=["trade_date"]).sort_values(["trade_date", "id"])
+    enriched = enriched.dropna(subset=["trade_date"])
+    enriched = enriched.assign(
+        _trade_time=enriched["trade_time"].fillna("").astype(str)
+    ).sort_values(["trade_date", "_trade_time", "id"])
     if enriched.empty:
         return pd.DataFrame(columns=LIVE_DAILY_PNL_COLUMNS)
 
@@ -451,7 +529,7 @@ def build_live_daily_pnl(
     )
 
     trades_by_date = {
-        pd.Timestamp(trade_date): group.sort_values("id")
+        pd.Timestamp(trade_date): group.sort_values(["_trade_time", "id"])
         for trade_date, group in enriched.groupby("trade_date")
     }
     price_by_date: dict[pd.Timestamp, dict[str, float]] = {}
@@ -497,17 +575,18 @@ def build_live_daily_pnl(
         held_symbols = [
             symbol for symbol, state in states.items() if int(state["quantity"]) > 0
         ]
+        day_prices = price_by_date.get(valuation_date, {})
         complete_close = all(
-            symbol in latest_prices
+            symbol in day_prices
             and symbol in history_end_dates
             and history_end_dates[symbol] >= valuation_date
             for symbol in held_symbols
         )
         if not complete_close:
-            continue
+            break
 
         market_value = sum(
-            int(states[symbol]["quantity"]) * latest_prices[symbol]
+            int(states[symbol]["quantity"]) * day_prices[symbol]
             for symbol in held_symbols
         )
         cost_basis = sum(float(state["cost_basis"]) for state in states.values())
@@ -987,4 +1066,94 @@ def append_live_symbol_pnl_total(history: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(
         [history, pd.DataFrame([total_row], columns=LIVE_SYMBOL_PNL_COLUMNS)],
         ignore_index=True,
+    )
+
+
+# Keep the existing live-trading module as the stable public entrypoint while
+# the account ledger and equity calculations live in a focused sibling module.
+LIVE_CASH_FLOW_TYPES = (
+    "期初资金",
+    "资金转入",
+    "资金转出",
+    "现金分红",
+    "利息",
+    "其他收入",
+    "其他支出",
+)
+
+
+def add_live_cash_flow(
+    *,
+    flow_date: date | datetime | str | pd.Timestamp,
+    flow_time: object = None,
+    entry_type: str,
+    amount: float,
+    symbol: str = "",
+    notes: str = "",
+) -> int:
+    from services.live_account import add_live_cash_flow as implementation
+
+    return implementation(
+        flow_date=flow_date,
+        flow_time=flow_time,
+        entry_type=entry_type,
+        amount=amount,
+        symbol=symbol,
+        notes=notes,
+    )
+
+
+def list_live_cash_flows() -> pd.DataFrame:
+    from services.live_account import list_live_cash_flows as implementation
+
+    return implementation()
+
+
+def delete_live_cash_flow(flow_id: int) -> bool:
+    from services.live_account import delete_live_cash_flow as implementation
+
+    return implementation(flow_id)
+
+
+def live_account_is_initialized(cash_flows: pd.DataFrame | None) -> bool:
+    from services.live_account import live_account_is_initialized as implementation
+
+    return implementation(cash_flows)
+
+
+def build_live_account_daily(
+    trades: pd.DataFrame,
+    cash_flows: pd.DataFrame,
+    price_histories: dict[str, pd.DataFrame],
+    *,
+    holding_daily: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    from services.live_account import build_live_account_daily as implementation
+
+    return implementation(
+        trades,
+        cash_flows,
+        price_histories,
+        holding_daily=holding_daily,
+    )
+
+
+def build_live_account_snapshot(
+    trades: pd.DataFrame,
+    cash_flows: pd.DataFrame,
+    price_histories: dict[str, pd.DataFrame],
+    *,
+    quotes: dict[str, dict[str, object]] | None = None,
+    market_now: datetime,
+    formal_target_date: object = None,
+) -> dict[str, object]:
+    from services.live_account import build_live_account_snapshot as implementation
+
+    return implementation(
+        trades,
+        cash_flows,
+        price_histories,
+        quotes=quotes,
+        market_now=market_now,
+        formal_target_date=formal_target_date,
     )

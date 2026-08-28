@@ -67,6 +67,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 record_key TEXT UNIQUE,
                 trade_date TEXT NOT NULL,
+                trade_time TEXT,
                 symbol TEXT NOT NULL,
                 name TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -77,6 +78,31 @@ def init_db() -> None:
                 notes TEXT,
                 created_at TEXT NOT NULL
             )
+            """
+        )
+        live_trade_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(live_trades)")
+        }
+        if "trade_time" not in live_trade_columns:
+            conn.execute("ALTER TABLE live_trades ADD COLUMN trade_time TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_cash_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                flow_date TEXT NOT NULL,
+                flow_time TEXT,
+                entry_type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                symbol TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_live_cash_flows_date
+            ON live_cash_flows(flow_date, flow_time, id)
             """
         )
         conn.execute(

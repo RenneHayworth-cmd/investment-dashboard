@@ -140,6 +140,16 @@ before a larger handoff or commit.
   supplement same-day spot prices so they do not remain stale during the
   trading day. Global indices may use Yahoo chart fallback when the AkShare
   Eastmoney global endpoint fails.
+  Hang Seng SCHK High Dividend Low Volatility may use Sina's Hong Kong index
+  daily history to append missing settled dates and the Hang Seng Indexes
+  official close as an independent confirmation. Its manual intraday card
+  quote may use Sina realtime data. Miaoxiang may be used after Sina fails only
+  when the response entity is exactly `HSHYLV.HI`; all Miaoxiang rows must be
+  filtered to completed sessions and appended by unseen date only. Its realtime
+  quote remains transient and must never be written to formal daily history.
+  Do not use Miaoxiang `861520.EI` as a fallback for `90.BK1158`: their absolute
+  levels and daily returns are different despite both resolving to a micro-cap
+  label.
 - `国证自由现金流` (`980092`) uses AkShare's official CNI history
   endpoint (`index_hist_cni`) so its back-calculated series reaches the
   2012-12-31 base date; generic A-share and TickFlow history are shorter.
@@ -148,14 +158,14 @@ before a larger handoff or commit.
   style should stay consistent so users do not have to relearn the page.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
   contracts, futures spreads, and reusable futures-option data. Its default
-  futures contract is `I2609`; its default spreads are `I2609 - I2705` and
+  futures contract is `I2701`; its default spreads are `I2701 - I2705` and
   `IM2609 - IM2703`, calculated independently with the futures-spread service.
   On an A-share trading day, fetch one ETF quote batch every 10 minutes from
   09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
   lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
   from 14:50 through 15:00. Each batch updates all ETF cards and the transient
   timing-table preview for configured timing symbols. Use the same schedule to
-  refresh the `I2609` futures card and the two futures-spread cards, retaining
+  refresh the `I2701` futures card and the two futures-spread cards, retaining
   their last successful transient values when one source fails. These previews
   remain transient and must not affect formal history or recent operation guidance.
   It should read local cache on first render
@@ -220,6 +230,18 @@ before a larger handoff or commit.
   digits without `.SH` or `.SZ` in cards, tables, and detail captions. At the
   very bottom, show every position transition reconstructed from formal daily
   closes in the latest seven calendar days; intraday quotes must not affect it.
+  Immediately below the ETF timing table, show the fixed 500,000-yuan daily
+  strategy result starting on 2026-08-05. Enter only symbols whose formal signal
+  is a fresh buy on that date; an initial hold must first pass through empty and
+  then a later buy, while an initial empty waits for its later buy. Start 512890
+  at zero and activate each 510500/159967/159552 parking sleeve only after that
+  source has first been bought and subsequently sold. Before delayed activation,
+  both halves of a half-timing sleeve stay in cash; its first valid buy establishes
+  the full sleeve and later sells reduce it to the long-term half. Use formal
+  forward-adjusted closes, 100-share lots, 0.006% one-way fees, same-close
+  execution, and no network request or result cache. Keep the start-date account
+  value at 500,000 and NAV at 1 with setup fees disclosed separately; include
+  later fees in daily P&L. Stop before the first incomplete formal session.
 - The `实盘记录` page stores actual executions separately from simulated
   backtests in the local `live_trades` SQLite table. Treat `fee_rate_pct` as a
   percentage value, calculate position cost with fees included, and use moving

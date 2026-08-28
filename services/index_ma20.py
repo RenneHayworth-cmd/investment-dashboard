@@ -218,11 +218,11 @@ def get_index_data_from_yahoo(symbol: str, index_name: str, days: int = 30):
 def is_sparse_daily_history(df: pd.DataFrame) -> bool:
     return _dispatch('is_sparse_daily_history', df)
 
-def get_index_data_from_eastmoney_kline(secid: str, index_name: str, days: int = 30, fqt: str = '0', akshare_board_symbol: str | None = None, akshare_hk_em_symbol: str | None = None) -> pd.DataFrame | None:
-    return _dispatch('get_index_data_from_eastmoney_kline', secid, index_name, days, fqt, akshare_board_symbol, akshare_hk_em_symbol)
+def get_index_data_from_eastmoney_kline(secid: str, index_name: str, days: int = 30, fqt: str = '0', akshare_board_symbol: str | None = None, akshare_hk_em_symbol: str | None = None, sina_hk_symbol: str | None = None, hsi_official_series: str | None = None, mx_query_name: str | None = None, mx_expected_code: str | None = None) -> pd.DataFrame | None:
+    return _dispatch('get_index_data_from_eastmoney_kline', secid, index_name, days, fqt, akshare_board_symbol, akshare_hk_em_symbol, sina_hk_symbol, hsi_official_series, mx_query_name, mx_expected_code)
 
-def get_index_data_from_akshare_eastmoney_fallback(secid: str, index_name: str, days: int, fqt: str, board_symbol: str | None, hk_em_symbol: str | None, last_error: Exception | None) -> pd.DataFrame | None:
-    return _dispatch('get_index_data_from_akshare_eastmoney_fallback', secid, index_name, days, fqt, board_symbol, hk_em_symbol, last_error)
+def get_index_data_from_akshare_eastmoney_fallback(secid: str, index_name: str, days: int, fqt: str, board_symbol: str | None, hk_em_symbol: str | None, last_error: Exception | None, sina_hk_symbol: str | None = None, hsi_official_series: str | None = None, mx_query_name: str | None = None, mx_expected_code: str | None = None) -> pd.DataFrame | None:
+    return _dispatch('get_index_data_from_akshare_eastmoney_fallback', secid, index_name, days, fqt, board_symbol, hk_em_symbol, last_error, sina_hk_symbol, hsi_official_series, mx_query_name, mx_expected_code)
 
 def fetch_eastmoney_completed_global_row(secid: str, market_name: str, *, now: datetime | None = None) -> pd.DataFrame | None:
     return _dispatch('fetch_eastmoney_completed_global_row', secid, market_name, now=now)

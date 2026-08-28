@@ -83,6 +83,7 @@ def render_etf_operation_guidance(df: pd.DataFrame) -> None:
 def render_etf_timing_section(
     etf_codes: list[str],
     *,
+    quote_codes: list[str] | None = None,
     position_items: list[PositionItem],
     show_cache_caption: bool,
     api_key: str,
@@ -96,6 +97,7 @@ def render_etf_timing_section(
     """保留单一实时 fragment，实现由组件承载。"""
     render_etf_timing_section_impl(
         etf_codes,
+        quote_codes=quote_codes,
         position_items=position_items,
         show_cache_caption=show_cache_caption,
         api_key=api_key,

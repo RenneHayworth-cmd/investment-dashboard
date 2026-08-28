@@ -9,8 +9,11 @@ import pandas as pd
 
 from core import db
 from services.live_trading import (
+    add_live_cash_flow,
     add_live_trade,
     append_live_symbol_pnl_total,
+    build_live_account_daily,
+    build_live_account_snapshot,
     build_live_daily_pnl,
     build_live_daily_returns,
     build_live_period_returns,
@@ -18,8 +21,10 @@ from services.live_trading import (
     build_live_positions,
     build_live_return_month_grid,
     build_live_symbol_pnl_history,
+    delete_live_cash_flow,
     delete_live_trade,
     live_close_refresh_due,
+    list_live_cash_flows,
     list_live_trades,
     summarize_live_position_performance,
     summarize_live_trades,
@@ -70,6 +75,300 @@ class LiveTradingTests(unittest.TestCase):
         self.assertAlmostEqual(summary["net_investment"], 47145.3852)
         self.assertEqual(positions.iloc[0]["quantity"], 22200)
         self.assertAlmostEqual(positions.iloc[0]["average_cost"], 2.123666)
+
+    def test_schema_upgrade_adds_trade_time_and_cash_flow_table(self):
+        with sqlite3.connect(self.database_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE live_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_key TEXT UNIQUE,
+                    trade_date TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    fee_rate_pct REAL NOT NULL,
+                    strategy TEXT,
+                    notes TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+        db.init_db()
+        with sqlite3.connect(self.database_path) as conn:
+            trade_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(live_trades)")
+            }
+            cash_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='live_cash_flows'"
+            ).fetchone()
+        self.assertIn("trade_time", trade_columns)
+        self.assertIsNotNone(cash_table)
+
+    def test_trade_time_is_optional_and_controls_display_order(self):
+        add_live_trade(
+            trade_date="2026-08-05",
+            trade_time="09:35:10",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=2,
+            quantity=100,
+            fee_rate_pct=0,
+        )
+        add_live_trade(
+            trade_date="2026-08-05",
+            symbol="518850",
+            name="黄金ETF华夏",
+            side="买入",
+            price=8,
+            quantity=100,
+            fee_rate_pct=0,
+        )
+        trades = list_live_trades()
+        self.assertEqual(trades.iloc[0]["trade_time"], "09:35:10")
+        self.assertTrue(pd.isna(trades.iloc[1]["trade_time"]))
+
+    def test_backfilled_sell_cannot_precede_same_day_buy(self):
+        add_live_trade(
+            trade_date="2026-08-05",
+            trade_time="10:00:00",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=2,
+            quantity=100,
+            fee_rate_pct=0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "本次记录未保存"):
+            add_live_trade(
+                trade_date="2026-08-05",
+                trade_time="09:30:00",
+                symbol="159501",
+                name="纳指ETF嘉实",
+                side="卖出",
+                price=2,
+                quantity=100,
+                fee_rate_pct=0,
+            )
+
+        trades = list_live_trades()
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades.iloc[0]["side"], "买入")
+
+    def test_cash_ledger_builds_account_equity_and_internal_income(self):
+        add_live_cash_flow(
+            flow_date="2026-08-05",
+            entry_type="期初资金",
+            amount=10_000,
+        )
+        add_live_trade(
+            trade_date="2026-08-05",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=10,
+            quantity=100,
+            fee_rate_pct=1,
+        )
+        add_live_cash_flow(
+            flow_date="2026-08-05",
+            entry_type="现金分红",
+            amount=20,
+            symbol="159501",
+        )
+        history = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-05", "2026-08-06"]), "price": [10, 11]}
+        )
+        account = build_live_account_daily(
+            list_live_trades(),
+            list_live_cash_flows(),
+            {"159501": history},
+        )
+        self.assertAlmostEqual(account.iloc[0]["cash"], 9010.0)
+        self.assertAlmostEqual(account.iloc[0]["total_assets"], 10010.0)
+        self.assertAlmostEqual(account.iloc[0]["account_pnl"], 10.0)
+        self.assertAlmostEqual(account.iloc[1]["daily_pnl"], 100.0)
+        self.assertAlmostEqual(account.iloc[1]["return_base"], 10010.0)
+
+    def test_external_deposit_changes_return_base_but_not_profit(self):
+        add_live_cash_flow(
+            flow_date="2026-08-05", entry_type="期初资金", amount=10_000
+        )
+        add_live_trade(
+            trade_date="2026-08-05",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=10,
+            quantity=100,
+            fee_rate_pct=1,
+        )
+        add_live_cash_flow(
+            flow_date="2026-08-06", entry_type="资金转入", amount=1_000
+        )
+        history = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-05", "2026-08-06"]), "price": [10, 11]}
+        )
+        account = build_live_account_daily(
+            list_live_trades(), list_live_cash_flows(), {"159501": history}
+        )
+        self.assertAlmostEqual(account.iloc[1]["external_flow"], 1000.0)
+        self.assertAlmostEqual(account.iloc[1]["daily_pnl"], 100.0)
+        self.assertAlmostEqual(account.iloc[1]["return_base"], 10990.0)
+
+    def test_withdrawal_does_not_reduce_account_return_base(self):
+        add_live_cash_flow(
+            flow_date="2026-08-05", entry_type="期初资金", amount=10_000
+        )
+        add_live_trade(
+            trade_date="2026-08-05",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=10,
+            quantity=100,
+            fee_rate_pct=0,
+        )
+        add_live_cash_flow(
+            flow_date="2026-08-06", entry_type="资金转出", amount=1_000
+        )
+        history = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-05", "2026-08-06"]), "price": [10, 10]}
+        )
+        account = build_live_account_daily(
+            list_live_trades(), list_live_cash_flows(), {"159501": history}
+        )
+        self.assertAlmostEqual(account.iloc[1]["external_flow"], -1000.0)
+        self.assertAlmostEqual(account.iloc[1]["daily_pnl"], 0.0)
+        self.assertAlmostEqual(account.iloc[1]["return_base"], 10000.0)
+
+    def test_realtime_snapshot_is_transient_and_requires_complete_quotes(self):
+        add_live_cash_flow(
+            flow_date="2026-08-05", entry_type="期初资金", amount=10_000
+        )
+        add_live_trade(
+            trade_date="2026-08-05",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=10,
+            quantity=100,
+            fee_rate_pct=0,
+        )
+        history = pd.DataFrame(
+            {"date": pd.to_datetime(["2026-08-05"]), "price": [10.0]}
+        )
+        snapshot = build_live_account_snapshot(
+            list_live_trades(),
+            list_live_cash_flows(),
+            {"159501": history},
+            quotes={
+                "159501": {
+                    "price": 12.0,
+                    "quote_time": datetime(2026, 8, 6, 10, 0),
+                }
+            },
+            market_now=datetime(2026, 8, 6, 10, 1),
+            formal_target_date="2026-08-05",
+        )
+        self.assertEqual(len(history), 1)
+        self.assertEqual(snapshot["formal_holding_daily"].iloc[-1]["date"], pd.Timestamp("2026-08-05"))
+        self.assertEqual(snapshot["view_holding_daily"].iloc[-1]["date"], pd.Timestamp("2026-08-06"))
+        self.assertEqual(snapshot["positions"].iloc[0]["price_status"], "实时")
+        self.assertAlmostEqual(snapshot["summary"]["total_assets"], 10200.0)
+
+    def test_partial_realtime_quotes_use_labelled_formal_fallback_and_reconcile(self):
+        add_live_cash_flow(
+            flow_date="2026-08-05", entry_type="期初资金", amount=20_000
+        )
+        for symbol in ("159501", "510500"):
+            add_live_trade(
+                trade_date="2026-08-05",
+                symbol=symbol,
+                name=symbol,
+                side="买入",
+                price=10,
+                quantity=100,
+                fee_rate_pct=0,
+            )
+        histories = {
+            symbol: pd.DataFrame(
+                {"date": pd.to_datetime(["2026-08-05"]), "price": [10.0]}
+            )
+            for symbol in ("159501", "510500")
+        }
+        snapshot = build_live_account_snapshot(
+            list_live_trades(),
+            list_live_cash_flows(),
+            histories,
+            quotes={
+                "159501": {
+                    "price": 12.0,
+                    "quote_time": datetime(2026, 8, 6, 10, 0),
+                }
+            },
+            market_now=datetime(2026, 8, 6, 10, 1),
+            formal_target_date="2026-08-05",
+        )
+        positions = snapshot["positions"].set_index("symbol")
+        self.assertAlmostEqual(positions.loc["159501", "market_value"], 1200.0)
+        self.assertAlmostEqual(positions.loc["510500", "market_value"], 1000.0)
+        self.assertEqual(positions.loc["159501", "price_status"], "实时")
+        self.assertEqual(positions.loc["510500", "price_status"], "正式收盘")
+        self.assertAlmostEqual(snapshot["summary"]["market_value"], 2200.0)
+        self.assertAlmostEqual(snapshot["summary"]["total_assets"], 20200.0)
+        self.assertEqual(snapshot["incomplete_realtime_symbols"], ["510500"])
+
+    def test_same_day_buy_uses_quote_and_fee_in_transient_account_pnl(self):
+        add_live_cash_flow(
+            flow_date="2026-08-06", entry_type="期初资金", amount=10_000
+        )
+        add_live_trade(
+            trade_date="2026-08-06",
+            trade_time="10:00:00",
+            symbol="159501",
+            name="纳指ETF嘉实",
+            side="买入",
+            price=10,
+            quantity=100,
+            fee_rate_pct=1,
+        )
+        snapshot = build_live_account_snapshot(
+            list_live_trades(),
+            list_live_cash_flows(),
+            {
+                "159501": pd.DataFrame(
+                    {"date": pd.to_datetime(["2026-08-05"]), "price": [9.0]}
+                )
+            },
+            quotes={
+                "159501": {
+                    "price": 11.0,
+                    "quote_time": datetime(2026, 8, 6, 10, 5),
+                }
+            },
+            market_now=datetime(2026, 8, 6, 10, 6),
+            formal_target_date="2026-08-05",
+        )
+        self.assertAlmostEqual(snapshot["summary"]["cash"], 8990.0)
+        self.assertAlmostEqual(snapshot["summary"]["market_value"], 1100.0)
+        self.assertAlmostEqual(snapshot["summary"]["total_assets"], 10090.0)
+        self.assertAlmostEqual(snapshot["summary"]["daily_pnl"], 90.0)
+
+    def test_cash_flow_requires_opening_and_can_be_deleted(self):
+        with self.assertRaisesRegex(ValueError, "先录入期初资金"):
+            add_live_cash_flow(
+                flow_date="2026-08-05", entry_type="资金转入", amount=1_000
+            )
+        flow_id = add_live_cash_flow(
+            flow_date="2026-08-05", entry_type="期初资金", amount=1_000
+        )
+        self.assertTrue(delete_live_cash_flow(flow_id))
+        self.assertTrue(list_live_cash_flows().empty)
 
     def test_close_refresh_backfills_weekend_and_rechecks_when_target_changes(self):
         saturday = datetime(2026, 8, 15, 10, 0)
@@ -311,6 +610,34 @@ class LiveTradingTests(unittest.TestCase):
 
         daily = build_live_daily_pnl(list_live_trades(), histories)
 
+        self.assertEqual(daily["date"].tolist(), [pd.Timestamp("2026-08-05")])
+
+    def test_daily_pnl_stops_at_first_internal_formal_gap(self):
+        for symbol in ("159501", "510500"):
+            add_live_trade(
+                trade_date="2026-08-05",
+                symbol=symbol,
+                name=symbol,
+                side="买入",
+                price=10,
+                quantity=100,
+                fee_rate_pct=0,
+            )
+        histories = {
+            "159501": pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-08-05", "2026-08-06", "2026-08-07"]),
+                    "price": [10.0, 11.0, 12.0],
+                }
+            ),
+            "510500": pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-08-05", "2026-08-07"]),
+                    "price": [10.0, 12.0],
+                }
+            ),
+        }
+        daily = build_live_daily_pnl(list_live_trades(), histories)
         self.assertEqual(daily["date"].tolist(), [pd.Timestamp("2026-08-05")])
 
     def test_daily_returns_include_first_day_fee_and_new_investment(self):
@@ -657,7 +984,7 @@ class LiveTradingTests(unittest.TestCase):
     def test_live_page_renders_close_based_pnl_curve(self):
         root = Path(__file__).parents[1]
         page_source = (root / "pages" / "6_实盘记录.py").read_text(encoding="utf-8")
-        valuation_source = (root / "components" / "live_record" / "valuation.py").read_text(
+        dashboard_source = (root / "components" / "live_record" / "dashboard.py").read_text(
             encoding="utf-8"
         )
         tables_source = (root / "components" / "live_record" / "tables.py").read_text(
@@ -666,53 +993,40 @@ class LiveTradingTests(unittest.TestCase):
         history_source = (root / "components" / "live_record" / "history.py").read_text(
             encoding="utf-8"
         )
+        account_source = (root / "components" / "live_record" / "account.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertLessEqual(len(page_source.splitlines()), 250)
         self.assertEqual(page_source.count('@st.fragment(run_every="120s")'), 2)
-        self.assertIn("list_trades=list_live_trades", page_source)
-        self.assertIn("load_etf=load_or_fetch_etf", page_source)
+        self.assertIn("_render_live_account_dashboard(", page_source)
+        self.assertNotIn('st.button("启用实时行情"', page_source)
+        self.assertNotIn('st.expander("实时行情"', page_source)
+        self.assertIn("_render_live_cash_flow_form(", page_source)
         self.assertLess(
             page_source.rindex("render_daily_close_pnl()"),
             page_source.rindex("_render_live_trade_form("),
         )
-        self.assertLess(
-            page_source.rindex("_render_live_trade_details("),
-            page_source.rindex("render_live_symbol_pnl_history()"),
-        )
 
-        self.assertIn('st.subheader("每日收盘盈亏")', valuation_source)
-        self.assertIn('st.subheader(f"每日收盘盈亏（{valuation_date}）")', valuation_source)
-        self.assertIn("build_daily_pnl(current_trades, price_histories)", valuation_source)
-        self.assertIn("build_position_performance(\n        current_trades,", valuation_source)
-        self.assertIn("adjust=adjustment", valuation_source)
-        self.assertIn("adjustment=FUND_ADJUST_NONE", page_source)
-        self.assertIn('attempt_scope_key = "live_pnl_close_last_scope"', valuation_source)
-        self.assertIn("refresh_scope=refresh_scope", valuation_source)
-        self.assertIn("页面将在下次自动检查时联网补齐", valuation_source)
-        self.assertIn('name="总盈亏"', valuation_source)
-        self.assertIn('name="累计收益率"', valuation_source)
-        self.assertIn("build_daily_returns(daily_pnl)", valuation_source)
-        self.assertIn("不包含账户未投资现金", valuation_source)
-        self.assertIn("render_calendar(daily_pnl, first_trade_date=first_trade_date)", valuation_source)
-        self.assertLess(
-            valuation_source.index(
-                "render_calendar(daily_pnl, first_trade_date=first_trade_date)"
-            ),
-            valuation_source.index('figure = make_subplots(specs=[[{"secondary_y": True}]])'),
-        )
-        self.assertIn("收盘价更新失败，当前继续使用本地缓存", valuation_source)
-        self.assertIn("页面保持打开时将在10分钟后重试", valuation_source)
-        self.assertIn('failure_state_key = "live_pnl_close_failures"', valuation_source)
-        self.assertIn("st.session_state.pop(failure_state_key, None)", valuation_source)
-        warning_position = valuation_source.index("if update_failures:")
-        self.assertLess(
-            valuation_source.index("收盘价更新失败", warning_position),
-            valuation_source.index(
-                'st.subheader("当前实盘持仓")', warning_position
-            ),
-        )
+        self.assertIn('st.subheader("每日正式收盘盈亏")', dashboard_source)
+        self.assertIn('["账户口径", "持仓口径"]', dashboard_source)
+        self.assertIn("adjust=FUND_ADJUST_NONE", dashboard_source)
+        self.assertIn("build_live_account_snapshot(", dashboard_source)
+        self.assertNotIn("refresh_runtime_etf_quotes(", dashboard_source)
+        self.assertNotIn("load_runtime_etf_quotes()", dashboard_source)
+        self.assertNotIn("realtime_enabled", dashboard_source)
+        self.assertIn('name="每日盈亏"', dashboard_source)
+        self.assertIn('name="持仓当日盈亏"', dashboard_source)
+        self.assertIn('name="账户净值"', dashboard_source)
+        self.assertIn('name="持仓净值"', dashboard_source)
+        self.assertIn('type="category"', dashboard_source)
+        self.assertIn("categoryarray=chart_dates.tolist()", dashboard_source)
+        self.assertIn("周末和节假日已自动跳过", dashboard_source)
+        self.assertIn("render_return_calendar(", dashboard_source)
+        self.assertIn("临时混合估值", account_source)
+        self.assertNotIn("继续显示最近一次完整估值", account_source)
 
-        self.assertIn('"累计盈亏",\n        "仓位",', tables_source)
+        self.assertIn('"行情状态",', tables_source)
         self.assertIn("format_live_number(row.average_cost, 3)", tables_source)
         self.assertIn("pnl_cell(row.daily_pnl, row.daily_return_pct)", tables_source)
         self.assertIn("float(market_value) / float(total_market_value) * 100", tables_source)
@@ -731,8 +1045,7 @@ class LiveTradingTests(unittest.TestCase):
         self.assertIn("包含当前持仓和已清仓标的", history_source)
 
         # 被后一个同名函数覆盖的旧收益日历实现已经删除，继续复用共享日历。
-        self.assertNotIn("def _live_return_tile", page_source + valuation_source)
-        self.assertNotIn("build_live_period_returns", page_source + valuation_source)
+        self.assertNotIn("def _live_return_tile", page_source + dashboard_source)
 
 
 if __name__ == "__main__":
