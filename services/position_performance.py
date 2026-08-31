@@ -46,6 +46,27 @@ class PositionTimingPerformanceResult:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PositionTimingTradePreviewResult:
+    actions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    formal_date: str = ""
+    preview_date: str = ""
+    quote_time: str = ""
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+POSITION_TIMING_TRADE_ACTION_COLUMNS = [
+    "操作",
+    "代码",
+    "基金名称",
+    "数量",
+    "参考价",
+    "预计金额",
+    "原因",
+]
+
+
 def _empty_result(*, error: str) -> PositionTimingPerformanceResult:
     return PositionTimingPerformanceResult(errors=[error])
 
@@ -133,6 +154,258 @@ def _build_allocations() -> list[PortfolioTimingAllocation]:
             )
         )
     return allocations
+
+
+def _run_fixed_position_timing_backtest(
+    histories: dict[str, pd.DataFrame],
+    *,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    initial_capital: float,
+    transaction_cost: float,
+    lot_size: int,
+):
+    required_codes = list(ETF_PORTFOLIO_WEIGHTS_PCT) + [POSITION_TIMING_PARKING_SYMBOL]
+    funds = [
+        RotationInput(
+            symbol=code,
+            name=ETF_DISPLAY_NAMES.get(code, code),
+            dataframe=histories[code],
+            trade_lot_size=lot_size,
+            apply_slippage=False,
+        )
+        for code in required_codes
+    ]
+    return run_portfolio_timing_backtest(
+        funds=funds,
+        allocations=_build_allocations(),
+        initial_capital=float(initial_capital),
+        transaction_cost=float(transaction_cost),
+        lot_size=int(lot_size),
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def _strategy_position_quantities(trades: pd.DataFrame | None) -> dict[str, int]:
+    quantities: dict[str, float] = {}
+    if trades is None or trades.empty:
+        return {}
+    for row in trades.itertuples(index=False):
+        symbol = normalize_etf_base_code(getattr(row, "交易标的", ""))
+        quantity = pd.to_numeric(getattr(row, "份额", 0), errors="coerce")
+        operation = str(getattr(row, "操作", ""))
+        if not symbol or pd.isna(quantity) or operation not in {"买入", "卖出"}:
+            continue
+        quantities[symbol] = quantities.get(symbol, 0.0) + (
+            float(quantity) if operation == "买入" else -float(quantity)
+        )
+    return {
+        symbol: int(round(quantity))
+        for symbol, quantity in quantities.items()
+        if abs(quantity) >= 0.5
+    }
+
+
+def _preview_action_reasons(
+    trades: pd.DataFrame,
+    *,
+    symbol: str,
+    preview_date: pd.Timestamp,
+) -> str:
+    if trades is None or trades.empty:
+        return "盘中目标持仓发生变化"
+    dates = pd.to_datetime(trades.get("日期"), errors="coerce").dt.normalize()
+    symbols = trades.get("交易标的", pd.Series(index=trades.index, dtype="object"))
+    symbols = symbols.astype(str).map(normalize_etf_base_code)
+    matching = trades.loc[dates.eq(preview_date) & symbols.eq(symbol)]
+    reasons: list[str] = []
+    for row in matching.itertuples(index=False):
+        sleeve = normalize_etf_base_code(getattr(row, "代码", ""))
+        reason = str(getattr(row, "原因", "") or "").strip()
+        text = f"{sleeve}袖套：{reason}" if sleeve and sleeve != symbol else reason
+        if text and text not in reasons:
+            reasons.append(text)
+    return "；".join(reasons) or "盘中目标持仓发生变化"
+
+
+def build_position_timing_trade_preview(
+    items: list[PositionItem],
+    quotes: dict[str, dict[str, object]],
+    *,
+    market_now: datetime | None = None,
+    start_date: str | pd.Timestamp = POSITION_TIMING_START_DATE,
+    initial_capital: float = POSITION_TIMING_INITIAL_CAPITAL,
+    transaction_cost: float = POSITION_TIMING_TRANSACTION_COST,
+    lot_size: int = POSITION_TIMING_LOT_SIZE,
+) -> PositionTimingTradePreviewResult:
+    """Compare the last formal strategy holdings with a transient same-day quote preview."""
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    market = get_market_window("A股")
+    if market is None or not is_market_trading_day(market, market_now):
+        return PositionTimingTradePreviewResult(errors=["当前不是A股交易日。"])
+
+    start = pd.Timestamp(start_date).normalize()
+    preview_date = pd.Timestamp(market_now.date())
+    formal_date = pd.Timestamp(latest_final_etf_trade_date(market_now)).normalize()
+    if formal_date >= preview_date:
+        return PositionTimingTradePreviewResult(errors=["当前交易日已进入正式收盘阶段，不再生成盘中交易预判。"])
+    if formal_date < start:
+        return PositionTimingTradePreviewResult(
+            errors=[f"正式数据尚未到达策略开始日 {start:%Y-%m-%d}。"]
+        )
+
+    required_codes = list(ETF_PORTFOLIO_WEIGHTS_PCT) + [POSITION_TIMING_PARKING_SYMBOL]
+    item_by_code = {
+        normalize_etf_base_code(item.code): item
+        for item in items
+        if item.category == "ETF"
+    }
+    missing_items = [code for code in required_codes if code not in item_by_code]
+    if missing_items:
+        return PositionTimingTradePreviewResult(
+            errors=[f"缺少正式ETF缓存：{'、'.join(missing_items)}。"]
+        )
+    invalid_items = [
+        code for code in required_codes if not item_by_code[code].formal_history_valid
+    ]
+    if invalid_items:
+        return PositionTimingTradePreviewResult(
+            errors=[f"以下ETF前复权缓存校验未通过：{'、'.join(invalid_items)}。"]
+        )
+
+    histories = {
+        code: _formal_price_history(item_by_code[code], market_now=market_now)
+        for code in required_codes
+    }
+    empty_histories = [code for code, history in histories.items() if history.empty]
+    if empty_histories:
+        return PositionTimingTradePreviewResult(
+            errors=[f"以下ETF没有可用正式日线：{'、'.join(empty_histories)}。"]
+        )
+
+    expected_sessions = _expected_a_share_sessions(start, formal_date)
+    available_dates = {
+        code: set(pd.to_datetime(history["trade_date"], errors="coerce").dropna())
+        for code, history in histories.items()
+    }
+    for session in expected_sessions:
+        missing_on_date = [
+            code for code in required_codes if session not in available_dates[code]
+        ]
+        if missing_on_date:
+            return PositionTimingTradePreviewResult(
+                errors=[
+                    f"{session:%Y-%m-%d} 正式日线不完整（{'、'.join(missing_on_date)}），"
+                    "不能生成可执行交易通知。"
+                ]
+            )
+
+    normalized_quotes = {
+        normalize_etf_base_code(code): dict(quote)
+        for code, quote in (quotes or {}).items()
+    }
+    missing_quotes: list[str] = []
+    quote_times: list[pd.Timestamp] = []
+    preview_histories: dict[str, pd.DataFrame] = {}
+    for code in required_codes:
+        quote = normalized_quotes.get(code, {})
+        quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+        quote_price = pd.to_numeric(quote.get("price"), errors="coerce")
+        if (
+            pd.isna(quote_time)
+            or quote_time.date() != market_now.date()
+            or pd.isna(quote_price)
+            or float(quote_price) <= 0
+        ):
+            missing_quotes.append(code)
+            continue
+        quote_times.append(pd.Timestamp(quote_time))
+        history = histories[code].copy()
+        history = history.loc[
+            pd.to_datetime(history["trade_date"], errors="coerce").dt.normalize()
+            != preview_date
+        ]
+        preview_histories[code] = pd.concat(
+            [
+                history,
+                pd.DataFrame(
+                    {"trade_date": [preview_date], "close": [float(quote_price)]}
+                ),
+            ],
+            ignore_index=True,
+        )
+    if missing_quotes:
+        return PositionTimingTradePreviewResult(
+            formal_date=formal_date.strftime("%Y-%m-%d"),
+            preview_date=preview_date.strftime("%Y-%m-%d"),
+            errors=[f"以下ETF缺少当日有效实时行情：{'、'.join(missing_quotes)}。"],
+        )
+
+    try:
+        formal_backtest = _run_fixed_position_timing_backtest(
+            histories,
+            start_date=start,
+            end_date=formal_date,
+            initial_capital=initial_capital,
+            transaction_cost=transaction_cost,
+            lot_size=lot_size,
+        )
+        preview_backtest = _run_fixed_position_timing_backtest(
+            preview_histories,
+            start_date=start,
+            end_date=preview_date,
+            initial_capital=initial_capital,
+            transaction_cost=transaction_cost,
+            lot_size=lot_size,
+        )
+    except Exception as exc:
+        return PositionTimingTradePreviewResult(
+            formal_date=formal_date.strftime("%Y-%m-%d"),
+            preview_date=preview_date.strftime("%Y-%m-%d"),
+            errors=[f"组合策略盘中预判失败：{exc}"],
+        )
+
+    formal_quantities = _strategy_position_quantities(formal_backtest.trades)
+    preview_quantities = _strategy_position_quantities(preview_backtest.trades)
+    preview_trades = _normalize_trade_display_names(preview_backtest.trades)
+    action_rows: list[dict[str, object]] = []
+    for code in sorted(set(formal_quantities) | set(preview_quantities)):
+        delta = preview_quantities.get(code, 0) - formal_quantities.get(code, 0)
+        if delta == 0:
+            continue
+        price = float(normalized_quotes[code]["price"])
+        action_rows.append(
+            {
+                "操作": "买入" if delta > 0 else "卖出",
+                "代码": code,
+                "基金名称": ETF_DISPLAY_NAMES.get(code, code),
+                "数量": abs(int(delta)),
+                "参考价": round(price, 4),
+                "预计金额": round(abs(int(delta)) * price, 2),
+                "原因": _preview_action_reasons(
+                    preview_trades,
+                    symbol=code,
+                    preview_date=preview_date,
+                ),
+            }
+        )
+    actions = pd.DataFrame(action_rows, columns=POSITION_TIMING_TRADE_ACTION_COLUMNS)
+    if not actions.empty:
+        actions["_order"] = actions["操作"].map({"卖出": 0, "买入": 1})
+        actions = actions.sort_values(["_order", "代码"]).drop(columns="_order").reset_index(drop=True)
+
+    latest_quote_time = max(quote_times) if quote_times else pd.NaT
+    return PositionTimingTradePreviewResult(
+        actions=actions,
+        formal_date=formal_date.strftime("%Y-%m-%d"),
+        preview_date=preview_date.strftime("%Y-%m-%d"),
+        quote_time=(
+            latest_quote_time.strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notna(latest_quote_time)
+            else ""
+        ),
+    )
 
 
 POSITION_TIMING_POSITION_COLUMNS = [
@@ -466,6 +739,9 @@ __all__ = [
     "POSITION_TIMING_TRANSACTION_COST",
     "POSITION_TIMING_LOT_SIZE",
     "POSITION_TIMING_PARKING_SYMBOL",
+    "POSITION_TIMING_TRADE_ACTION_COLUMNS",
     "PositionTimingPerformanceResult",
+    "PositionTimingTradePreviewResult",
     "build_position_timing_performance",
+    "build_position_timing_trade_preview",
 ]

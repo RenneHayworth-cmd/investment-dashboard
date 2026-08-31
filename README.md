@@ -80,6 +80,33 @@ SendKey优先读取环境变量 `SERVERCHAN_SENDKEY`，也可保存到仅当前�
 `scripts/install_iron_ore_price_alert_task.ps1`，创建每分钟检查一次的Windows计划任务；
 计划任务通过无窗口的 `wscript.exe` 包装器运行，非交易时段会自动跳过。
 
+## ETF均线策略交易微信提醒
+
+`scripts/monitor_position_timing_trades.py` 以「持仓分析」中的固定50万元ETF均线策略为
+唯一持仓基准。A股交易日09:45、11:45、14:45、14:50、14:54分别读取上一正式
+交易日的策略持仓，批量获取当天TickFlow实时行情，在内存中预演当天信号，并将目标
+持仓相对正式持仓的净变化通过Server酱发送。11:45是在午间休市后发起请求，正常得到
+上午最后一笔、即11:30午间收盘附近的价格；通知保留数据源返回的实际行情时间，不把
+它标成11:45的新成交价。通知按先卖后买列出ETF名称、代码、100股整数手数量、参考
+价、预计金额和触发原因；同一ETF在不同策略袖套中的反向交易会先合并为净数量。盘中
+行情和预演结果都不写入正式日线或策略历史。
+
+前四个时点分别发送当时的判断。若14:50无需操作，14:54仍会静默获取实时行情并重新
+计算；仍无需操作时不重复通知，后续一旦出现交易信号就立即发送。存在交易时每个时点
+都会重新取价并发送当时的可执行数量。脚本仅在A股交易日和上述时刻工作，单实例锁和
+按时点状态文件会阻止重复运行。它复用 `SERVERCHAN_SENDKEY`，并要求计划任务登录
+Shell可以读取 `TICKFLOW_API_KEY`。安装或移除Windows计划任务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_position_timing_trade_alert_task.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install_position_timing_trade_alert_task.ps1 -Remove
+```
+
+任务不要求Codex或Streamlit保持打开；Windows当前用户需保持登录，电脑睡眠时任务
+设置会请求唤醒。运行状态保存在 `output/alerts/position_timing_trade_alert.json`，
+日志保存在 `output/logs/position_timing_trade_alert.log` 和
+`output/logs/position_timing_trade_alert_task.log`。
+
 ## ETF组合严格审计
 
 现有组合回测页面保持原有兼容口径；需要核对复权、真实成交、分红、基准公平性、
