@@ -16,6 +16,7 @@ from scripts.monitor_position_timing_trades import (
     format_notification,
     load_notification_state,
     save_notification_state,
+    send_notification_channels,
     should_suppress_notification,
 )
 from services import position_analysis as position
@@ -218,6 +219,47 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
                 slot="14:54",
             )
         )
+
+    def test_notification_channels_send_serverchan_and_hermes(self):
+        with (
+            patch(
+                "scripts.monitor_position_timing_trades.send_serverchan_message"
+            ) as serverchan_mock,
+            patch(
+                "scripts.monitor_position_timing_trades.send_hermes_weixin_message"
+            ) as hermes_mock,
+        ):
+            sent_channels, errors = send_notification_channels(
+                "SCT_TEST",
+                "测试标题",
+                "测试正文",
+            )
+
+        self.assertEqual(sent_channels, ("Server酱", "Hermes微信"))
+        self.assertEqual(errors, ())
+        serverchan_mock.assert_called_once_with("SCT_TEST", "测试标题", "测试正文")
+        hermes_mock.assert_called_once_with("测试标题", "测试正文")
+
+    def test_notification_channel_failure_does_not_block_other_channel(self):
+        with (
+            patch(
+                "scripts.monitor_position_timing_trades.send_serverchan_message",
+                side_effect=RuntimeError("serverchan unavailable"),
+            ),
+            patch(
+                "scripts.monitor_position_timing_trades.send_hermes_weixin_message"
+            ) as hermes_mock,
+        ):
+            sent_channels, errors = send_notification_channels(
+                "SCT_TEST",
+                "测试标题",
+                "测试正文",
+            )
+
+        self.assertEqual(sent_channels, ("Hermes微信",))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Server酱推送失败", errors[0])
+        hermes_mock.assert_called_once_with("测试标题", "测试正文")
 
 
 if __name__ == "__main__":

@@ -430,6 +430,11 @@ def _fetch_dce_option_settlements_for_date(
         except Exception as exc:
             failures.append(str(exc))
     detail = failures[-1] if failures else "未知错误"
+    if any("412 Client Error" in failure for failure in failures):
+        detail = (
+            "大商所匿名旧接口已停用并返回 412；新版门户 API 需要已注册用户的 "
+            "API 凭据，当前环境未配置，未用收盘价冒充正式结算价"
+        )
     raise RuntimeError(f"大商所期权日行情不可用：{detail}")
 
 

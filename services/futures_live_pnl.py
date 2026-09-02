@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pandas as pd
 
+from services.futures_live_models import exercise_fee_mask
 from services.futures_live_positions import (
     _apply_manual_to_positions,
     _known_multiplier,
     build_estimated_positions,
 )
 from services.futures_live_repository import (
+    _effective_cash_flows,
     _effective_manual_trades,
     latest_monthly_account,
     list_futures_live_trades,
@@ -16,6 +18,64 @@ from services.futures_live_repository import (
     load_daily_closes,
 )
 from services.futures_live_statement_parser import _date_text, _number
+
+
+def _contract_account_pnl_snapshot(
+    *,
+    as_of: object = None,
+    valuation_mode: str = "close",
+    valuation_date: str | None = None,
+) -> tuple[dict[tuple[str, str], dict[str, object]], str | None]:
+    """Return the per-contract slice produced by the account daily ledger."""
+    # Local import keeps the stable P&L modules independent at import time.
+    from services.futures_live_daily_pnl import build_daily_account_pnl
+
+    daily = build_daily_account_pnl(as_of=as_of, valuation_mode=valuation_mode)
+    if daily.empty or "contract_pnl" not in daily.columns:
+        return {}, None
+    eligible = daily[
+        daily["status"].isin(["完整", "手工估算"])
+        & daily["net_pnl"].notna()
+    ]
+    if valuation_date:
+        eligible = eligible[eligible["date"].astype(str).eq(valuation_date)]
+    if eligible.empty:
+        return {}, None
+    row = eligible.iloc[-1]
+    selected_date = str(row["date"])
+    details = row.get("contract_pnl")
+    if not isinstance(details, list):
+        return {}, selected_date
+
+    previous_rows = daily[
+        daily["date"].astype(str).lt(selected_date)
+        & daily["status"].isin(["完整", "手工估算"])
+        & daily["net_pnl"].notna()
+    ]
+    previous_lookup: dict[tuple[str, str], dict[str, object]] = {}
+    if not previous_rows.empty:
+        previous_details = previous_rows.iloc[-1].get("contract_pnl")
+        if isinstance(previous_details, list):
+            previous_lookup = {
+                (str(item["asset_type"]), str(item["contract"])): item
+                for item in previous_details
+            }
+
+    lookup: dict[tuple[str, str], dict[str, object]] = {}
+    for item in details:
+        key = (str(item["asset_type"]), str(item["contract"]))
+        detail = dict(item)
+        current_net = _number(detail.get("net_pnl"))
+        previous_net = _number(previous_lookup.get(key, {}).get("net_pnl"))
+        detail["daily_pnl"] = (
+            None
+            if current_net is None
+            else current_net - previous_net
+            if previous_net is not None
+            else current_net
+        )
+        lookup[key] = detail
+    return lookup, selected_date
 
 def _position_prices_for_date(
     positions: pd.DataFrame,
@@ -106,6 +166,11 @@ def build_current_position_pnl(
         pd.to_datetime(effective_trades["trade_date"], errors="coerce")
         <= pd.Timestamp(valuation_date)
     ].copy()
+    ledger_lookup, ledger_date = _contract_account_pnl_snapshot(
+        as_of=valuation_date,
+        valuation_mode=valuation_mode,
+        valuation_date=valuation_date,
+    )
     rows: list[dict[str, object]] = []
     for position in positions.to_dict("records"):
         asset_type = str(position["asset_type"])
@@ -158,6 +223,15 @@ def build_current_position_pnl(
             if quantity > 0 and average is not None and multiplier is not None:
                 open_basis = average * quantity * multiplier * (1 if side == "空" else -1)
             realized = cashflow - open_basis
+        ledger_detail = ledger_lookup.get((asset_type, contract))
+        if ledger_detail is not None and ledger_date == valuation_date:
+            realized = float(ledger_detail["realized_pnl"])
+            floating = _number(ledger_detail.get("floating_pnl"))
+            fee = float(ledger_detail["fee"])
+            daily = _number(ledger_detail.get("daily_pnl"))
+            net_pnl = _number(ledger_detail.get("net_pnl"))
+        else:
+            net_pnl = None if floating is None else realized + floating - fee
         rows.append(
             {
                 "asset_type": asset_type,
@@ -176,7 +250,7 @@ def build_current_position_pnl(
                 "realized_pnl": realized,
                 "floating_pnl": floating,
                 "fee": fee,
-                "net_pnl": None if floating is None else realized + floating - fee,
+                "net_pnl": net_pnl,
             }
         )
     return pd.DataFrame(rows)
@@ -203,6 +277,10 @@ def build_contract_pnl_history(
         (row.asset_type, row.contract, row.side): row
         for row in current.itertuples(index=False)
     }
+    ledger_lookup, ledger_date = _contract_account_pnl_snapshot(
+        as_of=as_of,
+        valuation_mode=valuation_mode,
+    )
     rows: list[dict[str, object]] = []
     for (asset_type, contract), group in trades.groupby(["asset_type", "contract"], dropna=False):
         first_date = group["trade_date"].min()
@@ -236,6 +314,14 @@ def build_contract_pnl_history(
             realized = cashflow - open_basis
         floating_values = [row.floating_pnl for row in matching_current if pd.notna(row.floating_pnl)]
         floating = float(sum(floating_values)) if floating_values else (0.0 if not matching_current else None)
+        ledger_detail = ledger_lookup.get((str(asset_type), str(contract)))
+        if ledger_detail is not None:
+            realized = float(ledger_detail["realized_pnl"])
+            floating = _number(ledger_detail.get("floating_pnl"))
+            fee = float(ledger_detail["fee"])
+            net_pnl = _number(ledger_detail.get("net_pnl"))
+        else:
+            net_pnl = None if floating is None else realized + floating - fee
         long_quantity = sum(int(row.estimated_quantity) for row in matching_current if row.side == "多")
         short_quantity = sum(int(row.estimated_quantity) for row in matching_current if row.side == "空")
         valuation_dates = [str(row.valuation_date) for row in matching_current if row.valuation_date]
@@ -253,8 +339,8 @@ def build_contract_pnl_history(
                 "realized_pnl": realized,
                 "floating_pnl": floating,
                 "fee": fee,
-                "net_pnl": None if floating is None else realized + floating - fee,
-                "valuation_date": max(valuation_dates) if valuation_dates else "",
+                "net_pnl": net_pnl,
+                "valuation_date": ledger_date or (max(valuation_dates) if valuation_dates else ""),
             }
         )
     return pd.DataFrame(rows).sort_values(["asset_type", "status", "contract"]).reset_index(drop=True)
@@ -266,23 +352,8 @@ def summarize_futures_live_pnl(
     valuation_mode: str = "close",
     include_declaration_fee: bool = True,
 ) -> dict[str, object]:
-    current = build_current_position_pnl(
-        as_of=as_of,
-        valuation_mode=valuation_mode,
-    )
-    history = build_contract_pnl_history(
-        as_of=as_of,
-        valuation_mode=valuation_mode,
-    )
-    if history.empty:
-        return {
-            "daily_pnl": None,
-            "realized_pnl": 0.0,
-            "floating_pnl": 0.0,
-            "fee": 0.0,
-            "net_pnl": 0.0,
-            "valuation_date": None,
-        }
+    if valuation_mode not in {"close", "settlement"}:
+        raise ValueError("估值口径必须是 close 或 settlement。")
     accounts = list_monthly_accounts()
     cutoff = pd.to_datetime(as_of, errors="coerce") if as_of is not None else pd.NaT
     if pd.notna(cutoff) and not accounts.empty:
@@ -291,6 +362,13 @@ def summarize_futures_live_pnl(
         ].copy()
     official_fee = float(pd.to_numeric(accounts.get("monthly_fee"), errors="coerce").fillna(0).sum()) if not accounts.empty else 0.0
     declaration_fee = float(pd.to_numeric(accounts.get("declaration_fee"), errors="coerce").fillna(0).sum()) if not accounts.empty else 0.0
+    cash_flows = _effective_cash_flows(as_of=as_of)
+    exercise_fee = float(
+        pd.to_numeric(
+            cash_flows.loc[exercise_fee_mask(cash_flows), "amount"],
+            errors="coerce",
+        ).fillna(0).sum()
+    ) if not cash_flows.empty else 0.0
     account = latest_monthly_account()
     manual_fee = 0.0
     if account is not None:
@@ -301,7 +379,79 @@ def summarize_futures_live_pnl(
                 pd.to_datetime(manual["trade_date"], errors="coerce") <= pd.Timestamp(cutoff)
             ]
         manual_fee = float(pd.to_numeric(manual.get("fee"), errors="coerce").fillna(0).sum()) if not manual.empty else 0.0
-    total_fee = official_fee + manual_fee
+    expected_total_fee = official_fee + manual_fee
+
+    # 汇总直接取账户日度账本，避免再次把月结单昨结算平仓盈亏与
+    # 开仓成本浮盈混算。该账本也是趋势图和收益日历的唯一来源。
+    from services.futures_live_daily_pnl import build_daily_account_pnl
+
+    daily = build_daily_account_pnl(as_of=as_of, valuation_mode=valuation_mode)
+    if not daily.empty:
+        eligible = daily[
+            daily["status"].isin(["完整", "手工估算"])
+            & daily["net_pnl"].notna()
+        ]
+        if not accounts.empty:
+            statement_end = str(accounts.iloc[-1]["statement_end_date"])
+            eligible = eligible[eligible["date"].astype(str).ge(statement_end)]
+        if not eligible.empty:
+            row = eligible.iloc[-1]
+            total_fee = float(row["fee"])
+            net_pnl = float(row["net_pnl"])
+            if valuation_mode == "close" and not include_declaration_fee:
+                total_fee -= declaration_fee
+                net_pnl += declaration_fee
+            details = row.get("contract_pnl")
+            contract_fee = (
+                sum(float(item.get("fee") or 0) for item in details)
+                if isinstance(details, list)
+                else 0.0
+            )
+            unallocated_fee = total_fee - contract_fee
+            unallocated_fee -= exercise_fee
+            if valuation_mode == "close" and include_declaration_fee:
+                unallocated_fee -= declaration_fee
+            return {
+                "daily_pnl": _number(row.get("daily_pnl")),
+                "realized_pnl": _number(row.get("realized_pnl")),
+                "floating_pnl": _number(row.get("floating_pnl")),
+                "fee": total_fee,
+                "declaration_fee": declaration_fee,
+                "exercise_fee": exercise_fee,
+                "unallocated_fee": unallocated_fee,
+                "net_pnl": net_pnl,
+                "valuation_date": str(row["date"]),
+                "valuation_mode": valuation_mode,
+            }
+
+    # 缺少完整正式价格时继续显示月结单费用及旧的可用估值，不凭空补价。
+    current = build_current_position_pnl(
+        as_of=as_of,
+        valuation_mode=valuation_mode,
+    )
+    history = build_contract_pnl_history(
+        as_of=as_of,
+        valuation_mode=valuation_mode,
+    )
+    if history.empty:
+        total_fee = expected_total_fee
+        if not include_declaration_fee:
+            total_fee -= declaration_fee
+        return {
+            "daily_pnl": None,
+            "realized_pnl": 0.0,
+            "floating_pnl": 0.0,
+            "fee": total_fee,
+            "declaration_fee": declaration_fee,
+            "exercise_fee": exercise_fee,
+            "unallocated_fee": total_fee - (
+                declaration_fee if include_declaration_fee else 0.0
+            ) - exercise_fee,
+            "net_pnl": -total_fee,
+            "valuation_date": None,
+            "valuation_mode": valuation_mode,
+        }
+    total_fee = expected_total_fee
     if not include_declaration_fee:
         total_fee -= declaration_fee
     realized = float(pd.to_numeric(history["realized_pnl"], errors="coerce").fillna(0).sum())
@@ -312,9 +462,11 @@ def summarize_futures_live_pnl(
         "floating_pnl": floating,
         "fee": total_fee,
         "declaration_fee": declaration_fee,
+        "exercise_fee": exercise_fee,
         "unallocated_fee": total_fee
         - float(pd.to_numeric(history["fee"], errors="coerce").fillna(0).sum())
-        - (declaration_fee if include_declaration_fee else 0.0),
+        - (declaration_fee if include_declaration_fee else 0.0)
+        - exercise_fee,
         "net_pnl": realized + floating - total_fee,
         "valuation_date": current["valuation_date"].max() if not current.empty else None,
         "valuation_mode": valuation_mode,

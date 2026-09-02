@@ -24,6 +24,7 @@ from services import position_analysis as position  # noqa: E402
 from services.price_alerts import (  # noqa: E402
     SERVERCHAN_SENDKEY_FILE,
     load_serverchan_sendkey,
+    send_hermes_weixin_message,
     send_serverchan_message,
 )
 
@@ -49,7 +50,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="忽略通知时刻限制，供手工检查使用。")
     parser.add_argument("--dry-run", action="store_true", help="计算并打印结果，不发送通知或修改状态。")
-    parser.add_argument("--test-notification", action="store_true", help="立即发送一条Server酱测试通知。")
+    parser.add_argument(
+        "--test-notification",
+        action="store_true",
+        help="立即通过Server酱和Hermes微信发送一条测试通知。",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +110,35 @@ def should_suppress_notification(
         and state.no_action_at_1450
         and slot > "14:50"
     )
+
+
+def send_notification_channels(
+    sendkey: str,
+    title: str,
+    description: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Send through both WeChat paths without one failure blocking the other."""
+    sent_channels: list[str] = []
+    errors: list[str] = []
+
+    if sendkey:
+        try:
+            send_serverchan_message(sendkey, title, description)
+            sent_channels.append("Server酱")
+        except Exception as exc:
+            errors.append(f"Server酱推送失败（{type(exc).__name__}）")
+    else:
+        errors.append(f"Server酱未配置SendKey（{SERVERCHAN_SENDKEY_FILE}）")
+
+    try:
+        send_hermes_weixin_message(title, description)
+        sent_channels.append("Hermes微信")
+    except Exception as exc:
+        errors.append(f"Hermes微信推送失败（{type(exc).__name__}）")
+
+    if not sent_channels:
+        raise RuntimeError("；".join(errors))
+    return tuple(sent_channels), tuple(errors)
 
 
 @contextmanager
@@ -227,15 +261,19 @@ def main() -> int:
     sendkey = load_serverchan_sendkey()
 
     if args.test_notification:
-        if not sendkey:
-            print(f"失败：未配置Server酱 SendKey，请写入 {SERVERCHAN_SENDKEY_FILE}")
-            return 2
-        send_serverchan_message(
+        sent_channels, delivery_errors = send_notification_channels(
             sendkey,
             "ETF均线策略交易提醒测试",
-            f"Server酱通知通道配置成功。\n\n测试时间：{now:%Y-%m-%d %H:%M:%S}",
+            (
+                "这是均线择时定时脚本发送的双通道测试消息。\n\n"
+                f"测试时间：{now:%Y-%m-%d %H:%M:%S}"
+            ),
         )
-        print("成功：ETF均线策略测试通知已发送。")
+        if delivery_errors:
+            logging.warning("notification_partial_failure errors=%s", " | ".join(delivery_errors))
+        print(f"成功：ETF均线策略测试通知已发送（{'、'.join(sent_channels)}）。")
+        if delivery_errors:
+            print(f"警告：{'；'.join(delivery_errors)}")
         return 0
 
     market = get_market_window("A股")
@@ -255,10 +293,6 @@ def main() -> int:
     if slot in state.notified_slots and not args.force:
         print(f"跳过：{slot}通知已经发送。")
         return 0
-    if not args.dry_run and not sendkey:
-        print(f"失败：未配置Server酱 SendKey，请写入 {SERVERCHAN_SENDKEY_FILE}")
-        return 2
-
     api_key = str(os.environ.get("TICKFLOW_API_KEY") or "").strip()
     with single_instance_lock() as acquired:
         if not acquired:
@@ -303,7 +337,11 @@ def main() -> int:
             print(f"跳过：{slot}仍无需操作，已抑制重复通知。")
             return 0
 
-        send_serverchan_message(sendkey, title, description)
+        sent_channels, delivery_errors = send_notification_channels(
+            sendkey,
+            title,
+            description,
+        )
         state.notified_slots = sorted(set(state.notified_slots + [slot]))
         if outcome == "no_action" and slot == "14:50":
             state.no_action_at_1450 = True
@@ -311,12 +349,17 @@ def main() -> int:
         state.last_notification_at = now.isoformat(timespec="seconds")
         save_notification_state(state)
         logging.info(
-            "status=%s slot=%s action_count=%d",
+            "status=%s slot=%s action_count=%d channels=%s",
             outcome,
             slot,
             len(preview.actions),
+            ",".join(sent_channels),
         )
-        print(f"成功：{title}")
+        if delivery_errors:
+            logging.warning("notification_partial_failure errors=%s", " | ".join(delivery_errors))
+        print(f"成功：{title}（已发送：{'、'.join(sent_channels)}）")
+        if delivery_errors:
+            print(f"警告：{'；'.join(delivery_errors)}")
         return 0
 
 

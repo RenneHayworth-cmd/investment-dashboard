@@ -14,10 +14,34 @@ from services import futures_spread
 def render_daily_pnl_override_form() -> None:
     with st.expander("同花顺日盈亏补录", expanded=False):
         completed_date = futures_spread.completed_futures_daily_cutoff().date()
+        account = futures_live.latest_monthly_account()
+        statement_end = (
+            pd.Timestamp(account["statement_end_date"]).date()
+            if account is not None
+            else None
+        )
+        minimum_date = (
+            statement_end.replace(day=1)
+            if statement_end is not None
+            else completed_date
+        )
+        if minimum_date > completed_date:
+            st.caption(
+                f"当前没有不晚于 {completed_date} 的已完成交易日可供补录。"
+            )
+            return
+        if statement_end is not None:
+            st.caption(
+                "月结单不含逐日盯市明细；月内缺少正式结算价时仍可补录。"
+                "同日完整正式结果生成后会自动核对并接管。"
+            )
         with st.form("futures_live_daily_pnl_form", clear_on_submit=True):
             override_columns = st.columns([2, 2, 4])
             override_date = override_columns[0].date_input(
-                "交易日期", value=completed_date, max_value=completed_date
+                "交易日期",
+                value=completed_date,
+                min_value=minimum_date,
+                max_value=completed_date,
             )
             override_amount = override_columns[1].number_input(
                 "同花顺当日盈亏", value=0.0, step=100.0, format="%.2f"
@@ -71,7 +95,7 @@ def render_daily_pnl_reconciliation() -> None:
         },
     )
     mismatch = daily_overrides[
-        daily_overrides["reconciliation_status"].eq("待核对")
+        daily_overrides["reconciliation_status"].isin(["待核对", "待确认"])
     ]
     if not mismatch.empty:
         review_columns = st.columns([3, 1, 1, 3])
@@ -83,10 +107,14 @@ def render_daily_pnl_reconciliation() -> None:
             ),
             label_visibility="collapsed",
         )
-        if review_columns[1].button("采用手工"):
+        selected = mismatch.loc[mismatch["id"].eq(review_id)].iloc[0]
+        formal_available = pd.notna(selected.get("formal_pnl"))
+        if review_columns[1].button(
+            "采用手工" if formal_available else "确认同花顺"
+        ):
             futures_live.resolve_manual_daily_pnl(int(review_id), "采用手工")
             st.rerun()
-        if review_columns[2].button("采用正式"):
+        if review_columns[2].button("采用正式", disabled=not formal_available):
             futures_live.resolve_manual_daily_pnl(int(review_id), "采用正式")
             st.rerun()
     delete_override_columns = st.columns([3, 1, 4])

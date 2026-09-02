@@ -1,20 +1,60 @@
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
+from components.live_record.dashboard import _load_shared_position_quotes
+
 
 class LiveRecordPageSmokeTests(unittest.TestCase):
+    def test_shared_holdings_quotes_merge_process_and_session_state(self):
+        market_now = datetime(2026, 8, 31, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        process_quotes = {
+            "159501": {
+                "price": 1.2,
+                "quote_time": market_now.replace(hour=9, minute=58),
+            }
+        }
+        session_quotes = {
+            "159501": {
+                "price": 1.3,
+                "quote_time": market_now,
+            },
+            "510500": {
+                "price": 6.1,
+                "quote_time": market_now,
+            },
+        }
+
+        with patch(
+            "components.live_record.dashboard.load_runtime_etf_quotes",
+            return_value=process_quotes,
+        ):
+            result = _load_shared_position_quotes(
+                market_now=market_now,
+                session_quotes=session_quotes,
+            )
+
+        self.assertEqual(result["159501"]["price"], 1.3)
+        self.assertEqual(result["510500"]["price"], 6.1)
+
     def test_default_empty_render_is_cache_first_and_never_fetches(self):
         page_path = Path(__file__).parents[1] / "pages" / "6_实盘记录.py"
         with (
+            patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
             patch("services.live_trading.list_live_trades", return_value=pd.DataFrame()),
             patch("components.live_record.dashboard.list_live_trades", return_value=pd.DataFrame()),
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=pd.DataFrame()),
+            patch(
+                "components.live_record.dashboard.refresh_runtime_etf_quotes",
+                return_value={},
+            ),
             patch("services.position_analysis.load_or_fetch_etf") as fetch_mock,
         ):
             app = AppTest.from_file(str(page_path), default_timeout=20).run()
@@ -63,12 +103,17 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             status="缓存",
         )
         with (
+            patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
             patch("services.live_trading.list_live_trades", return_value=trades),
             patch("components.live_record.dashboard.list_live_trades", return_value=trades),
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=pd.DataFrame()),
             patch("services.live_trading.live_close_refresh_due", return_value=False),
             patch("components.live_record.dashboard.live_close_refresh_due", return_value=False),
+            patch(
+                "components.live_record.dashboard.refresh_runtime_etf_quotes",
+                return_value={},
+            ) as realtime_mock,
             patch(
                 "services.position_analysis.load_or_fetch_etf",
                 return_value=cached_item,
@@ -91,6 +136,8 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             [call.kwargs["save_to_cache"] for call in fetch_mock.call_args_list],
             [False],
         )
+        realtime_mock.assert_called_once()
+        self.assertEqual(realtime_mock.call_args.args[0], ["159501"])
 
     def test_initialized_account_renders_summary_chart_and_detail_tabs(self):
         page_path = Path(__file__).parents[1] / "pages" / "6_实盘记录.py"
@@ -139,12 +186,14 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             status="缓存",
         )
         with (
+            patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
             patch("services.live_trading.list_live_trades", return_value=trades),
             patch("services.live_trading.list_live_cash_flows", return_value=cash_flows),
             patch("components.live_record.dashboard.list_live_trades", return_value=trades),
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=cash_flows),
             patch("components.live_record.dashboard.live_close_refresh_due", return_value=False),
+            patch("components.live_record.dashboard.refresh_runtime_etf_quotes", return_value={}),
             patch("components.live_record.dashboard.load_or_fetch_etf", return_value=cached_item),
             patch("services.position_analysis.load_or_fetch_etf", return_value=cached_item),
         ):

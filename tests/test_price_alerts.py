@@ -1,3 +1,5 @@
+import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime
@@ -8,12 +10,31 @@ from zoneinfo import ZoneInfo
 from services.price_alerts import (
     load_price_alert_state,
     process_price_alert,
+    send_hermes_weixin_message,
     send_serverchan_message,
     serverchan_endpoint,
 )
 
 
 class PriceAlertTests(unittest.TestCase):
+    @patch("services.price_alerts.subprocess.run")
+    def test_hermes_weixin_message_uses_cli_home_channel(self, run_mock):
+        run_mock.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"success": True, "platform": "weixin"}),
+            stderr="",
+        )
+
+        with patch.dict("os.environ", {"HERMES_SEND_BIN": "/test/hermes"}):
+            result = send_hermes_weixin_message("测试\n标题", "正文")
+
+        self.assertTrue(result["success"])
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:5], ["/test/hermes", "send", "--to", "weixin", "--json"])
+        self.assertEqual(command[5], "测试 标题\n\n正文")
+        self.assertFalse(run_mock.call_args.kwargs["check"])
+
     def test_serverchan_endpoint_supports_turbo_and_sc3_keys(self):
         self.assertEqual(
             serverchan_endpoint("SCT123"),

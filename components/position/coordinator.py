@@ -107,9 +107,15 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     allow_fetch = bool(update_clicked)
     if "position_updates_enabled" not in st.session_state:
         st.session_state.position_updates_enabled = False
+    if "position_derivative_refresh_request" not in st.session_state:
+        st.session_state.position_derivative_refresh_request = 0
     if update_clicked:
         st.session_state.position_updates_enabled = True
+        st.session_state.position_derivative_refresh_request += 1
     updates_enabled = bool(st.session_state.position_updates_enabled)
+    derivative_refresh_request = int(
+        st.session_state.position_derivative_refresh_request
+    )
     refresh_existing = bool(update_clicked and force_refresh)
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     intraday_market_active = position.etf_intraday_quote_ready(market_now)
@@ -286,5 +292,6 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         max_workers=int(max_workers),
         adjust=adjust_map[adjust_option],
         updates_enabled=updates_enabled,
+        derivative_refresh_request=derivative_refresh_request,
         save_to_cache=save_to_cache,
     )

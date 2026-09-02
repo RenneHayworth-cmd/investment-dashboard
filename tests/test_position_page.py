@@ -179,6 +179,9 @@ class PositionPageSmokeTests(unittest.TestCase):
                     "成本价": [2.0],
                     "最新价": [2.1],
                     "持仓市值": [210.0],
+                    "当日盈亏": [10.0],
+                    "当日收益率(%)": [5.0],
+                    "当日收益基数": [200.0],
                     "浮动盈亏": [10.0],
                     "账户权重(%)": [0.04],
                     "来源袖套": ["159501"],
@@ -238,6 +241,17 @@ render_position_timing_performance([])
             ["策略持仓情况", "策略交易明细", "每日盈亏明细"],
         )
         self.assertEqual(len(app.get("plotly_chart")), 1)
+        position_tables = [
+            item.value
+            for item in app.markdown
+            if "position-data-table" in item.value
+        ]
+        self.assertEqual(len(position_tables), 1)
+        self.assertIn("正式收盘", position_tables[0])
+        self.assertIn("当日盈亏", position_tables[0])
+        self.assertIn("2.100", position_tables[0])
+        self.assertIn("2.000", position_tables[0])
+        self.assertIn("合计", position_tables[0])
 
     def test_timing_performance_chart_uses_trading_day_category_axis(self):
         source = (
@@ -250,6 +264,89 @@ render_position_timing_performance([])
         self.assertIn('type="category"', source)
         self.assertIn("categoryarray=chart_dates.tolist()", source)
         self.assertIn("周末和节假日已自动跳过", source)
+
+    def test_timing_performance_tables_show_prices_with_three_decimals(self):
+        source = (
+            Path(__file__).parents[1]
+            / "components"
+            / "position"
+            / "performance.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('position_number_cell(row["成本价"], digits=3)', source)
+        self.assertIn('position_number_cell(row["最新价"], digits=3)', source)
+        self.assertIn(
+            'position_pnl_cell(row["当日盈亏"], row["当日收益率(%)"])',
+            source,
+        )
+        self.assertIn(
+            '"成交价": st.column_config.NumberColumn(format="%.3f")',
+            source,
+        )
+        self.assertIn(
+            "render_position_table(headers, rows, total_cells=total_cells",
+            source,
+        )
+
+    def test_strategy_positions_overlay_realtime_quote_for_display_only(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from components.position.performance import (
+            _overlay_strategy_positions_with_realtime,
+        )
+
+        formal = pd.DataFrame(
+            {
+                "基金名称": ["纳指ETF嘉实"],
+                "代码": ["159501"],
+                "持仓数量": [100],
+                "成本价": [2.0],
+                "最新价": [2.1],
+                "持仓市值": [210.0],
+                "当日盈亏": [5.0],
+                "当日收益率(%)": [2.5],
+                "当日收益基数": [200.0],
+                "浮动盈亏": [10.0],
+                "账户权重(%)": [17.36],
+                "来源袖套": ["159501"],
+                "累计手续费": [0.01],
+            }
+        )
+        display, summary = _overlay_strategy_positions_with_realtime(
+            formal,
+            {
+                "159501.SZ": {
+                    "price": 2.2,
+                    "previous_close": 2.1,
+                    "quote_time": "2026-08-31 14:54:03+08:00",
+                }
+            },
+            formal_cash=1_000.0,
+            market_now=datetime(2026, 8, 31, 14, 54, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+        self.assertEqual(float(formal.iloc[0]["最新价"]), 2.1)
+        self.assertEqual(float(display.iloc[0]["最新价"]), 2.2)
+        self.assertAlmostEqual(float(display.iloc[0]["持仓市值"]), 220.0)
+        self.assertAlmostEqual(float(display.iloc[0]["当日盈亏"]), 10.0)
+        self.assertAlmostEqual(float(display.iloc[0]["当日收益率(%)"]), 10 / 210 * 100)
+        self.assertAlmostEqual(float(display.iloc[0]["浮动盈亏"]), 20.0)
+        self.assertEqual(display.iloc[0]["行情状态"], "实时")
+        self.assertEqual(display.iloc[0]["行情时间"], "2026-08-31 14:54:03")
+        self.assertEqual(summary["实时行情数量"], 1)
+        self.assertEqual(float(summary["策略资产"]), 1_220.0)
+
+    def test_strategy_positions_receive_existing_shared_quotes(self):
+        source = (
+            Path(__file__).parents[1]
+            / "components"
+            / "position"
+            / "realtime.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("realtime_quotes=active_preview_quotes", source)
+        self.assertIn("market_now=market_now", source)
 
     def test_default_render_is_cache_first_and_network_disabled(self):
         with ExitStack() as stack:
@@ -314,6 +411,65 @@ render_position_timing_performance([])
         self.assertTrue(etf.call_args_list)
         realtime_fetch.assert_not_called()
         derivative_refresh.assert_not_called()
+
+    def test_load_click_refreshes_derivatives_once_when_formal_cache_is_current(self):
+        with ExitStack() as stack:
+            _, _, _, _, derivative_refresh = _patch_page(stack, cached=True)
+            derivative_refresh.side_effect = None
+            derivative_refresh.return_value = ([], [])
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+
+            app.button[0].click().run()
+            app.run()
+
+        self.assertEqual(list(app.exception), [])
+        derivative_refresh.assert_called_once()
+        refreshed_items = derivative_refresh.call_args.args[0]
+        self.assertEqual(
+            [item.category for item in refreshed_items if item.category != "ETF"],
+            ["期货", "期货价差", "期货价差"],
+        )
+        self.assertEqual(app.session_state["position_derivative_refresh_request"], 1)
+        self.assertEqual(app.session_state["position_derivative_refresh_consumed"], 1)
+
+    def test_etf_refresh_cadence_also_refreshes_derivatives(self):
+        with ExitStack() as stack:
+            _, _, _, _, derivative_refresh = _patch_page(stack, cached=True)
+            derivative_refresh.side_effect = None
+            derivative_refresh.return_value = ([], [])
+            stack.enter_context(
+                patch(
+                    "services.position_analysis.etf_morning_timing_fetch_ready",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.position_analysis.refresh_runtime_etf_quotes",
+                    return_value={},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.position_analysis.ETF_MORNING_TIMING_REFRESH_SECONDS",
+                    0,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.position_analysis.ETF_MIDSESSION_TIMING_REFRESH_SECONDS",
+                    0,
+                )
+            )
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            app.text_input[0].set_value("test-key")
+            app.button[0].click().run()
+            derivative_refresh.reset_mock()
+
+            app.run()
+
+        self.assertEqual(list(app.exception), [])
+        derivative_refresh.assert_called_once()
 
     def test_cached_option_detail_component_is_network_free(self):
         source = """

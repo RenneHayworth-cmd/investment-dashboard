@@ -4,7 +4,14 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
-from core.ui import apply_global_style, apply_plotly_layout, render_metric_card, render_page_header
+from core.ui import (
+    apply_global_style,
+    apply_plotly_layout,
+    build_sparse_trading_date_ticks,
+    filter_by_time_range,
+    render_metric_card,
+    render_page_header,
+)
 from services.microcap import (
     build_microcap_snapshot_metrics,
     build_microcap_summary,
@@ -173,26 +180,49 @@ with tabs[1]:
         with metric_row[3]:
             render_metric_card("微盘20均值", format_metric(latest_row.get("微盘20均值(亿元)"), " 亿元"), "真实快照中最小 20 只市值均值")
 
+        period = st.segmented_control(
+            "时间范围",
+            ["近1月", "近3月", "近1年", "全部"],
+            default="全部",
+            key="microcap_snapshot_period",
+            label_visibility="collapsed",
+        )
+        view_snapshot_metrics = filter_by_time_range(
+            snapshot_metrics, date_column="日期", period=period or "全部"
+        )
+        chart_dates = pd.to_datetime(view_snapshot_metrics["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
-                x=snapshot_metrics["日期显示"],
-                y=snapshot_metrics["第200名市值(亿元)"],
+                x=chart_dates,
+                y=view_snapshot_metrics["第200名市值(亿元)"],
                 mode="lines+markers",
                 name="第200名市值（真实快照）",
+                hovertemplate="第200名市值：%{y:.2f} 亿元<extra></extra>",
             )
         )
         fig.add_trace(
             go.Scatter(
-                x=snapshot_metrics["日期显示"],
-                y=snapshot_metrics["微盘20均值(亿元)"],
+                x=chart_dates,
+                y=view_snapshot_metrics["微盘20均值(亿元)"],
                 mode="lines+markers",
                 name="微盘20均值（真实快照）",
+                hovertemplate="微盘20均值：%{y:.2f} 亿元<extra></extra>",
             )
         )
         apply_plotly_layout(fig, height=520)
-        fig.update_xaxes(type="category", tickmode="array", tickvals=snapshot_metrics["日期显示"].tolist())
-        st.plotly_chart(fig, use_container_width=True)
+        tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
+        fig.update_xaxes(
+            title_text="快照日期",
+            type="category",
+            categoryorder="array",
+            categoryarray=chart_dates.tolist(),
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+        )
+        st.plotly_chart(fig, width="stretch")
 
         display_snapshot_metrics = snapshot_metrics.sort_values("日期", ascending=False).copy()
         if "日期显示" in display_snapshot_metrics.columns:

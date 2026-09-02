@@ -7,6 +7,7 @@ import fcntl
 import logging
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 
 
@@ -21,10 +22,8 @@ from services.index_realtime import (  # noqa: E402
     load_futures_main_contract_names,
 )
 from services.price_alerts import (  # noqa: E402
-    SERVERCHAN_SENDKEY_FILE,
-    load_serverchan_sendkey,
     process_price_alert,
-    send_serverchan_message,
+    send_hermes_weixin_message,
 )
 
 
@@ -37,12 +36,12 @@ LOG_PATH = ROOT / "output" / "logs" / "iron_ore_price_alert.log"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="监控铁矿石主连价格并通过Server酱推送微信通知。")
+    parser = argparse.ArgumentParser(description="监控铁矿石主连价格并通过Hermes推送微信通知。")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="告警阈值，默认730。")
     parser.add_argument("--force", action="store_true", help="忽略交易时段限制，供手动检查使用。")
     parser.add_argument("--dry-run", action="store_true", help="不发送通知，也不修改告警状态。")
     parser.add_argument("--test-price", type=float, help="使用指定价格代替联网行情，供测试使用。")
-    parser.add_argument("--test-notification", action="store_true", help="立即发送一条Server酱测试通知。")
+    parser.add_argument("--test-notification", action="store_true", help="立即发送一条Hermes微信测试通知。")
     return parser.parse_args()
 
 
@@ -86,26 +85,18 @@ def main() -> int:
     args = parse_args()
     configure_logging()
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    sendkey = load_serverchan_sendkey()
 
     if args.test_notification:
-        if not sendkey:
-            print(f"失败：未配置Server酱 SendKey，请写入 {SERVERCHAN_SENDKEY_FILE}")
-            return 2
-        send_serverchan_message(
-            sendkey,
+        send_hermes_weixin_message(
             "铁矿石价格监控测试",
-            f"Server酱通知通道配置成功。\n\n测试时间：{now:%Y-%m-%d %H:%M:%S}",
+            f"Hermes微信通知通道配置成功。\n\n测试时间：{now:%Y-%m-%d %H:%M:%S}",
         )
-        print("成功：Server酱测试通知已发送。")
+        print("成功：Hermes微信测试通知已发送。")
         return 0
 
     if not args.force and args.test_price is None and not _futures_market_is_open(SYMBOL, now=now):
         print("跳过：当前不在铁矿石期货交易时段。")
         return 0
-    if not args.dry_run and not sendkey:
-        print(f"失败：未配置Server酱 SendKey，请写入 {SERVERCHAN_SENDKEY_FILE}")
-        return 2
 
     with single_instance_lock() as acquired:
         if not acquired:
@@ -130,18 +121,36 @@ def main() -> int:
             print(f"试运行：{contract} {price:.1f}，{relation} {args.threshold:.1f}，未发送通知。")
             return 0
 
-        result = process_price_alert(
-            price=price,
-            threshold=args.threshold,
-            contract=contract,
-            checked_at=checked_at,
-            state_path=STATE_PATH,
-            notify=lambda title, description: send_serverchan_message(
-                sendkey,
-                title,
-                description,
-            ),
-        )
+        is_simulation = args.test_price is not None
+
+        def notify(title: str, description: str):
+            if is_simulation:
+                title = f"【模拟告警】{title}"
+                description = description.replace(
+                    "价格来自指数监控使用的铁矿石主连实时行情。",
+                    "这是通过监控脚本发送的模拟测试；价格为用户指定值，并非实时行情。",
+                )
+            return send_hermes_weixin_message(title, description)
+
+        if is_simulation:
+            with TemporaryDirectory(prefix="iron_ore_alert_test_") as directory:
+                result = process_price_alert(
+                    price=price,
+                    threshold=args.threshold,
+                    contract=contract,
+                    checked_at=checked_at,
+                    state_path=Path(directory) / "state.json",
+                    notify=notify,
+                )
+        else:
+            result = process_price_alert(
+                price=price,
+                threshold=args.threshold,
+                contract=contract,
+                checked_at=checked_at,
+                state_path=STATE_PATH,
+                notify=notify,
+            )
         logging.info("status=%s price=%.1f contract=%s", result.status, price, contract)
         print(result.message)
         return 0

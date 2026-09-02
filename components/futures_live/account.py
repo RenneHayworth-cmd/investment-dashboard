@@ -41,7 +41,7 @@ def render_account_summary(account: pd.Series | dict[str, object]) -> None:
             (
                 "全部盈亏（盯市）",
                 format_money(mark_pnl),
-                "按结算价估值并扣除交易手续费，不含申报费；与同花顺期货通盯市口径一致",
+                "按结算价估值并扣除成交手续费和行权手续费，不含申报费；与同花顺期货通盯市口径一致",
             ),
             (
                 "累计净盈亏（收盘）",
@@ -52,7 +52,7 @@ def render_account_summary(account: pd.Series | dict[str, object]) -> None:
     )
     if mark_matches_close_date:
         st.caption(
-            f"盯市盈亏按 {mark_summary['valuation_date']} 结算价计算，扣交易手续费、不扣申报费；"
+            f"盯市盈亏按 {mark_summary['valuation_date']} 结算价计算，扣成交手续费和行权手续费、不扣申报费；"
             "收盘口径按同日收盘价计算并扣除全部费用。"
         )
     else:
@@ -61,9 +61,14 @@ def render_account_summary(account: pd.Series | dict[str, object]) -> None:
         st.caption(
             f"累计手续费已包含月结单确认的申报费 {format_money(pnl_summary['declaration_fee'])} 元。"
         )
+    if float(pnl_summary.get("exercise_fee") or 0) > 0.05:
+        st.caption(
+            f"累计手续费已包含月结单确认的行权手续费 {format_money(pnl_summary['exercise_fee'])} 元，"
+            "并已计入盯市净收益。"
+        )
     if abs(float(pnl_summary.get("unallocated_fee") or 0)) > 0.05:
         st.warning(
-            f"累计手续费仍有 {format_money(pnl_summary['unallocated_fee'])} 元未能与成交明细及申报费核对。"
+            f"累计手续费仍有 {format_money(pnl_summary['unallocated_fee'])} 元未能与成交明细、申报费及行权手续费核对。"
         )
 
 

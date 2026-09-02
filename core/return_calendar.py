@@ -139,13 +139,13 @@ def render_return_calendar(
     data = daily_returns.copy()
     data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
     data = data.dropna(subset=["date", "pnl_amount"]).sort_values("date")
-    pending_dates = set()
+    confirmation_by_date: dict[object, str] = {}
     if "confirmation_status" in data.columns:
-        pending_dates = set(
-            data.loc[
-                data["confirmation_status"].astype(str).ne("正式"), "date"
-            ].dt.date
-        )
+        confirmation_by_date = {
+            row.date.date(): str(row.confirmation_status)
+            for row in data[["date", "confirmation_status"]].itertuples(index=False)
+            if str(row.confirmation_status) != "正式"
+        }
     controls = st.columns([3, 2])
     period_label = controls[0].segmented_control(
         "统计周期", list(PERIOD_OPTIONS), default="日收益", key=f"{key_prefix}_period"
@@ -198,7 +198,7 @@ def render_return_calendar(
                 )
             elif calendar_date in lookup:
                 row = lookup[calendar_date]
-                cells.append(_tile(label=f"{calendar_date.day:02d}", period_start=pd.Timestamp(row.period_start), period_end=pd.Timestamp(row.period_end), pnl_amount=row.pnl_amount, return_pct=row.return_pct, display_mode=display_mode, max_abs_value=max_abs, detail_label="待月结单确认" if calendar_date in pending_dates else ""))
+                cells.append(_tile(label=f"{calendar_date.day:02d}", period_start=pd.Timestamp(row.period_start), period_end=pd.Timestamp(row.period_end), pnl_amount=row.pnl_amount, return_pct=row.return_pct, display_mode=display_mode, max_abs_value=max_abs, detail_label=confirmation_by_date.get(calendar_date, "")))
             else:
                 cells.append(f'<div class="live-return-empty-day{outside}"><div class="live-return-label">{calendar_date.day:02d}</div></div>')
         st.markdown('<div class="live-return-calendar-scroll"><div class="live-return-weekdays"><div>一</div><div>二</div><div>三</div><div>四</div><div>五</div></div><div class="live-return-day-grid">' + "".join(cells) + "</div></div>", unsafe_allow_html=True)
@@ -231,12 +231,17 @@ def render_return_calendar(
             else:
                 period_start = pd.Timestamp(row.period_start).date()
                 period_end = pd.Timestamp(row.period_end).date()
-                pending = any(period_start <= day <= period_end for day in pending_dates)
+                confirmation_labels = list(
+                    dict.fromkeys(
+                        status
+                        for day, status in confirmation_by_date.items()
+                        if period_start <= day <= period_end
+                    )
+                )
                 detail_parts = []
                 if period == "week":
                     detail_parts.append(f"{pd.Timestamp(row.period_start):%m-%d} 至 {pd.Timestamp(row.period_end):%m-%d}")
-                if pending:
-                    detail_parts.append("待月结单确认")
+                detail_parts.extend(confirmation_labels)
                 detail = " · ".join(detail_parts)
                 cells.append(_tile(label=label, period_start=pd.Timestamp(row.period_start), period_end=pd.Timestamp(row.period_end), pnl_amount=row.pnl_amount, return_pct=row.return_pct, display_mode=display_mode, max_abs_value=max_abs, detail_label=detail))
         st.markdown('<div class="live-return-period-grid">' + "".join(cells) + "</div>", unsafe_allow_html=True)
@@ -249,6 +254,6 @@ def render_return_calendar(
         f'<div class="live-return-summary"><span>{summary_label}收益金额：<strong class="{amount_class}">{_format_signed(amount)}</strong></span><span>{summary_label}收益率：<strong class="{rate_class}">{_format_signed(rate, percentage=True)}</strong></span></div>',
         unsafe_allow_html=True,
     )
-    if pending_dates:
-        st.caption("标有“待月结单确认”的收益包含最新月结单截止日之后的手工记录。")
+    if confirmation_by_date:
+        st.caption("收益格中的状态说明其正式确认进度；月结单截止日内不采用手工日盈亏。")
     st.caption(caption)

@@ -415,6 +415,9 @@ POSITION_TIMING_POSITION_COLUMNS = [
     "成本价",
     "最新价",
     "持仓市值",
+    "当日盈亏",
+    "当日收益率(%)",
+    "当日收益基数",
     "浮动盈亏",
     "账户权重(%)",
     "来源袖套",
@@ -453,67 +456,133 @@ def _build_current_positions(
     ledger = trades.copy().reset_index(drop=True)
     ledger["_date"] = pd.to_datetime(ledger.get("日期"), errors="coerce").dt.normalize()
     ledger["_order"] = ledger.index
-    ledger = ledger.sort_values(["_date", "_order"], kind="stable")
+    ledger = ledger[
+        ledger["_date"].notna() & ledger["_date"].le(valuation_date)
+    ].sort_values(["_date", "_order"], kind="stable")
     states: dict[tuple[str, str], dict[str, float]] = {}
+    prior_states: dict[tuple[str, str], dict[str, float]] | None = None
     names: dict[str, str] = {}
     fees: dict[str, float] = {}
-    for row in ledger.itertuples(index=False):
-        sleeve = str(getattr(row, "代码", "") or "")
-        symbol = normalize_etf_base_code(getattr(row, "交易标的", ""))
+    valuation_buy_costs: dict[str, float] = {}
+    for _, row in ledger.iterrows():
+        trade_date = pd.Timestamp(row["_date"]).normalize()
+        if trade_date == valuation_date and prior_states is None:
+            prior_states = {key: value.copy() for key, value in states.items()}
+        sleeve = str(row.get("代码", "") or "")
+        symbol = normalize_etf_base_code(row.get("交易标的", ""))
         if not symbol:
             continue
-        quantity_value = pd.to_numeric(getattr(row, "份额", 0), errors="coerce")
-        gross_value = pd.to_numeric(getattr(row, "成交金额", 0), errors="coerce")
-        fee_value = pd.to_numeric(getattr(row, "手续费", 0), errors="coerce")
+        quantity_value = pd.to_numeric(row.get("份额", 0), errors="coerce")
+        gross_value = pd.to_numeric(row.get("成交金额", 0), errors="coerce")
+        fee_value = pd.to_numeric(row.get("手续费", 0), errors="coerce")
         quantity = 0.0 if pd.isna(quantity_value) else float(quantity_value)
         gross_amount = 0.0 if pd.isna(gross_value) else float(gross_value)
         fee = 0.0 if pd.isna(fee_value) else float(fee_value)
-        operation = str(getattr(row, "操作", ""))
+        operation = str(row.get("操作", ""))
         names[symbol] = ETF_DISPLAY_NAMES.get(symbol) or str(
-            getattr(row, "交易标的名称", "") or symbol
+            row.get("交易标的名称", "") or symbol
         )
         fees[symbol] = fees.get(symbol, 0.0) + fee
         key = (sleeve, symbol)
-        state = states.setdefault(key, {"quantity": 0.0, "cost_basis": 0.0})
+        state = states.setdefault(
+            key,
+            {"quantity": 0.0, "cost_basis": 0.0, "realized_pnl": 0.0},
+        )
         if operation == "买入":
             state["quantity"] += quantity
             state["cost_basis"] += gross_amount + fee
+            if trade_date == valuation_date:
+                valuation_buy_costs[symbol] = (
+                    valuation_buy_costs.get(symbol, 0.0) + gross_amount + fee
+                )
         elif operation == "卖出" and state["quantity"] > 0:
             sold_quantity = min(quantity, state["quantity"])
             average_cost = state["cost_basis"] / state["quantity"]
+            removed_cost = average_cost * sold_quantity
             state["quantity"] -= sold_quantity
-            state["cost_basis"] -= average_cost * sold_quantity
+            state["cost_basis"] -= removed_cost
+            state["realized_pnl"] += gross_amount - fee - removed_cost
             if state["quantity"] < 1e-8:
                 state["quantity"] = 0.0
                 state["cost_basis"] = 0.0
+    if prior_states is None:
+        prior_states = {key: value.copy() for key, value in states.items()}
 
-    aggregated: dict[str, dict[str, object]] = {}
-    for (sleeve, symbol), state in states.items():
-        if state["quantity"] <= 0:
-            continue
-        item = aggregated.setdefault(
-            symbol,
-            {"quantity": 0.0, "cost_basis": 0.0, "sleeves": set()},
-        )
-        item["quantity"] = float(item["quantity"]) + state["quantity"]
-        item["cost_basis"] = float(item["cost_basis"]) + state["cost_basis"]
-        item["sleeves"].add(sleeve)
+    def aggregate_states(
+        source: dict[tuple[str, str], dict[str, float]],
+    ) -> dict[str, dict[str, object]]:
+        aggregated: dict[str, dict[str, object]] = {}
+        for (sleeve, symbol), state in source.items():
+            item = aggregated.setdefault(
+                symbol,
+                {
+                    "quantity": 0.0,
+                    "cost_basis": 0.0,
+                    "realized_pnl": 0.0,
+                    "sleeves": set(),
+                },
+            )
+            item["quantity"] = float(item["quantity"]) + state["quantity"]
+            item["cost_basis"] = float(item["cost_basis"]) + state["cost_basis"]
+            item["realized_pnl"] = (
+                float(item["realized_pnl"]) + state["realized_pnl"]
+            )
+            if state["quantity"] > 0:
+                item["sleeves"].add(sleeve)
+        return aggregated
+
+    aggregated = aggregate_states(states)
+    prior_aggregated = aggregate_states(prior_states)
 
     rows: list[dict[str, object]] = []
     for symbol, state in aggregated.items():
+        if float(state["quantity"]) <= 0:
+            continue
         history = histories.get(symbol, pd.DataFrame())
+        history_dates = pd.to_datetime(
+            history.get("trade_date"), errors="coerce"
+        ).dt.normalize()
         matching = history[
-            pd.to_datetime(history.get("trade_date"), errors="coerce").dt.normalize()
-            == valuation_date
+            history_dates == valuation_date
         ]
         latest_price = (
             float(pd.to_numeric(matching.iloc[-1]["close"], errors="coerce"))
             if not matching.empty
             else float("nan")
         )
+        previous_rows = history[history_dates < valuation_date]
+        previous_price = (
+            float(pd.to_numeric(previous_rows.iloc[-1]["close"], errors="coerce"))
+            if not previous_rows.empty
+            else float("nan")
+        )
         quantity = float(state["quantity"])
         cost_basis = float(state["cost_basis"])
         market_value = quantity * latest_price
+        current_total_pnl = (
+            float(state["realized_pnl"]) + market_value - cost_basis
+        )
+        prior_state = prior_aggregated.get(
+            symbol,
+            {"quantity": 0.0, "cost_basis": 0.0, "realized_pnl": 0.0},
+        )
+        prior_quantity = float(prior_state["quantity"])
+        prior_market_value = (
+            0.0
+            if prior_quantity <= 0
+            else prior_quantity * previous_price
+            if not pd.isna(previous_price)
+            else float("nan")
+        )
+        prior_total_pnl = (
+            float(prior_state["realized_pnl"])
+            + prior_market_value
+            - float(prior_state["cost_basis"])
+        )
+        daily_pnl = current_total_pnl - prior_total_pnl
+        daily_return_base = (
+            prior_market_value + valuation_buy_costs.get(symbol, 0.0)
+        )
         rows.append(
             {
                 "基金名称": names.get(symbol, ETF_DISPLAY_NAMES.get(symbol, symbol)),
@@ -522,6 +591,13 @@ def _build_current_positions(
                 "成本价": cost_basis / quantity,
                 "最新价": latest_price,
                 "持仓市值": market_value,
+                "当日盈亏": daily_pnl,
+                "当日收益率(%)": (
+                    daily_pnl / daily_return_base * 100
+                    if daily_return_base > 0
+                    else pd.NA
+                ),
+                "当日收益基数": daily_return_base,
                 "浮动盈亏": market_value - cost_basis,
                 "账户权重(%)": (
                     market_value / account_assets * 100 if account_assets > 0 else pd.NA
@@ -533,8 +609,19 @@ def _build_current_positions(
     if not rows:
         return pd.DataFrame(columns=POSITION_TIMING_POSITION_COLUMNS)
     result = pd.DataFrame(rows, columns=POSITION_TIMING_POSITION_COLUMNS)
-    money_columns = ["成本价", "最新价", "持仓市值", "浮动盈亏", "累计手续费"]
+    money_columns = [
+        "成本价",
+        "最新价",
+        "持仓市值",
+        "当日盈亏",
+        "当日收益基数",
+        "浮动盈亏",
+        "累计手续费",
+    ]
     result[money_columns] = result[money_columns].round(4)
+    result["当日收益率(%)"] = pd.to_numeric(
+        result["当日收益率(%)"], errors="coerce"
+    ).round(8)
     result["账户权重(%)"] = pd.to_numeric(
         result["账户权重(%)"], errors="coerce"
     ).round(2)

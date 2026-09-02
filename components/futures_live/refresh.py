@@ -110,7 +110,33 @@ def render_refresh_status(
         st.error("正式收盘价未全部更新：" + "；".join(close_errors))
     settlement_errors = st.session_state.get("futures_live_settlement_errors", [])
     if settlement_errors:
-        st.warning("正式结算价尚未全部更新：" + "；".join(settlement_errors))
+        display_errors = [
+            (
+                "铁矿石期权历史结算价：大商所匿名旧接口已停用并返回 412；"
+                "新版门户 API 需要已注册用户凭据，当前未配置"
+                if "412 Client Error" in str(message)
+                and "dayQuotes" in str(message)
+                else str(message)
+            )
+            for message in settlement_errors
+        ]
+        st.warning("正式结算价尚未全部更新：" + "；".join(display_errors))
+        daily_overrides = futures_live.list_futures_daily_pnl_overrides()
+        pending_manual = (
+            daily_overrides[
+                daily_overrides["reconciliation_status"].isin(["待确认", "采用手工"])
+            ]
+            if not daily_overrides.empty
+            else daily_overrides
+        )
+        if not pending_manual.empty:
+            st.caption(
+                "缺失日期已保留同花顺账户级日盈亏："
+                + "、".join(
+                    sorted(pending_manual["trade_date"].astype(str).unique())
+                )
+                + "；收益日历不会留空，但这些值不生成或伪装成单合约正式结算价。"
+            )
     settlement_conflicts = st.session_state.get(
         "futures_live_settlement_conflicts", []
     )

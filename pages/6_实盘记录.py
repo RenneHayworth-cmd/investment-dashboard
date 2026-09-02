@@ -80,10 +80,15 @@ def render_live_return_calendar(
     )
 
 
-def render_live_positions_table(positions: pd.DataFrame) -> None:
+def render_live_positions_table(
+    positions: pd.DataFrame,
+    *,
+    total_assets: float | None = None,
+) -> None:
     """兼容旧页面内持仓表入口，并保留旧路径 mock 行为。"""
     _render_live_positions_table(
         positions,
+        total_assets=total_assets,
         summarize_positions=summarize_live_position_performance,
     )
 
@@ -95,7 +100,7 @@ def render_live_symbol_history_table(history: pd.DataFrame) -> None:
 
 @st.fragment(run_every="120s")
 def render_daily_close_pnl() -> None:
-    """共享账户模型；本页只使用正式收盘历史。"""
+    """当前持仓可用共享实时行情；历史盈亏仍只使用正式收盘。"""
     _render_live_account_dashboard(
         api_key=os.getenv("TICKFLOW_API_KEY", ""),
         formal_fetch_enabled=True,

@@ -31,6 +31,7 @@ def render_etf_timing_section_impl(
     max_workers: int,
     adjust: str | None,
     updates_enabled: bool,
+    derivative_refresh_request: int,
     save_to_cache: bool,
     value_formatter: Callable[[str, object], str],
 ) -> None:
@@ -100,7 +101,15 @@ def render_etf_timing_section_impl(
     )
     if position.etf_final_close_ready(market_now) and not formal_close_missing:
         active_preview_quotes = {}
-    derivative_refresh_due = False
+    derivative_refresh_consumed_key = "position_derivative_refresh_consumed"
+    derivative_refresh_consumed = int(
+        st.session_state.get(derivative_refresh_consumed_key, 0)
+    )
+    derivative_refresh_requested = bool(
+        updates_enabled
+        and derivative_refresh_request > derivative_refresh_consumed
+    )
+    derivative_refresh_due = derivative_refresh_requested
     realtime_timing_error = ""
     missing_realtime_codes: list[str] = []
     morning_preview_key = "position_etf_morning_timing_preview"
@@ -363,6 +372,11 @@ def render_etf_timing_section_impl(
     )
     derivative_realtime_error = ""
     if derivative_refresh_due:
+        if derivative_refresh_requested:
+            # fragment 独立重跑会复用入参，先消费请求可避免一次点击被重复执行。
+            st.session_state[derivative_refresh_consumed_key] = (
+                derivative_refresh_request
+            )
         refreshed_derivatives, derivative_errors = (
             position.refresh_position_derivative_items(
                 position_items,
@@ -524,4 +538,8 @@ def render_etf_timing_section_impl(
         )
     st.caption("依据正式收盘日线计算；盘中实时报价不参与，展示窗口以最新正式交易日为截止日。")
 
-    render_position_timing_performance(formal_items)
+    render_position_timing_performance(
+        formal_items,
+        realtime_quotes=active_preview_quotes,
+        market_now=market_now,
+    )

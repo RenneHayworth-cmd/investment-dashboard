@@ -45,7 +45,7 @@ Register-ScheduledTask `
     -Trigger $triggers `
     -Settings $settings `
     -Principal $principal `
-    -Description "Send ServerChan trade quantities for the fixed 500,000-yuan ETF MA strategy at 09:45, 11:45, 14:45, 14:50, and 14:54 on A-share trading days." `
+    -Description "Send ServerChan and Hermes Weixin trade quantities for the fixed 500,000-yuan ETF MA strategy at 09:45, 11:45, 14:45, 14:50, and 14:54 on A-share trading days." `
     -Force | Out-Null
 
 $task = Get-ScheduledTask -TaskName $taskName

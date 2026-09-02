@@ -59,6 +59,7 @@ def write_statement(
     monthly_pnl: float = 0,
     monthly_fee: float = 3,
     declaration_fees: list[tuple[str, float]] | None = None,
+    exercise_fees: list[tuple[str, float]] | None = None,
     cash_flows: list[tuple[str, float, float, str]] | None = None,
     floating_pnl: float = 100,
     margin: float = 2200,
@@ -82,6 +83,7 @@ def write_statement(
     ]
     workbook_month = workbook_month or month
     declaration_fees = declaration_fees or []
+    exercise_fees = exercise_fees or []
     cash_flows = cash_flows or []
     deposits_withdrawals = sum(
         float(deposit or 0) - float(withdrawal or 0)
@@ -97,6 +99,13 @@ def write_statement(
             [
                 [fee_date, None, "中国金融期货交易所", None, "中金所申报费", None, -abs(amount)],
                 ["合计", None, None, None, "中金所申报费", None, -abs(amount)],
+            ]
+        )
+    for fee_date, amount in exercise_fees:
+        other_fund_rows.extend(
+            [
+                [fee_date, None, "大连商品交易所", None, "行权手续费", None, -abs(amount)],
+                ["合计", None, None, None, "行权手续费", None, -abs(amount)],
             ]
         )
     report_rows = [
@@ -465,20 +474,21 @@ class FuturesLiveTradingTests(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["contract"], "MO2606P5400")
         self.assertEqual(frame.iloc[0]["settlement"], 27.0)
 
-    def test_mark_to_market_uses_settlement_equity_and_trade_fees_only(self) -> None:
-        path = self.root / "00226050000029_2026-07.xlsx"
+    def test_mark_to_market_includes_exercise_fee_but_excludes_declaration_fee(self) -> None:
+        path = self.root / "00226050000029_2026-06.xlsx"
         write_statement(
             path,
-            month="2026-07",
-            monthly_fee=10,
-            declaration_fees=[("2026-07-01", 8)],
-            cash_flows=[("2026-07-01", 10000, 0, "首次入金")],
+            month="2026-06",
+            monthly_fee=18.04,
+            declaration_fees=[("2026-06-30", 8)],
+            exercise_fees=[("2026-06-30", 8.04)],
+            cash_flows=[("2026-06-30", 10000, 0, "首次入金")],
             futures_positions=[
                 ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
             ],
             option_positions=[],
             futures_trades=[
-                ["2026-07-01", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 2, "--", "2026-07-01"]
+                ["2026-06-30", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 2, "--", "2026-06-30"]
             ],
             option_trades=[],
             floating_pnl=0,
@@ -486,8 +496,8 @@ class FuturesLiveTradingTests(unittest.TestCase):
         sync_statements(self.root)
         with get_conn() as conn:
             for day, settlement in (
-                ("2026-07-01", 100),
-                ("2026-07-02", 110),
+                ("2026-06-30", 100),
+                ("2026-07-01", 110),
             ):
                 conn.execute(
                     """
@@ -501,37 +511,95 @@ class FuturesLiveTradingTests(unittest.TestCase):
             conn.commit()
 
         daily = build_daily_account_pnl(
-            as_of="2026-07-02", valuation_mode="settlement"
+            as_of="2026-07-01", valuation_mode="settlement"
         ).set_index("date")
-        self.assertEqual(daily.loc["2026-07-01", "fee"], 2)
-        self.assertEqual(daily.loc["2026-07-01", "daily_pnl"], -2)
-        self.assertEqual(daily.loc["2026-07-02", "daily_pnl"], 100)
-        self.assertEqual(daily.loc["2026-07-02", "return_base"], 9998)
+        self.assertEqual(daily.loc["2026-06-30", "fee"], 10.04)
+        self.assertEqual(daily.loc["2026-06-30", "daily_pnl"], -10.04)
+        self.assertEqual(daily.loc["2026-07-01", "daily_pnl"], 100)
+        self.assertEqual(daily.loc["2026-07-01", "return_base"], 9989.96)
         self.assertAlmostEqual(
-            daily.loc["2026-07-02", "daily_return_pct"], 100 / 9998 * 100
+            daily.loc["2026-07-01", "daily_return_pct"], 100 / 9989.96 * 100
         )
-        add_manual_daily_pnl(trade_date="2026-07-02", pnl_amount=100.03)
+        summary = summarize_futures_live_pnl(
+            as_of="2026-07-01",
+            valuation_mode="settlement",
+            include_declaration_fee=False,
+        )
+        self.assertEqual(summary["fee"], 10.04)
+        self.assertEqual(summary["exercise_fee"], 8.04)
+        self.assertEqual(summary["unallocated_fee"], 0)
+        add_manual_daily_pnl(trade_date="2026-07-01", pnl_amount=100.03)
         reconciled = build_daily_account_pnl(
-            as_of="2026-07-02", valuation_mode="settlement"
+            as_of="2026-07-01", valuation_mode="settlement"
         ).set_index("date")
-        self.assertEqual(reconciled.loc["2026-07-02", "daily_pnl"], 100)
+        self.assertEqual(reconciled.loc["2026-07-01", "daily_pnl"], 100)
         self.assertEqual(
-            reconciled.loc["2026-07-02", "reconciliation_status"], "已一致"
+            reconciled.loc["2026-07-01", "reconciliation_status"], "已一致"
         )
 
-    def test_manual_daily_pnl_fills_gap_and_reconciles_formal_difference(self) -> None:
+    def test_settlement_daily_pnl_keeps_one_basis_when_carried_position_closes(self) -> None:
         path = self.root / "00226050000029_2026-07.xlsx"
         write_statement(
             path,
             month="2026-07",
             monthly_fee=0,
             cash_flows=[("2026-07-01", 10000, 0, "首次入金")],
+            futures_positions=[],
+            option_positions=[],
+            futures_trades=[
+                ["2026-07-01", "I2705", "F1", "09:31:00", "卖", "投机", 723.5, 3, 217050, "开", 21.87, "--", "2026-07-01"],
+                ["2026-07-02", "I2705", "F2", "09:32:00", "买", "投机", 701.5, 3, 210450, "平", 21.20, 450, "2026-07-02"],
+            ],
+            option_trades=[],
+            floating_pnl=0,
+        )
+        sync_statements(self.root)
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO futures_daily_closes (
+                    asset_type, contract, trade_date, close_price,
+                    settlement_price, source, settlement_source, updated_at
+                ) VALUES ('期货', 'I2705', '2026-07-01', 703, 703,
+                          '测试', '测试结算', '2026-07-02 16:00:00')
+                """
+            )
+            conn.commit()
+
+        daily = build_daily_account_pnl(
+            as_of="2026-07-02", valuation_mode="settlement"
+        ).set_index("date")
+
+        self.assertAlmostEqual(daily.loc["2026-07-01", "floating_pnl"], 6150)
+        self.assertAlmostEqual(daily.loc["2026-07-02", "realized_pnl"], 6600)
+        self.assertAlmostEqual(daily.loc["2026-07-02", "daily_pnl"], 428.80)
+        summary = summarize_futures_live_pnl(
+            as_of="2026-07-02",
+            valuation_mode="settlement",
+            include_declaration_fee=False,
+        )
+        self.assertAlmostEqual(summary["realized_pnl"], 6600)
+        self.assertAlmostEqual(summary["net_pnl"], daily.loc["2026-07-02", "net_pnl"])
+        history = build_contract_pnl_history(
+            as_of="2026-07-02",
+            valuation_mode="settlement",
+        ).query("asset_type == '期货' and contract == 'I2705'").iloc[0]
+        self.assertAlmostEqual(history["realized_pnl"], 6600)
+        self.assertAlmostEqual(history["net_pnl"], daily.loc["2026-07-02", "net_pnl"])
+
+    def test_manual_daily_pnl_fills_gap_and_reconciles_formal_difference(self) -> None:
+        path = self.root / "00226050000029_2026-06.xlsx"
+        write_statement(
+            path,
+            month="2026-06",
+            monthly_fee=0,
+            cash_flows=[("2026-06-30", 10000, 0, "首次入金")],
             futures_positions=[
                 ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
             ],
             option_positions=[],
             futures_trades=[
-                ["2026-07-01", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-07-01"]
+                ["2026-06-30", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-06-30"]
             ],
             option_trades=[],
             floating_pnl=0,
@@ -539,8 +607,8 @@ class FuturesLiveTradingTests(unittest.TestCase):
         sync_statements(self.root)
         with get_conn() as conn:
             for day, settlement in (
-                ("2026-07-01", 100),
-                ("2026-07-03", 120),
+                ("2026-06-30", 100),
+                ("2026-07-02", 120),
             ):
                 conn.execute(
                     """
@@ -553,17 +621,17 @@ class FuturesLiveTradingTests(unittest.TestCase):
                 )
             conn.commit()
         record_id = add_manual_daily_pnl(
-            trade_date="2026-07-02", pnl_amount=90, notes="同花顺截图"
+            trade_date="2026-07-01", pnl_amount=90, notes="同花顺截图"
         )
 
         estimated = build_daily_account_pnl(
-            as_of="2026-07-03", valuation_mode="settlement"
+            as_of="2026-07-02", valuation_mode="settlement"
         ).set_index("date")
-        self.assertEqual(estimated.loc["2026-07-02", "status"], "手工估算")
-        self.assertEqual(estimated.loc["2026-07-02", "daily_pnl"], 90)
-        self.assertEqual(estimated.loc["2026-07-03", "daily_pnl"], 110)
+        self.assertEqual(estimated.loc["2026-07-01", "status"], "手工估算")
+        self.assertEqual(estimated.loc["2026-07-01", "daily_pnl"], 90)
+        self.assertEqual(estimated.loc["2026-07-02", "daily_pnl"], 110)
         self.assertEqual(
-            estimated.loc["2026-07-03", "confirmation_status"], "待前序核对"
+            estimated.loc["2026-07-02", "confirmation_status"], "待前序核对"
         )
 
         with get_conn() as conn:
@@ -572,71 +640,161 @@ class FuturesLiveTradingTests(unittest.TestCase):
                 INSERT INTO futures_daily_closes (
                     asset_type, contract, trade_date, close_price,
                     settlement_price, source, settlement_source, updated_at
-                ) VALUES ('期货', 'I2609', '2026-07-02', 110, 110,
+                ) VALUES ('期货', 'I2609', '2026-07-01', 110, 110,
                           '测试', '测试', '2026-07-03 16:00:00')
                 """
             )
             conn.commit()
         compared = build_daily_account_pnl(
-            as_of="2026-07-03", valuation_mode="settlement"
+            as_of="2026-07-02", valuation_mode="settlement"
         ).set_index("date")
-        self.assertEqual(compared.loc["2026-07-02", "formal_daily_pnl"], 100)
-        self.assertEqual(compared.loc["2026-07-02", "difference"], 10)
-        self.assertEqual(compared.loc["2026-07-02", "daily_pnl"], 90)
-        self.assertEqual(compared.loc["2026-07-03", "daily_pnl"], 100)
-        self.assertEqual(compared.loc["2026-07-03", "net_pnl"], 190)
+        self.assertEqual(compared.loc["2026-07-01", "formal_daily_pnl"], 100)
+        self.assertEqual(compared.loc["2026-07-01", "difference"], 10)
+        self.assertEqual(compared.loc["2026-07-01", "daily_pnl"], 90)
+        self.assertEqual(compared.loc["2026-07-02", "daily_pnl"], 100)
+        self.assertEqual(compared.loc["2026-07-02", "net_pnl"], 190)
         self.assertEqual(
-            compared.loc["2026-07-02", "reconciliation_status"], "待核对"
+            compared.loc["2026-07-01", "reconciliation_status"], "待核对"
         )
         resolve_manual_daily_pnl(record_id, "采用正式")
         resolved = build_daily_account_pnl(
-            as_of="2026-07-03", valuation_mode="settlement"
+            as_of="2026-07-02", valuation_mode="settlement"
         ).set_index("date")
-        self.assertEqual(resolved.loc["2026-07-02", "daily_pnl"], 100)
-        self.assertEqual(resolved.loc["2026-07-02", "status"], "完整")
+        self.assertEqual(resolved.loc["2026-07-01", "daily_pnl"], 100)
+        self.assertEqual(resolved.loc["2026-07-01", "status"], "完整")
         self.assertEqual(
-            resolved.loc["2026-07-02", "reconciliation_status"], "采用正式"
+            resolved.loc["2026-07-01", "reconciliation_status"], "采用正式"
         )
         self.assertEqual(
-            resolved.loc["2026-07-03", "confirmation_status"], "正式"
+            resolved.loc["2026-07-02", "confirmation_status"], "待月结单确认"
         )
 
         removable = add_manual_daily_pnl(
-            trade_date="2026-07-03", pnl_amount=100
+            trade_date="2026-07-02", pnl_amount=100
         )
         self.assertTrue(delete_manual_daily_pnl(removable))
         records = list_futures_daily_pnl_overrides()
-        self.assertEqual(records["trade_date"].tolist(), ["2026-07-02"])
+        self.assertEqual(records["trade_date"].tolist(), ["2026-07-01"])
 
     def test_isolated_manual_daily_pnl_remains_visible_without_cumulative_anchor(self) -> None:
-        path = self.root / "00226050000029_2026-07.xlsx"
+        path = self.root / "00226050000029_2026-06.xlsx"
         write_statement(
             path,
-            month="2026-07",
+            month="2026-06",
             monthly_fee=0,
             futures_positions=[
                 ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
             ],
             option_positions=[],
             futures_trades=[
-                ["2026-07-01", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-07-01"]
+                ["2026-06-30", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-06-30"]
             ],
             option_trades=[],
             floating_pnl=0,
         )
         sync_statements(self.root)
-        add_manual_daily_pnl(trade_date="2026-07-02", pnl_amount=-5560)
+        add_manual_daily_pnl(trade_date="2026-07-01", pnl_amount=-5560)
 
         daily = build_daily_account_pnl(
-            as_of="2026-07-02", valuation_mode="settlement"
+            as_of="2026-07-01", valuation_mode="settlement"
         )
-        manual_day = daily.set_index("date").loc["2026-07-02"]
+        manual_day = daily.set_index("date").loc["2026-07-01"]
         self.assertEqual(manual_day["status"], "手工估算")
         self.assertEqual(manual_day["daily_pnl"], -5560)
         self.assertTrue(pd.isna(manual_day["net_pnl"]))
         returns = build_futures_daily_returns(daily)
         self.assertEqual(returns.iloc[0]["pnl_amount"], -5560)
         self.assertTrue(pd.isna(returns.iloc[0]["return_pct"]))
+
+    def test_verified_manual_daily_pnl_ends_confirmation_pause_without_formal_price(self) -> None:
+        path = self.root / "00226050000029_2026-06.xlsx"
+        write_statement(
+            path,
+            month="2026-06",
+            monthly_fee=0,
+            cash_flows=[("2026-06-30", 10000, 0, "首次入金")],
+            futures_positions=[
+                ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
+            ],
+            option_positions=[],
+            futures_trades=[
+                ["2026-06-30", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-06-30"]
+            ],
+            option_trades=[],
+            floating_pnl=0,
+        )
+        sync_statements(self.root)
+        record_id = add_manual_daily_pnl(
+            trade_date="2026-07-01", pnl_amount=90, notes="用户已核对"
+        )
+
+        self.assertTrue(resolve_manual_daily_pnl(record_id, "采用手工"))
+        resolved = build_daily_account_pnl(
+            as_of="2026-07-01", valuation_mode="settlement"
+        ).set_index("date")
+
+        self.assertEqual(resolved.loc["2026-07-01", "daily_pnl"], 90)
+        self.assertEqual(
+            resolved.loc["2026-07-01", "reconciliation_status"], "采用手工"
+        )
+        self.assertEqual(
+            resolved.loc["2026-07-01", "confirmation_status"], "同花顺已核对"
+        )
+
+    def test_later_statement_keeps_manual_daily_pnl_until_formal_day_exists(self) -> None:
+        june = self.root / "00226050000029_2026-06.xlsx"
+        write_statement(
+            june,
+            month="2026-06",
+            monthly_fee=0,
+            cash_flows=[("2026-06-30", 10000, 0, "首次入金")],
+            futures_positions=[
+                ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
+            ],
+            option_positions=[],
+            futures_trades=[
+                ["2026-06-30", "I2609", "F1", "09:31:00", "买", "投机", 100, 1, 1000, "开", 0, "--", "2026-06-30"]
+            ],
+            option_trades=[],
+            floating_pnl=0,
+        )
+        sync_statements(self.root)
+        add_manual_daily_pnl(trade_date="2026-07-02", pnl_amount=-5560)
+        before_statement = build_daily_account_pnl(
+            as_of="2026-07-02", valuation_mode="settlement"
+        ).set_index("date")
+        self.assertEqual(before_statement.loc["2026-07-02", "status"], "手工估算")
+
+        july = self.root / "00226050000029_2026-07.xlsx"
+        write_statement(
+            july,
+            month="2026-07",
+            monthly_fee=0,
+            futures_positions=[
+                ["I2609", 1, 100, None, None, 100, 100, 0, 1000, "投机"]
+            ],
+            option_positions=[],
+            futures_trades=[],
+            option_trades=[],
+            floating_pnl=0,
+        )
+        sync_statements(self.root)
+
+        retained = list_futures_daily_pnl_overrides().iloc[0]
+        self.assertEqual(retained["reconciliation_status"], "待确认")
+        self.assertTrue(pd.isna(retained["resolution"]))
+        after_statement = build_daily_account_pnl(
+            as_of="2026-07-02", valuation_mode="settlement"
+        ).set_index("date")
+        self.assertEqual(after_statement.loc["2026-07-02", "status"], "手工估算")
+        self.assertEqual(after_statement.loc["2026-07-02", "daily_pnl"], -5560)
+        self.assertEqual(
+            after_statement.loc["2026-07-02", "confirmation_status"], "待核对"
+        )
+        same_month = add_manual_daily_pnl(
+            trade_date="2026-07-03", pnl_amount=100
+        )
+        self.assertGreater(same_month, 0)
 
     def test_iron_ore_option_expiry_can_be_confirmed_per_strike(self) -> None:
         path = self.root / "00226050000029_2026-07.xlsx"
@@ -918,16 +1076,20 @@ class FuturesLiveTradingTests(unittest.TestCase):
         option = current.query("asset_type == '期权'").iloc[0]
         self.assertEqual(future["daily_pnl"], 40)
         self.assertEqual(option["daily_pnl"], 100)
+        daily = build_daily_account_pnl()
+        close_latest = daily.loc[daily["net_pnl"].notna()].iloc[-1]
         summary = summarize_futures_live_pnl()
-        self.assertEqual(summary["daily_pnl"], 140)
+        self.assertEqual(summary["daily_pnl"], close_latest["daily_pnl"])
+        self.assertEqual(summary["net_pnl"], close_latest["net_pnl"])
         self.assertEqual(summary["valuation_date"], "2026-08-04")
         mark_summary = summarize_futures_live_pnl(
             valuation_mode="settlement",
             include_declaration_fee=False,
         )
+        mark_daily = build_daily_account_pnl(valuation_mode="settlement")
+        mark_latest = mark_daily.loc[mark_daily["net_pnl"].notna()].iloc[-1]
         self.assertEqual(mark_summary["valuation_date"], "2026-08-04")
-        self.assertAlmostEqual(mark_summary["net_pnl"], summary["net_pnl"] - 40)
-        daily = build_daily_account_pnl()
+        self.assertAlmostEqual(mark_summary["net_pnl"], mark_latest["net_pnl"])
         formal_dates = daily.loc[daily["source"].eq("正式收盘估值"), "date"].tolist()
         self.assertEqual(formal_dates, ["2026-08-03", "2026-08-04"])
 

@@ -1,4 +1,4 @@
-"""实盘账户仪表盘：只使用正式收盘历史。"""
+"""实盘账户仪表盘：当前估值可叠加共享实时行情，历史只用正式收盘。"""
 
 from __future__ import annotations
 
@@ -14,19 +14,78 @@ from components.live_record.account import render_live_account_section
 from components.live_record.formatting import money
 from components.live_record.tables import render_live_positions_table
 from core.return_calendar import render_return_calendar
-from core.ui import DEFAULT_CHART_HEIGHT, apply_plotly_layout, render_metric_grid
+from core.ui import (
+    DEFAULT_CHART_HEIGHT,
+    apply_plotly_layout,
+    build_sparse_trading_date_ticks,
+    filter_by_time_range,
+    render_metric_grid,
+)
 from services.fund_analysis import FUND_ADJUST_NONE
 from services.live_trading import (
     build_live_account_snapshot,
     build_live_daily_returns,
+    build_live_positions,
     list_live_cash_flows,
     list_live_trades,
     live_close_refresh_due,
 )
 from services.position_analysis import (
+    filter_current_etf_realtime_quotes,
     latest_final_etf_trade_date,
     load_or_fetch_etf,
+    load_runtime_etf_quotes,
+    refresh_runtime_etf_quotes,
 )
+
+
+def _load_shared_position_quotes(
+    *,
+    market_now: datetime,
+    session_quotes: dict[str, dict[str, object]] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Reuse holdings-page quotes without starting another network data flow."""
+    shared_quotes = load_runtime_etf_quotes()
+    if session_quotes is None:
+        session_quotes = st.session_state.get("position_etf_realtime_quotes", {})
+    if isinstance(session_quotes, dict):
+        shared_quotes.update(
+            {
+                str(symbol): dict(quote)
+                for symbol, quote in session_quotes.items()
+                if isinstance(quote, dict)
+            }
+        )
+    return filter_current_etf_realtime_quotes(
+        shared_quotes,
+        market_now=market_now,
+    )
+
+
+def _refresh_shared_position_quotes(
+    trades: pd.DataFrame,
+    *,
+    api_key: str,
+    market_now: datetime,
+) -> str:
+    """Refresh open ETFs through the holdings-page scheduler and shared cache."""
+    if not str(api_key or "").strip() or trades is None or trades.empty:
+        return ""
+    positions = build_live_positions(trades)
+    if positions.empty:
+        return ""
+    symbols = sorted(positions["symbol"].dropna().astype(str).unique())
+    if not symbols:
+        return ""
+    try:
+        refresh_runtime_etf_quotes(
+            symbols,
+            api_key=api_key,
+            market_now=market_now,
+        )
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 def _load_live_formal_histories(
@@ -125,23 +184,31 @@ def _render_performance_history(
         returns = daily[["date", "daily_pnl", "daily_return_pct"]].rename(
             columns={"daily_pnl": "pnl_amount", "daily_return_pct": "return_pct"}
         )
-        chart_dates = pd.to_datetime(daily["date"], errors="coerce").dt.strftime(
+        period = st.segmented_control(
+            "时间范围",
+            ["近1月", "近3月", "近1年", "全部"],
+            default="全部",
+            key=f"{key_prefix}_{scope}_period",
+            label_visibility="collapsed",
+        )
+        chart_view_daily = filter_by_time_range(daily, date_column="date", period=period or "全部")
+        chart_dates = pd.to_datetime(chart_view_daily["date"], errors="coerce").dt.strftime(
             "%Y-%m-%d"
         )
         pnl_colors = [
             "#ef4444" if float(val) >= 0 else "#22c55e"
-            for val in daily["daily_pnl"].fillna(0.0)
+            for val in chart_view_daily["daily_pnl"].fillna(0.0)
         ]
         figure = make_subplots(specs=[[{"secondary_y": True}]])
         figure.add_trace(
             go.Scatter(
                 x=chart_dates,
-                y=daily["nav"],
+                y=chart_view_daily["nav"],
                 mode="lines+markers",
                 name="账户净值",
                 line={"color": "#2563eb", "width": 2.4},
                 marker={"size": 5},
-                customdata=daily[["daily_return_pct", "cumulative_return_pct"]],
+                customdata=chart_view_daily[["daily_return_pct", "cumulative_return_pct"]],
                 hovertemplate=(
                     "净值：%{y:.4f}<br>当日收益率：%{customdata[0]:.2f}%"
                     "<br>累计收益率：%{customdata[1]:.2f}%<extra></extra>"
@@ -152,11 +219,11 @@ def _render_performance_history(
         figure.add_trace(
             go.Bar(
                 x=chart_dates,
-                y=daily["daily_pnl"],
+                y=chart_view_daily["daily_pnl"],
                 name="每日盈亏",
                 marker={"color": pnl_colors},
                 opacity=0.75,
-                customdata=daily[["account_pnl", "total_assets", "daily_return_pct", "nav"]],
+                customdata=chart_view_daily[["account_pnl", "total_assets", "daily_return_pct", "nav"]],
                 hovertemplate=(
                     "当日盈亏：%{y:,.2f} 元<br>当日收益率：%{customdata[2]:.2f}%"
                     "<br>累计盈亏：%{customdata[0]:,.2f} 元<br>总资产：%{customdata[1]:,.2f} 元"
@@ -166,11 +233,15 @@ def _render_performance_history(
             secondary_y=True,
         )
         apply_plotly_layout(figure, height=DEFAULT_CHART_HEIGHT)
+        tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
         figure.update_xaxes(
             title_text="交易日",
             type="category",
             categoryorder="array",
             categoryarray=chart_dates.tolist(),
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
         )
         figure.update_yaxes(title_text="账户净值", tickformat=".4f", secondary_y=False)
         figure.update_yaxes(title_text="每日盈亏（元）", secondary_y=True)
@@ -225,21 +296,29 @@ def _render_performance_history(
             + pd.to_numeric(normalized_dates.map(nav_rates), errors="coerce") / 100.0
         ).cumprod()
         daily["cumulative_return_pct"] = (daily["nav"] - 1.0) * 100.0
-        chart_dates = normalized_dates.dt.strftime("%Y-%m-%d")
+        period = st.segmented_control(
+            "时间范围",
+            ["近1月", "近3月", "近1年", "全部"],
+            default="全部",
+            key=f"{key_prefix}_{scope}_period",
+            label_visibility="collapsed",
+        )
+        chart_view_daily = filter_by_time_range(daily, date_column="date", period=period or "全部")
+        chart_dates = pd.to_datetime(chart_view_daily["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         holding_pnl_colors = [
             "#ef4444" if float(val) >= 0 else "#22c55e"
-            for val in daily["daily_pnl"]
+            for val in chart_view_daily["daily_pnl"]
         ]
         figure = make_subplots(specs=[[{"secondary_y": True}]])
         figure.add_trace(
             go.Scatter(
                 x=chart_dates,
-                y=daily["nav"],
+                y=chart_view_daily["nav"],
                 mode="lines+markers",
                 name="持仓净值",
                 line={"color": "#2563eb", "width": 2.4},
                 marker={"size": 5},
-                customdata=daily[["cumulative_return_pct"]],
+                customdata=chart_view_daily[["cumulative_return_pct"]],
                 hovertemplate=(
                     "净值：%{y:.4f}<br>累计复合收益率：%{customdata[0]:.2f}%"
                     "<extra></extra>"
@@ -250,11 +329,11 @@ def _render_performance_history(
         figure.add_trace(
             go.Bar(
                 x=chart_dates,
-                y=daily["daily_pnl"],
+                y=chart_view_daily["daily_pnl"],
                 name="持仓当日盈亏",
                 marker={"color": holding_pnl_colors},
                 opacity=0.75,
-                customdata=daily[["total_pnl", "market_value", "realized_pnl", "unrealized_pnl"]],
+                customdata=chart_view_daily[["total_pnl", "market_value", "realized_pnl", "unrealized_pnl"]],
                 hovertemplate=(
                     "当日盈亏：%{y:,.2f} 元<br>累计总盈亏：%{customdata[0]:,.2f} 元"
                     "<br>持仓市值：%{customdata[1]:,.2f} 元<br>已实现盈亏：%{customdata[2]:,.2f} 元"
@@ -264,11 +343,15 @@ def _render_performance_history(
             secondary_y=True,
         )
         apply_plotly_layout(figure, height=DEFAULT_CHART_HEIGHT)
+        tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
         figure.update_xaxes(
             title_text="交易日",
             type="category",
             categoryorder="array",
             categoryarray=chart_dates.tolist(),
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
         )
         figure.update_yaxes(title_text="持仓净值", tickformat=".4f", secondary_y=False)
         figure.update_yaxes(title_text="持仓当日盈亏（元）", secondary_y=True)
@@ -332,10 +415,21 @@ def render_live_account_dashboard(
     if warnings:
         st.warning("正式收盘数据尚未完全补齐：" + "；".join(warnings))
 
+    realtime_error = _refresh_shared_position_quotes(
+        trades,
+        api_key=api_key,
+        market_now=market_now,
+    )
+    shared_quotes = _load_shared_position_quotes(market_now=market_now)
+    if realtime_error:
+        st.warning(
+            "持仓实时行情更新失败，当前回退最近正式收盘价：" + realtime_error
+        )
     snapshot = build_live_account_snapshot(
         trades,
         cash_flows,
         histories,
+        quotes=shared_quotes,
         market_now=market_now,
         formal_target_date=latest_final_etf_trade_date(market_now),
     )

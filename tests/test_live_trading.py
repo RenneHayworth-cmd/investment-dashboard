@@ -990,6 +990,9 @@ class LiveTradingTests(unittest.TestCase):
         tables_source = (root / "components" / "live_record" / "tables.py").read_text(
             encoding="utf-8"
         )
+        shared_table_source = (root / "components" / "position_table.py").read_text(
+            encoding="utf-8"
+        )
         history_source = (root / "components" / "live_record" / "history.py").read_text(
             encoding="utf-8"
         )
@@ -1012,8 +1015,10 @@ class LiveTradingTests(unittest.TestCase):
         self.assertIn('["账户口径", "持仓口径"]', dashboard_source)
         self.assertIn("adjust=FUND_ADJUST_NONE", dashboard_source)
         self.assertIn("build_live_account_snapshot(", dashboard_source)
-        self.assertNotIn("refresh_runtime_etf_quotes(", dashboard_source)
-        self.assertNotIn("load_runtime_etf_quotes()", dashboard_source)
+        self.assertIn("refresh_runtime_etf_quotes(", dashboard_source)
+        self.assertIn("load_runtime_etf_quotes()", dashboard_source)
+        self.assertIn("filter_current_etf_realtime_quotes(", dashboard_source)
+        self.assertIn("quotes=shared_quotes", dashboard_source)
         self.assertNotIn("realtime_enabled", dashboard_source)
         self.assertIn('name="每日盈亏"', dashboard_source)
         self.assertIn('name="持仓当日盈亏"', dashboard_source)
@@ -1024,19 +1029,32 @@ class LiveTradingTests(unittest.TestCase):
         self.assertIn("周末和节假日已自动跳过", dashboard_source)
         self.assertIn("render_return_calendar(", dashboard_source)
         self.assertIn("临时混合估值", account_source)
+        self.assertIn("持仓分析", account_source)
+        self.assertIn("不影响", account_source)
+        self.assertIn("下方每日正式收盘盈亏", account_source)
         self.assertNotIn("继续显示最近一次完整估值", account_source)
 
         self.assertIn('"行情状态",', tables_source)
-        self.assertIn("format_live_number(row.average_cost, 3)", tables_source)
-        self.assertIn("pnl_cell(row.daily_pnl, row.daily_return_pct)", tables_source)
-        self.assertIn("float(market_value) / float(total_market_value) * 100", tables_source)
-        self.assertIn('"<td>100.00%</td>"', tables_source)
-        self.assertIn('live-total-label">合计</td>', tables_source)
+        self.assertIn("position_number_cell(row.average_cost, digits=3)", tables_source)
+        self.assertIn(
+            "position_pnl_cell(row.daily_pnl, row.daily_return_pct)",
+            tables_source,
+        )
+        self.assertIn("float(market_value) / base_assets * 100", tables_source)
+        self.assertIn("total_weight_pct", tables_source)
+        self.assertIn(
+            'position_text_cell("合计", class_name="position-total-label")',
+            tables_source,
+        )
+        self.assertIn(
+            "render_position_table(headers, rows, total_cells=total_cells",
+            tables_source,
+        )
         self.assertIn("live-symbol-history-total", tables_source)
-        self.assertIn("text-align: center", tables_source)
-        self.assertIn("color: rgb(190, 18, 60)", tables_source)
-        self.assertIn("color: rgb(22, 101, 52)", tables_source)
-        self.assertNotIn("¥", tables_source)
+        self.assertIn("text-align: center", shared_table_source)
+        self.assertIn("color: rgb(190, 18, 60)", shared_table_source)
+        self.assertIn("color: rgb(22, 101, 52)", shared_table_source)
+        self.assertNotIn("¥", tables_source + shared_table_source)
 
         self.assertIn('st.subheader("历史盈亏")', history_source)
         self.assertIn("build_history(all_trades, price_histories)", history_source)

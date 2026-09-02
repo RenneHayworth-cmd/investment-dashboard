@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
-from typing import Iterable
+from typing import Any, Iterable, Sequence
+from datetime import datetime
+import pandas as pd
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -225,5 +227,79 @@ def apply_plotly_layout(
         plot_bgcolor="#fafaf9",
     )
     fig.update_xaxes(hoverformat="%Y-%m-%d", gridcolor="rgba(120,113,108,0.14)")
-    fig.update_yaxes(gridcolor="rgba(120,113,108,0.14)")
+    fig.update_yaxes(gridcolor="rgba(120,113,108,0.14)", hoverformat=".2f")
     return fig
+
+
+def build_sparse_trading_date_ticks(
+    dates: Sequence[Any],
+    max_ticks: int = 7,
+) -> tuple[list[Any], list[str]]:
+    """Build sparse, clean tick values and labels for discrete trading-day axes."""
+    if not dates:
+        return [], []
+    
+    n = len(dates)
+    if n <= max_ticks:
+        indices = list(range(n))
+    else:
+        step = (n - 1) / (max_ticks - 1)
+        indices = sorted(list({round(i * step) for i in range(max_ticks)}))
+        if indices[-1] != n - 1:
+            indices.append(n - 1)
+        if indices[0] != 0:
+            indices.insert(0, 0)
+        indices = sorted(list(dict.fromkeys(indices)))
+
+    selected_vals = [dates[i] for i in indices]
+    parsed_dates = [pd.to_datetime(d, errors="coerce") for d in selected_vals]
+    valid_years = {ts.year for ts in parsed_dates if pd.notna(ts)}
+    multi_year = len(valid_years) > 1
+
+    labels: list[str] = []
+    last_year = None
+    for i, ts in enumerate(parsed_dates):
+        if pd.isna(ts):
+            labels.append(str(selected_vals[i]))
+            continue
+        if multi_year and (last_year is None or ts.year != last_year or i == 0):
+            labels.append(ts.strftime("%Y-%m-%d"))
+        else:
+            labels.append(ts.strftime("%m-%d"))
+        last_year = ts.year
+
+    return selected_vals, labels
+
+
+def filter_by_time_range(
+    df: pd.DataFrame,
+    date_column: str = "date",
+    period: str = "全部",
+    market_now: datetime | None = None,
+) -> pd.DataFrame:
+    """Filter a dataframe by common time range capsules: 近1月, 近3月, 近半年, 近1年, 今年以来, 全部."""
+    if df is None or df.empty or date_column not in df.columns or period == "全部":
+        return df
+
+    dates = pd.to_datetime(df[date_column], errors="coerce")
+    valid_dates = dates.dropna()
+    if valid_dates.empty:
+        return df
+
+    max_date = valid_dates.max()
+    if period == "近1月":
+        cutoff = max_date - pd.Timedelta(days=31)
+    elif period == "近3月":
+        cutoff = max_date - pd.Timedelta(days=92)
+    elif period == "近半年":
+        cutoff = max_date - pd.Timedelta(days=183)
+    elif period == "近1年":
+        cutoff = max_date - pd.Timedelta(days=366)
+    elif period == "今年以来":
+        cutoff = pd.Timestamp(year=max_date.year, month=1, day=1)
+    else:
+        return df
+
+    filtered = df[dates >= cutoff]
+    return filtered if not filtered.empty else df
+

@@ -136,9 +136,16 @@ def render_live_account_section(
         if positions.empty:
             st.info("暂无实盘持仓。")
         else:
-            render_positions(positions)
+            summary = dict(snapshot.get("summary") or {})
+            total_assets = summary.get("total_assets")
+            try:
+                render_positions(positions, total_assets=total_assets)
+            except TypeError:
+                render_positions(positions)
             st.caption(
-                "现价使用正式收盘数据，并标注正式收盘或已过期状态。"
+                "盘中使用“持仓分析”同一套共享行情刷新器；未覆盖标的回退最近正式收盘，"
+                "并在行情状态中标注。实时行情仅用于当前估值，不写入正式历史，也不影响"
+                "下方每日正式收盘盈亏。"
             )
     with detail_tab:
         render_live_symbol_detail(positions, trades, key_prefix=key_prefix)

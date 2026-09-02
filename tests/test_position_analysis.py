@@ -169,6 +169,16 @@ class PositionAnalysisTests(unittest.TestCase):
             float(result.daily.iloc[-1]["持仓市值"]),
             places=2,
         )
+        self.assertTrue(
+            {"当日盈亏", "当日收益率(%)", "当日收益基数"}.issubset(
+                result.positions.columns
+            )
+        )
+        self.assertAlmostEqual(
+            float(result.positions["当日盈亏"].sum()),
+            float(result.daily.iloc[-1]["每日盈亏"]),
+            places=2,
+        )
 
     def test_position_performance_stops_before_first_incomplete_formal_session(self):
         result = build_position_timing_performance(
@@ -1120,17 +1130,17 @@ class PositionAnalysisTests(unittest.TestCase):
         cached = pd.DataFrame(
             {
                 "date": [prior_day],
-                "I2609_close": [710.0],
+                "I2701_close": [710.0],
                 "I2705_close": [695.0],
-                "spread_I2609_vs_I2705": [15.0],
-                "spread_I2609_vs_I2705_pct": [2.1127],
+                "spread_I2701_vs_I2705": [15.0],
+                "spread_I2701_vs_I2705_pct": [2.1127],
                 "_calculation_version": [SPREAD_CALCULATION_VERSION],
             }
         )
         load_mock.return_value = (cached, {"last_update_time": prior_day.isoformat()})
 
         def add_spot(df, contract, *, replace_current_day=False, market_now=None):
-            price = 719.0 if contract == "I2609" else 698.0
+            price = 719.0 if contract == "I2701" else 698.0
             return pd.concat(
                 [df, pd.DataFrame({"date": [today], "close": [price]})],
                 ignore_index=True,
@@ -1139,7 +1149,7 @@ class PositionAnalysisTests(unittest.TestCase):
         spot_mock.side_effect = add_spot
 
         item = load_or_fetch_spread(
-            ["I2609", "I2705"],
+            ["I2701", "I2705"],
             force_refresh=True,
             save_to_cache=False,
             realtime_preview=True,

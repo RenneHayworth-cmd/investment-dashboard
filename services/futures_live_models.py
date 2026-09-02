@@ -27,6 +27,9 @@ OPEN_CLOSE_VALUES = ("开", "平")
 CASH_FLOW_TYPES = ("入金", "出金")
 
 
+ACCOUNT_FEE_TYPES = ("申报费", "账户费用", "行权手续费")
+
+
 OPTION_EXPIRY_OUTCOMES = ("作废", "履约")
 
 
@@ -34,6 +37,19 @@ DAILY_PNL_RESOLUTIONS = ("采用手工", "采用正式")
 
 
 RECONCILIATION_TOLERANCE = 0.05
+
+
+def exercise_fee_mask(frame: pd.DataFrame) -> pd.Series:
+    """兼容新分类与旧版已导入为“账户费用”的行权手续费。"""
+    if frame.empty:
+        return pd.Series(False, index=frame.index, dtype=bool)
+    entry_type = frame.get(
+        "entry_type", pd.Series("", index=frame.index, dtype=object)
+    ).fillna("").astype(str)
+    notes = frame.get(
+        "notes", pd.Series("", index=frame.index, dtype=object)
+    ).fillna("").astype(str)
+    return entry_type.eq("行权手续费") | notes.str.contains("行权手续费", regex=False)
 
 
 @dataclass

@@ -332,6 +332,15 @@ def _reconcile_manual_cash_flows(conn) -> None:
     conn.row_factory = None
 
 
+def _cover_manual_daily_pnl_overrides(conn) -> None:
+    """月结单不含逐日结算盈亏，不能仅按截止日期覆盖手工日盈亏。
+
+    手工值是否被正式结果接管，由 ``build_daily_account_pnl`` 在完整的
+    同日结算价实际生成后逐日核对。保留此入口是为了兼容既有同步流程。
+    """
+    return None
+
+
 def _reconcile_option_expiry_events(conn) -> None:
     latest_row = conn.execute(
         "SELECT MAX(statement_end_date) FROM futures_account_monthly"
@@ -440,6 +449,7 @@ def sync_statements(
         _backfill_position_multipliers(conn)
         _reconcile_manual_trades(conn)
         _reconcile_manual_cash_flows(conn)
+        _cover_manual_daily_pnl_overrides(conn)
         _reconcile_option_expiry_events(conn)
         conn.commit()
     return StatementSyncResult(
@@ -595,7 +605,8 @@ def add_manual_daily_pnl(
     notes: str = "",
 ) -> int:
     init_db()
-    if latest_monthly_account() is None:
+    account = latest_monthly_account()
+    if account is None:
         raise ValueError("请先导入月结单。")
     normalized_date = _date_text(trade_date)
     if not normalized_date:
@@ -665,7 +676,7 @@ def resolve_manual_daily_pnl(record_id: int, resolution: str) -> bool:
         ).fetchone()
         if row is None:
             return False
-        if row[0] is None:
+        if row[0] is None and resolution == "采用正式":
             raise ValueError("正式结算盈亏尚未生成，暂不能确认差异。")
         conn.execute(
             """

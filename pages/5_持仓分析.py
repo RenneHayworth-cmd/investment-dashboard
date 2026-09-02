@@ -92,6 +92,7 @@ def render_etf_timing_section(
     max_workers: int,
     adjust: str | None,
     updates_enabled: bool,
+    derivative_refresh_request: int,
     save_to_cache: bool,
 ) -> None:
     """保留单一实时 fragment，实现由组件承载。"""
@@ -106,6 +107,7 @@ def render_etf_timing_section(
         max_workers=max_workers,
         adjust=adjust,
         updates_enabled=updates_enabled,
+        derivative_refresh_request=derivative_refresh_request,
         save_to_cache=save_to_cache,
         value_formatter=format_etf_table_value,
     )

@@ -6,11 +6,15 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from typing import Callable
 
 
 SERVERCHAN_SENDKEY_ENV = "SERVERCHAN_SENDKEY"
 SERVERCHAN_SENDKEY_FILE = Path.home() / ".config" / "investment_dashboard" / "serverchan_sendkey"
+HERMES_SEND_BIN_ENV = "HERMES_SEND_BIN"
+DEFAULT_HERMES_SEND_BIN = Path.home() / ".local" / "bin" / "hermes"
 
 
 @dataclass
@@ -76,6 +80,56 @@ def send_serverchan_message(
     if str(code) != "0":
         message = str(payload.get("message") or payload.get("data") or "未知错误")
         raise RuntimeError(f"Server酱推送失败：{message}")
+    return payload
+
+
+def send_hermes_weixin_message(
+    title: str,
+    description: str = "",
+    *,
+    timeout: float = 60,
+) -> dict:
+    normalized_title = str(title).replace("\r", " ").replace("\n", " ").strip()
+    if not normalized_title:
+        raise ValueError("Hermes微信消息标题不能为空。")
+    normalized_description = str(description).strip()
+    message = (
+        f"{normalized_title}\n\n{normalized_description}"
+        if normalized_description
+        else normalized_title
+    )
+    configured_bin = str(os.environ.get(HERMES_SEND_BIN_ENV) or "").strip()
+    if configured_bin:
+        hermes_bin = configured_bin
+    elif DEFAULT_HERMES_SEND_BIN.is_file():
+        hermes_bin = str(DEFAULT_HERMES_SEND_BIN)
+    else:
+        hermes_bin = str(shutil.which("hermes") or "")
+    if not hermes_bin:
+        raise RuntimeError("找不到 Hermes 命令，请配置 HERMES_SEND_BIN。")
+
+    try:
+        completed = subprocess.run(
+            [hermes_bin, "send", "--to", "weixin", "--json", message],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Hermes微信推送超时（{timeout:g}秒）。") from exc
+
+    raw_output = completed.stdout.strip()
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or raw_output or f"退出代码 {completed.returncode}"
+        raise RuntimeError(f"Hermes微信推送失败：{detail}")
+    try:
+        payload = json.loads(raw_output)
+    except json.JSONDecodeError as exc:
+        detail = raw_output or completed.stderr.strip() or "未返回结果"
+        raise RuntimeError(f"Hermes微信推送返回异常：{detail}") from exc
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise RuntimeError(f"Hermes微信推送未确认成功：{payload}")
     return payload
 
 

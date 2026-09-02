@@ -267,7 +267,13 @@ def _parse_statement_cash_flows(raw: pd.DataFrame, statement_month: str) -> pd.D
                     "source": "月结单",
                     "statement_month": statement_month,
                     "flow_date": flow_date,
-                    "entry_type": "申报费" if "申报费" in fee_type else "账户费用",
+                    "entry_type": (
+                        "申报费"
+                        if "申报费" in fee_type
+                        else "行权手续费"
+                        if "行权手续费" in fee_type
+                        else "账户费用"
+                    ),
                     "amount": abs(amount),
                     "notes": fee_type,
                     "reconciliation_status": "不适用",

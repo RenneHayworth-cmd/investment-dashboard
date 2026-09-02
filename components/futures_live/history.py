@@ -10,7 +10,12 @@ import streamlit as st
 
 from components.futures_live.formatting import decode_warnings
 from core.return_calendar import render_return_calendar
-from core.ui import DEFAULT_CHART_HEIGHT, apply_plotly_layout
+from core.ui import (
+    DEFAULT_CHART_HEIGHT,
+    apply_plotly_layout,
+    build_sparse_trading_date_ticks,
+    filter_by_time_range,
+)
 from services import futures_live_trading as futures_live
 
 
@@ -38,27 +43,50 @@ def render_account_trend(
         daily_pnl["status"].isin(["完整", "手工估算"])
         & pd.to_numeric(daily_pnl["daily_pnl"], errors="coerce").notna()
     ].copy()
+    period = st.segmented_control(
+        "时间范围",
+        ["近1月", "近3月", "近1年", "全部"],
+        default="全部",
+        key="futures_live_period",
+        label_visibility="collapsed",
+    )
+    view_cumulative = filter_by_time_range(cumulative_daily_pnl, date_column="date", period=period or "全部")
+    view_amount = filter_by_time_range(amount_daily_pnl, date_column="date", period=period or "全部")
+    chart_dates = pd.to_datetime(view_cumulative["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
     figure = go.Figure()
     figure.add_trace(
         go.Scatter(
-            x=pd.to_datetime(cumulative_daily_pnl["date"]),
-            y=cumulative_daily_pnl["net_pnl"],
+            x=chart_dates,
+            y=view_cumulative["net_pnl"],
             mode="lines+markers",
             name=f"累计{pnl_mode}净盈亏",
             line={"color": "#b91c1c", "width": 2.2},
+            hovertemplate=f"累计{pnl_mode}净盈亏: %{{y:.2f}}<extra></extra>",
         )
     )
     figure.add_trace(
         go.Bar(
-            x=pd.to_datetime(amount_daily_pnl["date"]),
-            y=amount_daily_pnl["daily_pnl"],
+            x=pd.to_datetime(view_amount["date"], errors="coerce").dt.strftime("%Y-%m-%d"),
+            y=view_amount["daily_pnl"],
             name=f"当日{pnl_mode}盈亏",
             marker_color="#64748b",
             opacity=0.42,
+            hovertemplate=f"当日{pnl_mode}盈亏: %{{y:.2f}}<extra></extra>",
         )
     )
     apply_plotly_layout(figure, height=DEFAULT_CHART_HEIGHT)
-    figure.update_yaxes(title="盈亏（元）")
+    tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
+    figure.update_xaxes(
+        title_text="交易日",
+        type="category",
+        categoryorder="array",
+        categoryarray=chart_dates.tolist(),
+        tickmode="array",
+        tickvals=tickvals,
+        ticktext=ticktext,
+    )
+    figure.update_yaxes(title="盈亏（元）", hoverformat=".2f", tickformat=".2f")
     st.plotly_chart(figure, width="stretch")
     incomplete = daily_pnl[daily_pnl["status"].eq("数据不完整")]
     if not incomplete.empty:
@@ -84,7 +112,7 @@ def render_account_trend(
             f"收益金额为累计净盈亏（{pnl_mode}）的日变化；每日收益率以此前一交易日{pnl_mode}经济权益"
             "加当日正净入金为基数，周、月、年收益率按每日收益率复合。"
             + (
-                "盯市口径只扣成交手续费，不扣申报费及其他账户级费用。"
+                "盯市口径扣成交手续费和行权手续费，不扣申报费及其他账户级费用。"
                 if pnl_mode == "盯市"
                 else "收盘口径扣除包含申报费在内的全部账户手续费。"
             )

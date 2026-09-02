@@ -9,9 +9,11 @@ from core.db import get_conn
 from services.futures_spread import completed_futures_daily_cutoff
 from services.futures_live_calendar import _futures_trading_dates
 from services.futures_live_models import (
+    ACCOUNT_FEE_TYPES,
     CASH_FLOW_TYPES,
     DAILY_PNL_RESOLUTIONS,
     RECONCILIATION_TOLERANCE,
+    exercise_fee_mask,
 )
 from services.futures_live_positions import (
     _known_multiplier,
@@ -46,7 +48,7 @@ def _daily_fee_adjustments(
         month_account_fees = cash_flows[
             cash_flows["source"].eq("月结单")
             & cash_flows["statement_month"].eq(month)
-            & cash_flows["entry_type"].isin(["申报费", "账户费用"])
+            & cash_flows["entry_type"].isin(ACCOUNT_FEE_TYPES)
         ]
         explicit_account_fee = float(
             pd.to_numeric(month_account_fees.get("amount"), errors="coerce").fillna(0).sum()
@@ -169,6 +171,8 @@ def _calculate_daily_account_state(
     option_realized = 0.0
     cumulative_fee = 0.0
     cumulative_net_flow = 0.0
+    contract_realized: dict[tuple[str, str], float] = {}
+    contract_fee: dict[tuple[str, str], float] = {}
     rows: list[dict[str, object]] = []
 
     def add_futures_position(
@@ -205,10 +209,15 @@ def _calculate_daily_account_state(
         signed_quantity = int(state["quantity"])
         closed_quantity = min(abs(signed_quantity), quantity)
         multiplier = float(state["multiplier"])
-        option_realized += (
+        realized_delta = (
             -float(state["average"]) * closed_quantity * multiplier
             if signed_quantity > 0
             else float(state["average"]) * closed_quantity * multiplier
+        )
+        option_realized += realized_delta
+        contract_key = ("期权", contract)
+        contract_realized[contract_key] = (
+            contract_realized.get(contract_key, 0.0) + realized_delta
         )
         state["quantity"] = (
             signed_quantity - closed_quantity
@@ -233,7 +242,12 @@ def _calculate_daily_account_state(
             )
             if multiplier is None:
                 continue
-            day_trade_fee += float(trade.get("fee") or 0)
+            trade_fee = float(trade.get("fee") or 0)
+            day_trade_fee += trade_fee
+            contract_key = (asset_type, contract)
+            contract_fee[contract_key] = (
+                contract_fee.get(contract_key, 0.0) + trade_fee
+            )
             if asset_type == "期货":
                 if trade["open_close"] == "开":
                     side = "多" if trade["buy_sell"] == "买" else "空"
@@ -244,14 +258,21 @@ def _calculate_daily_account_state(
                 available = int(state["quantity"]) if state else 0
                 closed_quantity = min(quantity, available)
                 supplied_pnl = _number(trade.get("close_pnl"))
-                if supplied_pnl is not None:
-                    futures_realized += supplied_pnl
-                elif state is not None and closed_quantity > 0:
-                    futures_realized += (
+                # 月结单昨仓平仓盈亏按昨结算价计算；累计浮盈亏按开仓成本计算。
+                # 持仓链完整时必须按开仓成本重建已实现盈亏，避免平仓日重复释放浮盈亏。
+                realized_delta = 0.0
+                if state is not None and closed_quantity > 0:
+                    realized_delta = (
                         (price - float(state["average"])) * closed_quantity * multiplier
                         if side == "多"
                         else (float(state["average"]) - price) * closed_quantity * multiplier
                     )
+                elif supplied_pnl is not None:
+                    realized_delta = supplied_pnl
+                futures_realized += realized_delta
+                contract_realized[contract_key] = (
+                    contract_realized.get(contract_key, 0.0) + realized_delta
+                )
                 if state is not None:
                     state["quantity"] = max(0, available - quantity)
                 continue
@@ -270,10 +291,14 @@ def _calculate_daily_account_state(
                 state["multiplier"] = multiplier
                 continue
             closed_quantity = min(abs(signed_quantity), abs(delta))
-            option_realized += (
+            realized_delta = (
                 (price - float(state["average"])) * closed_quantity * multiplier
                 if signed_quantity > 0
                 else (float(state["average"]) - price) * closed_quantity * multiplier
+            )
+            option_realized += realized_delta
+            contract_realized[contract_key] = (
+                contract_realized.get(contract_key, 0.0) + realized_delta
             )
             new_quantity = signed_quantity + delta
             if signed_quantity * new_quantity < 0:
@@ -340,24 +365,36 @@ def _calculate_daily_account_state(
                 - pd.to_numeric(external.loc[external["entry_type"].eq("出金"), "amount"], errors="coerce").fillna(0).sum()
             )
         account_fee = 0.0
+        exercise_fee = 0.0
         if not day_flows.empty:
             account_fee = float(
                 pd.to_numeric(
                     day_flows.loc[
-                        day_flows["entry_type"].isin(["申报费", "账户费用"]),
+                        day_flows["entry_type"].isin(ACCOUNT_FEE_TYPES),
                         "amount",
                     ],
                     errors="coerce",
                 ).fillna(0).sum()
             )
+            exercise_fee = float(
+                pd.to_numeric(
+                    day_flows.loc[exercise_fee_mask(day_flows), "amount"],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
         cumulative_net_flow += net_flow
         if valuation_mode == "settlement":
-            cumulative_fee += day_trade_fee
+            # 行权手续费是期权成交链路的实际成本，同花顺盯市口径会扣除；
+            # 申报费及其他账户级费用仍不进入盯市净收益。
+            cumulative_fee += day_trade_fee + exercise_fee
         else:
             cumulative_fee += day_trade_fee + account_fee + fee_adjustments.get(day, 0.0)
 
         floating = 0.0
+        contract_floating: dict[tuple[str, str], float] = {}
+        missing_contract_keys: set[tuple[str, str]] = set()
         missing: list[str] = [f"{contract}到期处理待确认" for contract in pending_expiry]
+        missing_contract_keys.update(("期权", contract) for contract in pending_expiry)
         for (contract, side), state in futures_states.items():
             quantity = int(state["quantity"])
             if quantity <= 0:
@@ -365,13 +402,19 @@ def _calculate_daily_account_state(
             valuation_price = valuation_lookup.get(("期货", contract, day))
             if valuation_price is None:
                 missing.append(contract)
+                missing_contract_keys.add(("期货", contract))
                 continue
             direction = 1 if side == "多" else -1
-            floating += (
+            floating_delta = (
                 (valuation_price - float(state["average"]))
                 * quantity
                 * float(state["multiplier"])
                 * direction
+            )
+            floating += floating_delta
+            contract_key = ("期货", contract)
+            contract_floating[contract_key] = (
+                contract_floating.get(contract_key, 0.0) + floating_delta
             )
         for contract, state in option_states.items():
             signed_quantity = int(state["quantity"])
@@ -380,18 +423,51 @@ def _calculate_daily_account_state(
             valuation_price = valuation_lookup.get(("期权", contract, day))
             if valuation_price is None:
                 missing.append(contract)
+                missing_contract_keys.add(("期权", contract))
                 continue
             direction = 1 if signed_quantity > 0 else -1
-            floating += (
+            floating_delta = (
                 (valuation_price - float(state["average"]))
                 * abs(signed_quantity)
                 * float(state["multiplier"])
                 * direction
             )
+            floating += floating_delta
+            contract_key = ("期权", contract)
+            contract_floating[contract_key] = (
+                contract_floating.get(contract_key, 0.0) + floating_delta
+            )
         complete = not missing
         realized = futures_realized + option_realized
         net_pnl = realized + floating - cumulative_fee if complete else pd.NA
         economic_equity = cumulative_net_flow + float(net_pnl) if complete else pd.NA
+        contract_keys = set(contract_realized) | set(contract_fee) | set(contract_floating)
+        contract_keys.update(("期货", contract) for contract, _ in futures_states)
+        contract_keys.update(("期权", contract) for contract in option_states)
+        contract_pnl: list[dict[str, object]] = []
+        for contract_key in sorted(contract_keys):
+            contract_missing = contract_key in missing_contract_keys
+            contract_realized_pnl = contract_realized.get(contract_key, 0.0)
+            contract_floating_pnl = contract_floating.get(contract_key, 0.0)
+            contract_execution_fee = contract_fee.get(contract_key, 0.0)
+            contract_pnl.append(
+                {
+                    "asset_type": contract_key[0],
+                    "contract": contract_key[1],
+                    "realized_pnl": contract_realized_pnl,
+                    "floating_pnl": (
+                        None if contract_missing else contract_floating_pnl
+                    ),
+                    "fee": contract_execution_fee,
+                    "net_pnl": (
+                        None
+                        if contract_missing
+                        else contract_realized_pnl
+                        + contract_floating_pnl
+                        - contract_execution_fee
+                    ),
+                }
+            )
         rows.append(
             {
                 "date": day,
@@ -416,10 +492,11 @@ def _calculate_daily_account_state(
                     "正式" if day <= latest_statement_end else "待月结单确认"
                 ),
                 "missing_contracts": "、".join(sorted(set(missing))),
+                # 单合约明细与账户累计值由同一次状态推进产生，供持仓和历史表复用。
+                "contract_pnl": contract_pnl,
             }
         )
 
-    result = pd.DataFrame(rows)
     return pd.DataFrame(rows)
 
 
@@ -484,10 +561,16 @@ def _apply_manual_daily_pnl_overrides(
     if result.empty:
         return result
     overrides = list_futures_daily_pnl_overrides()
-    override_by_date = {
-        str(row["trade_date"]): row
-        for row in overrides.to_dict("records")
-    } if not overrides.empty else {}
+    # 月结单只有账户月度汇总，并不提供逐日结算盈亏。即使日期落在最新
+    # 月结单内，也要保留同花顺补录值，直到该日完整正式结算价确实生成。
+    override_by_date = (
+        {
+            str(row["trade_date"]): row
+            for row in overrides.to_dict("records")
+        }
+        if not overrides.empty
+        else {}
+    )
     result = result.copy()
     result["formal_net_pnl"] = result["net_pnl"]
     result["formal_economic_equity"] = result["economic_equity"]
@@ -505,7 +588,9 @@ def _apply_manual_daily_pnl_overrides(
     previous_formal_net: float | None = None
     previous_day_formal_complete = False
     confirmation_paused = False
-    reconciliation_updates: list[tuple[float, float, str, str | None, str, int]] = []
+    reconciliation_updates: list[
+        tuple[float | None, float | None, str, str | None, str, int]
+    ] = []
 
     for index, row in result.iterrows():
         day = str(row["date"])
@@ -555,8 +640,22 @@ def _apply_manual_daily_pnl_overrides(
             result.at[index, "difference"] = difference
             result.at[index, "reconciliation_status"] = reconciliation_status
         elif manual_pnl is not None:
-            reconciliation_status = "待确认"
+            if resolution == "采用手工":
+                reconciliation_status = "采用手工"
+            else:
+                reconciliation_status = "待确认"
+                resolution = None
             result.at[index, "reconciliation_status"] = reconciliation_status
+            reconciliation_updates.append(
+                (
+                    None,
+                    None,
+                    reconciliation_status,
+                    resolution,
+                    datetime.now().isoformat(timespec="seconds"),
+                    int(override["id"]),
+                )
+            )
 
         chosen_daily: float | None = None
         use_manual = False
@@ -623,14 +722,22 @@ def _apply_manual_daily_pnl_overrides(
         )
         previous_day_formal_complete = formal_complete
 
+        manual_confirmed = (
+            manual_pnl is not None
+            and formal_daily is None
+            and resolution == "采用手工"
+        )
         unresolved = manual_pnl is not None and (
-            formal_daily is None or reconciliation_status == "待核对"
+            (formal_daily is None and not manual_confirmed)
+            or reconciliation_status == "待核对"
         )
         confirmation_paused = confirmation_paused or unresolved
         if confirmation_paused:
             result.at[index, "confirmation_status"] = (
                 "待核对" if unresolved else "待前序核对"
             )
+        elif manual_confirmed:
+            result.at[index, "confirmation_status"] = "同花顺已核对"
         elif day <= latest_statement_end:
             result.at[index, "confirmation_status"] = "正式"
         else:
