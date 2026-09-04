@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 import logging
+import os
 import time
 
 import numpy as np
@@ -42,6 +43,40 @@ FUND_ADDITIVE_ADJUSTMENT_OPTIONS = {
     "不复权": FUND_ADJUST_NONE,
 }
 FUND_CACHE_SCHEMA_VERSION = 2
+
+
+def _tickflow_client_from_env(api_key: str):
+    """Build a TickFlow client with optional scheduler-only fast-fail settings."""
+    from tickflow import TickFlow
+
+    if not api_key:
+        return TickFlow.free()
+
+    kwargs: dict[str, object] = {"api_key": api_key}
+    timeout_text = str(
+        os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS") or ""
+    ).strip()
+    if timeout_text:
+        try:
+            timeout = float(timeout_text)
+        except ValueError:
+            logger.warning("忽略无效的 TickFlow 告警超时配置：%s", timeout_text)
+        else:
+            if timeout > 0:
+                kwargs["timeout"] = timeout
+
+    retries_text = str(
+        os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_MAX_RETRIES") or ""
+    ).strip()
+    if retries_text:
+        try:
+            retries = int(retries_text)
+        except ValueError:
+            logger.warning("忽略无效的 TickFlow 告警重试配置：%s", retries_text)
+        else:
+            if retries >= 0:
+                kwargs["max_retries"] = retries
+    return TickFlow(**kwargs)
 
 
 DATE_KEYWORDS = ("日期", "date", "trade_date", "净值日期")
@@ -284,10 +319,8 @@ def fetch_tickflow_fund_close(
     count: int = 5000,
     adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
 ) -> pd.DataFrame:
-    from tickflow import TickFlow
-
     adjustment = normalize_fund_adjustment(adjust)
-    client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    client = _tickflow_client_from_env(api_key)
     fund_name = fetch_tickflow_instrument_name(symbol, api_key=api_key)
     kwargs = {
         "period": "1d",
@@ -322,9 +355,7 @@ def fetch_tickflow_fund_close(
 
 def fetch_tickflow_instrument_name(symbol: str, api_key: str = "") -> str:
     try:
-        from tickflow import TickFlow
-
-        client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+        client = _tickflow_client_from_env(api_key)
         instruments = client.instruments.batch(symbols=[symbol])
         if instruments:
             name = str(instruments[0].get("name", "")).strip()

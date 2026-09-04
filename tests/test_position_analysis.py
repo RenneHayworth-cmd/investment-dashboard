@@ -43,6 +43,7 @@ from services.position_analysis import (
     ETF_POSITION_STRATEGIES,
     ETF_REALTIME_TIMING_REFRESH_SECONDS,
     ETF_TIMING_STRATEGIES,
+    POSITION_INDEX_TIMING_STRATEGIES,
     PositionItem,
     _adjusted_history_has_overlap_changes,
     _append_sina_final_close,
@@ -59,6 +60,7 @@ from services.position_analysis import (
     apply_etf_realtime_quote_to_timing,
     build_recent_etf_operation_guidance,
     build_etf_timing_table,
+    build_position_index_timing_table,
     calculate_512890_parking_snapshot,
     calculate_etf_timing_snapshot,
     etf_afternoon_timing_fetch_ready,
@@ -429,6 +431,7 @@ class PositionAnalysisTests(unittest.TestCase):
     def test_etf_table_formatter_accepts_dash_in_numeric_columns(self):
         self.assertEqual(format_etf_table_value("对应均线", "-"), "-")
         self.assertEqual(format_etf_table_value("最新价", 1.9), "1.900")
+        self.assertEqual(format_etf_table_value("最新收盘", 3760.75), "3760.75")
         self.assertEqual(format_etf_table_value("当日涨跌幅(%)", 1.234), "1.23")
 
     def test_recent_operation_guidance_lists_pure_and_half_position_transitions(self):
@@ -596,6 +599,58 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(ETF_DISPLAY_NAMES["513310"], "中韩半导体ETF华泰柏瑞")
         self.assertEqual(ETF_DISPLAY_NAMES["513880"], "日经225ETF华安")
         self.assertEqual(set(ETF_DISPLAY_NAMES), set(DEFAULT_ETF_CODES))
+
+    @patch("services.position_analysis.load_dataset")
+    def test_index_timing_reference_uses_formal_index_caches(self, load_mock):
+        micro_dates = pd.bdate_range("2026-01-05", periods=20)
+        csi_dates = pd.bdate_range("2026-01-05", periods=30)
+        histories = {
+            "index_raw_微盘股": pd.DataFrame(
+                {"trade_date": micro_dates, "close": [100.0] * len(micro_dates)}
+            ),
+            "index_raw_000905.SH": pd.DataFrame(
+                {
+                    "trade_date": csi_dates,
+                    "close": [100.0] * 14 + [103.0] * 10 + [95.0] * 6,
+                }
+            ),
+        }
+        finalized = {
+            symbol: pd.DataFrame(
+                {
+                    "trade_date": [history["trade_date"].max() + pd.offsets.BDay(1)],
+                    "close": [104.0 if symbol == "index_raw_微盘股" else 95.0],
+                }
+            )
+            for symbol, history in histories.items()
+        }
+
+        def load_side_effect(symbol, source, data_type, period="1d"):
+            del data_type, period
+            if source == "index_history":
+                return histories.get(symbol), {"last_trade_date": "2026-02-17"}
+            if source == "index_final_history":
+                return finalized.get(symbol), {"last_trade_date": "2026-02-18"}
+            return None, None
+
+        load_mock.side_effect = load_side_effect
+
+        table = build_position_index_timing_table().set_index("指数名称")
+
+        self.assertEqual(
+            POSITION_INDEX_TIMING_STRATEGIES,
+            {
+                "微盘股": {"code": "BK1158", "ma_period": 15, "threshold_pct": 2.5},
+                "中证500": {"code": "000905", "ma_period": 15, "threshold_pct": 1.0},
+            },
+        )
+        self.assertEqual(table.index.tolist(), ["微盘股指数", "中证500"])
+        self.assertEqual(table.loc["微盘股指数", "代码"], "BK1158")
+        self.assertEqual(table.loc["微盘股指数", "策略参数"], "MA15 / 2.5%")
+        self.assertEqual(table.loc["微盘股指数", "择时判断"], "买入")
+        self.assertEqual(table.loc["中证500", "策略参数"], "MA15 / 1.0%")
+        self.assertEqual(table.loc["中证500", "择时判断"], "空仓")
+        self.assertTrue((table["数据状态"] == "正式收盘缓存").all())
 
     def test_timing_snapshot_retains_state_inside_band_and_marks_transitions(self):
         dates = pd.date_range("2026-07-01", periods=7, freq="D")
@@ -2990,6 +3045,7 @@ class PositionFacadeContractTests(unittest.TestCase):
         "ETF_MORNING_TIMING_REFRESH_SECONDS", "ETF_PORTFOLIO_WEIGHTS_PCT",
         "ETF_POSITION_STRATEGIES", "ETF_REALTIME_TIMING_END_TIME",
         "ETF_REALTIME_TIMING_REFRESH_SECONDS", "ETF_TIMING_STRATEGIES",
+        "POSITION_INDEX_TIMING_STRATEGIES",
         "POSITION_TIMING_INITIAL_CAPITAL", "POSITION_TIMING_LOT_SIZE",
         "POSITION_TIMING_PARKING_SYMBOL", "POSITION_TIMING_START_DATE",
         "POSITION_TIMING_TRANSACTION_COST", "PositionItem",
@@ -3001,6 +3057,7 @@ class PositionFacadeContractTests(unittest.TestCase):
         "_merge_current_day_refresh", "_request_sina_realtime_snapshot",
         "apply_etf_realtime_quote", "apply_etf_realtime_quote_to_timing",
         "apply_etf_realtime_quotes_to_items", "build_etf_timing_table",
+        "build_position_index_timing_table",
         "build_position_timing_performance",
         "build_recent_etf_operation_guidance", "calculate_512890_parking_snapshot",
         "calculate_etf_timing_snapshot", "etf_afternoon_timing_fetch_ready",
@@ -3026,6 +3083,7 @@ class PositionFacadeContractTests(unittest.TestCase):
         "load_or_fetch_spread": "(contracts: 'list[str]', *, base_contract: 'str | None' = None, api_key: 'str' = '', max_workers: 'int' = 2, allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "load_or_fetch_option": "(code: 'str', *, period: 'str' = '1d', count: 'int' = 500, ma_periods: 'list[int] | tuple[int, ...]' = (5, 20, 60), allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "refresh_position_derivative_items": "(items: 'list[PositionItem]', *, api_key: 'str' = '', max_workers: 'int' = 2, option_count: 'int' = 500, market_now: 'datetime | None' = None) -> 'tuple[list[PositionItem], list[str]]'",
+        "build_position_index_timing_table": "() -> 'pd.DataFrame'",
     }
 
     def test_existing_import_surface_and_signatures_are_stable(self):

@@ -11,7 +11,7 @@ $logFile = Join-Path $logDir "position_timing_trade_alert_task.log"
 $fallbackLogFile = Join-Path $env:TEMP "investment_dashboard_position_timing_trade_alert.log"
 $wsl = Join-Path $env:WINDIR "System32\wsl.exe"
 
-$pythonCommand = "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; export HERMES_SEND_BIN=/home/renne/.local/bin/hermes; cd /home/renne/investment_dashboard && exec .venv/bin/python scripts/monitor_position_timing_trades.py"
+$pythonCommand = "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; export HERMES_SEND_BIN=/home/renne/.local/bin/hermes; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS=10; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_MAX_RETRIES=0; cd /home/renne/investment_dashboard && exec /usr/bin/timeout --signal=TERM --kill-after=10s 8m .venv/bin/python scripts/monitor_position_timing_trades.py"
 if ($DryRun) {
     $pythonCommand += " --dry-run --force"
 }

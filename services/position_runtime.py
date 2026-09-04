@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from services.fund_analysis import infer_tickflow_symbol
+from services.fund_analysis import _tickflow_client_from_env, infer_tickflow_symbol
 from services.market_calendar import get_market_window, is_market_trading_day
 from services.position_market import _fetch_sina_exchange_fund_quote
 from services.position_models import (
@@ -41,6 +41,11 @@ from services.position_timing import calculate_etf_timing_snapshot
 _RUNTIME_ETF_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_ETF_QUOTE_CACHE_LOCK = Lock()
 _RUNTIME_ETF_QUOTE_FETCH_STATE: dict[str, object] = {}
+
+
+def _tickflow_quote_client(api_key: str):
+    """Build the quote client, honoring the scheduler's fast-fail overrides."""
+    return _tickflow_client_from_env(api_key)
 
 
 def _runtime_quote_refresh_band(market_now: datetime) -> tuple[str, int] | None:
@@ -192,11 +197,9 @@ def fetch_tickflow_etf_quotes(
     if not api_key.strip():
         raise ValueError("TickFlow实时行情需要填写API Key。")
 
-    from tickflow import TickFlow
-
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     symbols = [infer_tickflow_symbol(code) for code in codes]
-    client = TickFlow(api_key=api_key)
+    client = _tickflow_quote_client(api_key)
     quote_frames = []
     for start in range(0, len(symbols), 5):
         batch = symbols[start:start + 5]

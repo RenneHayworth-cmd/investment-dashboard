@@ -2,6 +2,20 @@ from __future__ import annotations
 
 import pandas as pd
 
+from core.cache import load_dataset
+from services.index_config import (
+    INDEX_CONFIG,
+    INDEX_FINAL_HISTORY_SOURCE,
+    INDEX_LONG_HISTORY_SOURCE,
+    INDEX_SOURCE_CORRECTION_SOURCE,
+)
+from services.index_frames import (
+    extract_source_correction_rows,
+    filter_completed_market_dates,
+    merge_raw_index_data,
+    overlay_finalized_index_rows,
+    raw_cache_symbol,
+)
 from services.position_models import (
     ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES,
     ETF_512890_TRANSFER_SOURCE_CODES,
@@ -14,6 +28,29 @@ from services.position_models import (
     display_etf_name,
     normalize_etf_base_code,
 )
+
+
+POSITION_INDEX_TIMING_STRATEGIES = {
+    "微盘股": {"code": "BK1158", "ma_period": 15, "threshold_pct": 2.5},
+    "中证500": {"code": "000905", "ma_period": 15, "threshold_pct": 1.0},
+}
+
+POSITION_INDEX_TIMING_COLUMNS = [
+    "指数名称",
+    "代码",
+    "数据截止日",
+    "最新收盘",
+    "当日涨跌幅(%)",
+    "策略参数",
+    "对应均线",
+    "偏离率(%)",
+    "择时判断",
+    "状态转换时间",
+    "区间涨幅(%)",
+    "上一状态转换时间",
+    "上一区间涨幅(%)",
+    "数据状态",
+]
 
 def calculate_etf_timing_snapshot(
     df: pd.DataFrame,
@@ -94,6 +131,154 @@ def calculate_etf_timing_snapshot(
         ),
         "策略上一区间涨幅(%)": previous_interval_return_pct,
     }
+
+
+def _load_position_index_timing_history(index_name: str) -> pd.DataFrame | None:
+    index_config = INDEX_CONFIG.get(index_name)
+    if not isinstance(index_config, dict):
+        return None
+
+    cache_symbol = raw_cache_symbol(index_name, index_config)
+    long_history, _ = load_dataset(
+        cache_symbol,
+        INDEX_LONG_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    accumulated_history, _ = load_dataset(
+        cache_symbol,
+        "index_history",
+        "index_daily_raw",
+    )
+    finalized_history, _ = load_dataset(
+        cache_symbol,
+        INDEX_FINAL_HISTORY_SOURCE,
+        "index_daily_raw",
+    )
+    correction_history, _ = load_dataset(
+        cache_symbol,
+        INDEX_SOURCE_CORRECTION_SOURCE,
+        "index_daily_raw",
+    )
+
+    base_history = None
+    if long_history is not None and not long_history.empty:
+        base_history = merge_raw_index_data(None, long_history)
+    if accumulated_history is not None and not accumulated_history.empty:
+        base_history = merge_raw_index_data(base_history, accumulated_history)
+
+    market_name = str(index_config.get("market_group") or "")
+    base_history = filter_completed_market_dates(base_history, market_name)
+    finalized_history = filter_completed_market_dates(finalized_history, market_name)
+    correction_history = filter_completed_market_dates(
+        extract_source_correction_rows(correction_history, index_config),
+        market_name,
+    )
+    effective_history = overlay_finalized_index_rows(
+        base_history,
+        finalized_history,
+    )
+    effective_history = overlay_finalized_index_rows(
+        effective_history,
+        correction_history,
+    )
+    if effective_history is None or effective_history.empty:
+        return None
+    return merge_raw_index_data(None, effective_history)
+
+
+def build_position_index_timing_table() -> pd.DataFrame:
+    """从指数监控正式日线缓存构建持仓页的指数择时参考。"""
+    rows: list[dict[str, object]] = []
+    for index_name, strategy in POSITION_INDEX_TIMING_STRATEGIES.items():
+        ma_period = int(strategy["ma_period"])
+        threshold_pct = float(strategy["threshold_pct"])
+        row: dict[str, object] = {
+            "指数名称": f"{index_name}指数" if index_name == "微盘股" else index_name,
+            "代码": str(strategy["code"]),
+            "数据截止日": pd.NA,
+            "最新收盘": pd.NA,
+            "当日涨跌幅(%)": pd.NA,
+            "策略参数": f"MA{ma_period} / {threshold_pct:.1f}%",
+            "对应均线": pd.NA,
+            "偏离率(%)": pd.NA,
+            "择时判断": pd.NA,
+            "状态转换时间": pd.NA,
+            "区间涨幅(%)": pd.NA,
+            "上一状态转换时间": pd.NA,
+            "上一区间涨幅(%)": pd.NA,
+            "数据状态": "无正式缓存",
+        }
+        history = _load_position_index_timing_history(index_name)
+        if history is None or history.empty:
+            rows.append(row)
+            continue
+
+        timing_history = history[["trade_date", "close"]].rename(
+            columns={"trade_date": "date", "close": "price"}
+        )
+        timing_history["date"] = pd.to_datetime(
+            timing_history["date"], errors="coerce"
+        )
+        timing_history["price"] = pd.to_numeric(
+            timing_history["price"], errors="coerce"
+        )
+        timing_history = (
+            timing_history.dropna(subset=["date", "price"])
+            .sort_values("date")
+            .drop_duplicates("date", keep="last")
+            .reset_index(drop=True)
+        )
+        if timing_history.empty:
+            rows.append(row)
+            continue
+
+        latest = timing_history.iloc[-1]
+        previous_close = (
+            float(timing_history.iloc[-2]["price"])
+            if len(timing_history) >= 2
+            else pd.NA
+        )
+        latest_close = float(latest["price"])
+        daily_change_pct = (
+            (latest_close / previous_close - 1) * 100
+            if pd.notna(previous_close) and previous_close != 0
+            else pd.NA
+        )
+        row.update(
+            {
+                "数据截止日": pd.Timestamp(latest["date"]).strftime("%Y-%m-%d"),
+                "最新收盘": latest_close,
+                "当日涨跌幅(%)": daily_change_pct,
+            }
+        )
+        if len(timing_history) < ma_period:
+            row["数据状态"] = "正式缓存不足"
+            rows.append(row)
+            continue
+
+        snapshot = calculate_etf_timing_snapshot(
+            timing_history,
+            ma_period=ma_period,
+            threshold_pct=threshold_pct,
+        )
+        row.update(
+            {
+                "对应均线": snapshot.get("策略均线", pd.NA),
+                "偏离率(%)": snapshot.get("策略偏离(%)", pd.NA),
+                "择时判断": snapshot.get("择时判断", pd.NA),
+                "状态转换时间": snapshot.get("状态转换时间", pd.NA),
+                "区间涨幅(%)": snapshot.get("策略区间涨幅(%)", pd.NA),
+                "上一状态转换时间": snapshot.get(
+                    "上一状态转换时间", pd.NA
+                ),
+                "上一区间涨幅(%)": snapshot.get(
+                    "策略上一区间涨幅(%)", pd.NA
+                ),
+                "数据状态": "正式收盘缓存",
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=POSITION_INDEX_TIMING_COLUMNS)
 
 
 def etf_position_decision(code: str, timing_action: object) -> object:

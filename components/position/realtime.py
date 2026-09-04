@@ -527,6 +527,17 @@ def render_etf_timing_section_impl(
                     "午间价格不写入缓存，也不参与近一周操作指引。"
                 )
 
+    st.subheader("指数择时参考")
+    render_etf_timing_table(
+        position.build_position_index_timing_table(),
+        value_formatter=value_formatter,
+    )
+    st.caption(
+        "BK1158微盘股使用MA15/2.5%，中证500使用MA15/1%；"
+        "仅读取指数监控的正式收盘缓存并延续上一状态，"
+        "不计入ETF组合权重、50万元策略或近一周操作指引。"
+    )
+
     st.subheader("近一周操作指引")
     guidance_df = position.build_recent_etf_operation_guidance(formal_items, days=7)
     if guidance_df.empty:

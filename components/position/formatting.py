@@ -31,6 +31,11 @@ def format_etf_table_value(column: str, value: object) -> str:
                 Decimal(text).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP),
                 ".3f",
             )
+        if column == "最新收盘":
+            return format(
+                Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                ".2f",
+            )
         if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)", "上一区间涨幅(%)"}:
             return format(
                 Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),

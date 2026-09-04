@@ -139,6 +139,18 @@ def _patch_page(stack: ExitStack, *, cached: bool):
     )
     stack.enter_context(
         patch(
+            "services.position_analysis.build_position_index_timing_table",
+            return_value=pd.DataFrame(
+                {
+                    "指数名称": ["微盘股指数", "中证500"],
+                    "代码": ["BK1158", "000905"],
+                    "择时判断": ["持有", "空仓"],
+                }
+            ),
+        )
+    )
+    stack.enter_context(
+        patch(
             "services.position_analysis.build_recent_etf_operation_guidance",
             return_value=pd.DataFrame(),
         )
@@ -379,7 +391,8 @@ render_position_timing_performance([])
             [item.label for item in app.metric[:4]],
             ["分析标的", "可用数据", "缺失缓存", "获取失败"],
         )
-        self.assertLess(subheaders.index("ETF择时状态"), subheaders.index("近一周操作指引"))
+        self.assertLess(subheaders.index("ETF择时状态"), subheaders.index("指数择时参考"))
+        self.assertLess(subheaders.index("指数择时参考"), subheaders.index("近一周操作指引"))
         self.assertLess(
             subheaders.index("近一周操作指引"),
             subheaders.index("50万元ETF均线策略每日盈亏"),
