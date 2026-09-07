@@ -3,6 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from core.metrics import (
+    annualized_return,
+    drawdown_series,
+    max_drawdown,
+    seeded_returns,
+    sharpe_ratio,
+    trade_win_stats,
+)
 from services.fund_rotation_models import LOT_SIZE
 
 def _round_lot_shares(shares: float, lot_size: int = LOT_SIZE) -> float:
@@ -16,13 +24,15 @@ def _calculate_drawdown(
     nav_df: pd.DataFrame,
     initial_capital: float | None = None,
 ) -> pd.DataFrame:
+    # 统一实现见 core.metrics.drawdown_series（initial_capital 作为起点峰值）
     result = nav_df[["日期", "账户净值"]].copy()
     account_values = pd.to_numeric(result["账户净值"], errors="coerce")
+    drawdown = drawdown_series(account_values, initial_capital=initial_capital)
     running_peak = account_values.cummax()
     if initial_capital is not None:
         running_peak = running_peak.clip(lower=float(initial_capital))
     result["running_peak"] = running_peak
-    result["回撤(%)"] = (result["账户净值"] / result["running_peak"] - 1) * 100
+    result["回撤(%)"] = drawdown
     return result.round({"回撤(%)": 2})
 
 
@@ -44,16 +54,18 @@ def _calculate_individual_results(
         last = float(data["close"].iloc[-1])
         total_return = last / first - 1 if first > 0 else 0
         days = (pd.Timestamp(data["trade_date"].max()) - pd.Timestamp(data["trade_date"].min())).days
-        annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
+        annual_return = (
+            annualized_return(total_return, days) if days > 0 and total_return > -1 else 0
+        )
         nav = data["close"] / first * initial_capital if first > 0 else pd.Series(dtype=float)
-        drawdown = nav / nav.cummax() - 1 if not nav.empty else pd.Series(dtype=float)
+        mdd = max_drawdown(nav) if not nav.empty else 0.0
         rows.append(
             {
                 "标的": names.get(symbol, symbol),
                 "代码": symbol,
                 "总收益率(%)": round(total_return * 100, 2),
                 "年化收益率(%)": round(annual_return * 100, 2),
-                "一直持有最大回撤(%)": round(float(drawdown.min() * 100), 2) if not drawdown.empty else 0,
+                "一直持有最大回撤(%)": round(mdd, 2),
                 "期末资金": round(initial_capital * (1 + total_return), 2),
             }
         )
@@ -124,31 +136,17 @@ def _calculate_yearly_stats(
 
 
 def _calculate_sharpe_ratio(daily_returns: pd.Series) -> float:
-    clean_returns = pd.to_numeric(daily_returns, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    if len(clean_returns) < 2:
-        return 0.0
-    daily_volatility = float(clean_returns.std())
-    if daily_volatility <= 0:
-        return 0.0
-    return float(clean_returns.mean() / daily_volatility * np.sqrt(252))
+    # 统一实现见 core.metrics.sharpe_ratio（无风险利率默认 0）
+    return sharpe_ratio(daily_returns)
 
 
 def _calculate_nav_returns(nav_df: pd.DataFrame, initial_capital: float) -> pd.Series:
-    account_values = pd.to_numeric(nav_df["账户净值"], errors="coerce").dropna().reset_index(drop=True)
-    if account_values.empty:
-        return pd.Series(dtype=float)
-    seeded_values = pd.concat(
-        [pd.Series([float(initial_capital)]), account_values],
-        ignore_index=True,
-    )
-    return seeded_values.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    # 统一实现见 core.metrics.seeded_returns（以初始资金播种）
+    return seeded_returns(nav_df["账户净值"], initial_capital)
 
 
 def _calculate_trade_win_stats(realized_trade_pnls: list[float]) -> tuple[int, int, float]:
-    closed_count = len(realized_trade_pnls)
-    winning_count = sum(1 for pnl in realized_trade_pnls if pnl > 0)
-    win_rate = winning_count / closed_count * 100 if closed_count else 0.0
-    return closed_count, winning_count, win_rate
+    return trade_win_stats(realized_trade_pnls)
 
 __all__ = [
     "_round_lot_shares",

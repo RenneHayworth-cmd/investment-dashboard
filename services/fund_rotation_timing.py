@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from core.metrics import annual_volatility, annualized_return
 from services.fund_rotation_data import _normalize_date_range
 from services.fund_rotation_metrics import (
     _calculate_drawdown,
@@ -11,7 +12,12 @@ from services.fund_rotation_metrics import (
     _calculate_yearly_stats,
     _round_lot_shares,
 )
+from services.ma_timing_core import ma_threshold_states, threshold_desired_position
 from services.fund_rotation_models import (
+    BUY_SLIPPAGE,
+    EXECUTION_AFTER_CLOSE,
+    EXECUTION_NEXT_CLOSE,
+    EXECUTION_NEXT_OPEN,
     PORTFOLIO_EMPTY_ACTIVATION_IMMEDIATE,
     PORTFOLIO_EMPTY_ACTIVATIONS,
     PORTFOLIO_INITIAL_ENTRY_FOLLOW_STATE,
@@ -37,38 +43,180 @@ def _build_timing_signal_frame(
     ma_period: int,
     threshold_pct: float,
 ) -> pd.DataFrame:
-    signal_data = data[["trade_date", "close"]].copy()
-    signal_data[f"MA{ma_period}"] = signal_data["close"].rolling(window=ma_period).mean()
-    threshold = float(threshold_pct) / 100
-    position = 0
-    rows: list[dict[str, object]] = []
-    for _, row in signal_data.iterrows():
-        ma_value = pd.to_numeric(row[f"MA{ma_period}"], errors="coerce")
+    # 信号状态机统一定义见 services.ma_timing_core.ma_threshold_states
+    close = pd.to_numeric(data["close"], errors="coerce")
+    close.index = pd.DatetimeIndex(pd.to_datetime(data["trade_date"]))
+    states = ma_threshold_states(close, ma_period, threshold_pct)
+    ma_values = close.rolling(window=ma_period).mean()
+
+    previous_state = 0
+    raw_actions: list[str] = []
+    for trade_date, state_value in states.items():
+        ma_value = ma_values.loc[trade_date]
         if pd.isna(ma_value):
-            desired_position = position
-            action = "等待均线"
+            raw_actions.append("等待均线")
+            continue
+        state = int(state_value)
+        if state != previous_state:
+            raw_actions.append("买入" if state == 1 else "卖出")
         else:
-            close_price = float(row["close"])
-            desired_position = (
-                1
-                if close_price > float(ma_value) * (1 + threshold)
-                else 0
-                if close_price < float(ma_value) * (1 - threshold)
-                else position
+            raw_actions.append("持有" if state == 1 else "空仓")
+        previous_state = state
+
+    frame = pd.DataFrame(
+        {
+            "信号仓位": states.astype(int),
+            "原始信号": raw_actions,
+        },
+        index=close.index,
+    )
+    return frame.reindex(common_dates)
+
+
+def _delay_signal_frame(
+    signal_frame: pd.DataFrame,
+    common_dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """把信号帧整体延迟一个交易日：t 日的行携带 t-1 日的信号（首个交易日为 NaN）。"""
+    delayed = signal_frame.shift(1)
+    delayed.index = common_dates
+    return delayed
+
+
+def _align_timing_data(
+    timing_result,
+    common_dates: pd.DatetimeIndex,
+    *,
+    execution_mode: str,
+    slippage: float,
+    open_source: RotationInput | None = None,
+) -> pd.DataFrame:
+    """把单标的择时结果对齐到共同日期；非默认口径下按延迟执行重估。
+
+    next_close/next_open：信号仓位收益贡献延迟一日（t 日信号赚 t+1→t+2 的收益），
+    统一实现为净值收益序列 shift(1)；next_open 额外把换手日的滑点差
+    （新口径成交在开盘价 vs 旧口径收盘价）近似为延迟一日换手 × 滑点扣减。
+    估值仍用收盘价，现金按新净值与持仓重推。
+    """
+    timing_data = timing_result.data.set_index("日期").reindex(common_dates)
+    if execution_mode == EXECUTION_AFTER_CLOSE:
+        return timing_data
+    nav = pd.to_numeric(timing_data["账户净值"], errors="coerce")
+    benchmark = pd.to_numeric(timing_data["一直持有净值"], errors="coerce")
+    strategy_return = nav.pct_change().fillna(0.0)
+    delayed_return = strategy_return.shift(1).fillna(0.0)
+    if slippage > 0:
+        holdings = pd.to_numeric(timing_data["持仓份额"], errors="coerce").ffill().fillna(0.0)
+        position = (holdings > 0).astype(float)
+        turnover = position.diff().abs().fillna(0.0)
+        delayed_turnover = turnover.shift(1).fillna(0.0)
+        extra_cost = (delayed_turnover - turnover).clip(lower=0) * slippage
+        delayed_return = delayed_return - extra_cost
+    delayed_nav = float(nav.iloc[0]) * (1 + delayed_return).cumprod()
+    timing_data["账户净值"] = delayed_nav
+    timing_data["策略累计收益率(%)"] = (delayed_nav / float(nav.iloc[0]) - 1) * 100
+    close_price = pd.to_numeric(timing_data["收盘价"], errors="coerce").ffill().fillna(0)
+    timing_data["现金余额"] = timing_data["账户净值"] - pd.to_numeric(
+        timing_data["持仓份额"], errors="coerce"
+    ).fillna(0) * close_price
+    timing_data["一直持有净值"] = benchmark
+    return timing_data
+
+
+def _apply_sleeve_slippage(sleeve_result: dict[str, object], slippage: float) -> dict[str, object]:
+    """对延迟口径（next_open）袖套的每笔交易按滑点调整成交价并重估净值。
+
+    买价 ×(1+s)、卖价 ×(1-s)：从交易明细重放每日现金与份额
+    （初始现金 = 首日净值 - 首日市值），估值价用最近一次成交价近似
+    （成交当日估值价=成交价，非成交日沿用最后一次成交价）。
+    滑点仅作用于 next_open 口径的袖套；研究组合口径用。
+    """
+    trades = sleeve_result.get("trades")
+    nav = sleeve_result["nav"].astype(float)
+    market = sleeve_result["market"].astype(float)
+    if slippage <= 0 or trades is None or trades.empty:
+        return sleeve_result
+
+    initial_cash = float(nav.iloc[0]) - float(market.iloc[0])
+    trades_by_date: dict[pd.Timestamp, list[dict[str, object]]] = {}
+    for _, row in trades.iterrows():
+        trades_by_date.setdefault(pd.Timestamp(row["日期"]), []).append(row)
+
+    cash = initial_cash
+    primary_shares = 0.0
+    primary_cost = 0.0
+    fallback_shares = 0.0
+    fallback_cost = 0.0
+    total_cost = 0.0
+    realized_pnls: list[float] = []
+    nav_values: list[float] = []
+    cash_values: list[float] = []
+    market_values: list[float] = []
+
+    last_primary_price = float("nan")
+    last_fallback_price = float("nan")
+    for trade_date in nav.index:
+        for row in trades_by_date.get(pd.Timestamp(trade_date), []):
+            price = float(row["成交价"])
+            shares = float(row["份额"])
+            reason = str(row.get("原因", ""))
+            is_fallback = "承接标的" in reason
+            fee_rate = (
+                float(row["手续费"]) / float(row["成交金额"]) if float(row["成交金额"]) else 0.0
             )
-            if desired_position != position:
-                action = "买入" if desired_position else "卖出"
+            if row["操作"] == "买入":
+                fill_price = price * (1 + slippage)
+                gross = shares * fill_price
+                fee = gross * fee_rate
+                cash -= gross + fee
+                total_cost += fee
+                if is_fallback:
+                    fallback_shares += shares
+                    fallback_cost += gross + fee
+                    last_fallback_price = fill_price
+                else:
+                    if "长期半仓" in reason:
+                        primary_cost += 0.0  # 长期半仓与择时半仓共用主标的均价跟踪
+                    primary_cost += gross + fee
+                    primary_shares += shares
+                    last_primary_price = fill_price
             else:
-                action = "持有" if position else "空仓"
-        position = desired_position
-        rows.append(
-            {
-                "日期": pd.Timestamp(row["trade_date"]),
-                "信号仓位": int(position),
-                "原始信号": action,
-            }
-        )
-    return pd.DataFrame(rows).set_index("日期").reindex(common_dates)
+                fill_price = price * (1 - slippage)
+                gross = shares * fill_price
+                fee = gross * fee_rate
+                net = gross - fee
+                if is_fallback:
+                    realized = net - fallback_cost * (shares / fallback_shares) if fallback_shares > 0 else net
+                    fallback_shares = max(0.0, fallback_shares - shares)
+                    if fallback_shares <= 0:
+                        fallback_cost = 0.0
+                    else:
+                        fallback_cost *= (fallback_shares) / (fallback_shares + shares)
+                    last_fallback_price = fill_price
+                else:
+                    avg_cost = primary_cost / primary_shares if primary_shares > 0 else 0.0
+                    realized = net - avg_cost * shares
+                    primary_shares = max(0.0, primary_shares - shares)
+                    primary_cost = avg_cost * primary_shares
+                    last_primary_price = fill_price
+                cash += net
+                total_cost += fee
+                realized_pnls.append(realized)
+        market_value = 0.0
+        if np.isfinite(last_primary_price) and primary_shares > 0:
+            market_value += primary_shares * last_primary_price
+        if np.isfinite(last_fallback_price) and fallback_shares > 0:
+            market_value += fallback_shares * last_fallback_price
+        market_values.append(market_value)
+        nav_values.append(cash + market_value)
+        cash_values.append(cash)
+
+    sleeve_result["nav"] = pd.Series(nav_values, index=nav.index)
+    sleeve_result["cash"] = pd.Series(cash_values, index=nav.index)
+    sleeve_result["market"] = pd.Series(market_values, index=nav.index)
+    sleeve_result["total_cost"] = total_cost
+    sleeve_result["realized_trade_pnls"] = realized_pnls
+    return sleeve_result
 
 
 def _run_delayed_timing_sleeve(
@@ -371,7 +519,16 @@ def run_ma20_timing_backtest(
         raise ValueError("数据长度不足，无法计算 MA20 策略。")
 
     ma_col = f"MA{ma_period}"
-    data[ma_col] = data["close"].rolling(window=ma_period).mean()
+    # 触发线与阈值决策统一定义见 services.ma_timing_core（账户自愈语义）
+    close_indexed = pd.Series(
+        pd.to_numeric(data["close"], errors="coerce").to_numpy(),
+        index=pd.DatetimeIndex(pd.to_datetime(data["trade_date"])),
+    )
+    threshold = float(threshold_pct) / 100
+    ma_series = close_indexed.rolling(window=ma_period).mean()
+    buy_line_series = ma_series * (1 + threshold)
+    sell_line_series = ma_series * (1 - threshold)
+
     requested_start, requested_end = _normalize_date_range(start_date, end_date)
     if requested_end is not None:
         data = data[data["trade_date"] <= requested_end]
@@ -380,7 +537,7 @@ def run_ma20_timing_backtest(
     data = data.reset_index(drop=True)
     if data.empty:
         raise ValueError("所选时间区间内没有可回测的数据。")
-    if not data[ma_col].notna().any():
+    if not ma_series.reindex(pd.DatetimeIndex(pd.to_datetime(data["trade_date"]))).notna().any():
         raise ValueError("所选时间区间内均线尚未形成，请扩大区间或缩短均线周期。")
 
     cash = float(initial_capital)
@@ -396,7 +553,7 @@ def run_ma20_timing_backtest(
     for _, row in data.iterrows():
         trade_date = pd.Timestamp(row["trade_date"])
         close_price = float(row["close"])
-        ma_raw = pd.to_numeric(row[ma_col], errors="coerce")
+        ma_raw = ma_series.get(trade_date, np.nan)
         if pd.isna(ma_raw):
             ma_value = np.nan
             buy_line = np.nan
@@ -406,15 +563,10 @@ def run_ma20_timing_backtest(
             action = "等待"
         else:
             ma_value = float(ma_raw)
-            threshold = float(threshold_pct) / 100
-            buy_line = ma_value * (1 + threshold)
-            sell_line = ma_value * (1 - threshold)
-            desired_position = (
-                1
-                if close_price > buy_line
-                else 0
-                if close_price < sell_line
-                else int(shares > 0)
+            buy_line = float(buy_line_series.get(trade_date, np.nan))
+            sell_line = float(sell_line_series.get(trade_date, np.nan))
+            desired_position = threshold_desired_position(
+                close_price, buy_line, sell_line, int(shares > 0)
             )
             signal = "持仓" if desired_position == 1 else "空仓"
             action = "持有"
@@ -527,9 +679,28 @@ def run_portfolio_timing_backtest(
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
     *,
+    execution_mode: str = EXECUTION_AFTER_CLOSE,
+    slippage: float = 0.0,
     _timing_runner=None,
 ) -> PortfolioTimingResult:
+    """组合择时回测。
+
+    执行口径（audit P1 扩展，默认保持既有行为）：
+    - ``after_close``：t 日收盘信号、t 日收盘价成交（盘后固定价机制假设）；
+    - ``next_open``：t 日收盘信号、t+1 日开盘价成交（可选滑点）；
+    - ``next_close``：t 日收盘信号、t+1 日收盘价成交。
+
+    非默认口径下，袖套信号延迟一日执行：延迟期间的净值按原持仓估值，
+    到执行日才发生交易；半仓长期腿同样延迟建仓。
+    """
     timing_runner = _timing_runner or run_ma20_timing_backtest
+    if execution_mode not in (EXECUTION_AFTER_CLOSE, EXECUTION_NEXT_OPEN, EXECUTION_NEXT_CLOSE):
+        raise ValueError(f"不支持的执行口径：{execution_mode}")
+    if slippage < 0:
+        raise ValueError("滑点不能为负数。")
+    if execution_mode == EXECUTION_NEXT_OPEN and slippage == 0:
+        # 次日开盘成交默认计入项目口径的双边 0.05% 滑点
+        slippage = BUY_SLIPPAGE
     if initial_capital <= 0:
         raise ValueError("初始资金必须大于 0。")
     if transaction_cost < 0:
@@ -706,15 +877,36 @@ def run_portfolio_timing_backtest(
                     if item.empty_position_symbol
                     else None
                 )
-                sleeve_result = _run_delayed_timing_sleeve(
-                    item=item,
-                    capital=capital,
-                    primary_prices=prices,
-                    fallback_prices=fallback_prices,
-                    signal_frame=signal_frame,
-                    transaction_cost=transaction_cost,
-                    lot_size=lot_size,
-                )
+                if execution_mode != EXECUTION_AFTER_CLOSE:
+                    # 非默认口径：袖套信号整体延迟一日执行，成交价切换到次日开盘/收盘
+                    signal_frame = _delay_signal_frame(signal_frame, common_dates)
+                    if execution_mode == EXECUTION_NEXT_OPEN:
+                        prices = _open_prices_for(fund_by_symbol[item.symbol], common_dates)
+                        if fallback_prices is not None:
+                            fallback_prices = _open_prices_for(
+                                fund_by_symbol[item.empty_position_symbol], common_dates
+                            )
+                    sleeve_result = _run_delayed_timing_sleeve(
+                        item=item,
+                        capital=capital,
+                        primary_prices=prices,
+                        fallback_prices=fallback_prices,
+                        signal_frame=signal_frame,
+                        transaction_cost=transaction_cost,
+                        lot_size=lot_size,
+                    )
+                    if execution_mode == EXECUTION_NEXT_OPEN and slippage > 0:
+                        sleeve_result = _apply_sleeve_slippage(sleeve_result, slippage)
+                else:
+                    sleeve_result = _run_delayed_timing_sleeve(
+                        item=item,
+                        capital=capital,
+                        primary_prices=prices,
+                        fallback_prices=fallback_prices,
+                        signal_frame=signal_frame,
+                        transaction_cost=transaction_cost,
+                        lot_size=lot_size,
+                    )
                 strategy_nav = sleeve_result["nav"]
                 strategy_cash = sleeve_result["cash"]
                 strategy_market = sleeve_result["market"]
@@ -739,7 +931,13 @@ def run_portfolio_timing_backtest(
                     start_date=actual_start,
                     end_date=actual_end,
                 )
-                timing_data = timing_result.data.set_index("日期").reindex(common_dates)
+                timing_data = _align_timing_data(
+                    timing_result,
+                    common_dates,
+                    execution_mode=execution_mode,
+                    slippage=slippage,
+                    open_source=fund_by_symbol[item.symbol],
+                )
                 strategy_nav = timing_data["账户净值"]
                 strategy_cash = timing_data["现金余额"]
                 strategy_market = strategy_nav - strategy_cash
@@ -761,7 +959,13 @@ def run_portfolio_timing_backtest(
                     start_date=actual_start,
                     end_date=actual_end,
                 )
-                timing_data = timing_result.data.set_index("日期").reindex(common_dates)
+                timing_data = _align_timing_data(
+                    timing_result,
+                    common_dates,
+                    execution_mode=execution_mode,
+                    slippage=slippage,
+                    open_source=fund_by_symbol[item.symbol],
+                )
                 timing_nav = timing_data["账户净值"]
                 strategy_nav = hold_nav + timing_nav
                 strategy_cash = hold_cash + timing_data["现金余额"]
@@ -828,14 +1032,10 @@ def run_portfolio_timing_backtest(
     total_return = final_value / initial_capital - 1
     benchmark_return = benchmark_final / initial_capital - 1
     days = (actual_end - actual_start).days
-    annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0.0
-    benchmark_annual_return = (
-        (1 + benchmark_return) ** (365 / days) - 1
-        if days > 0 and benchmark_return > -1
-        else 0.0
-    )
+    annual_return = annualized_return(total_return, days)
+    benchmark_annual_return = annualized_return(benchmark_return, days)
     daily_returns = _calculate_nav_returns(nav_data, initial_capital)
-    annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
+    annual_vol = annual_volatility(daily_returns)
     sharpe = _calculate_sharpe_ratio(daily_returns)
     benchmark_seeded = pd.concat(
         [pd.Series([initial_capital]), nav_data["一直持有净值"].reset_index(drop=True)],

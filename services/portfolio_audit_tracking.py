@@ -71,6 +71,7 @@ def load_frozen_strategy_snapshot(path: str | Path) -> dict[str, object]:
 
 
 def frozen_allocations(snapshot: dict[str, object]) -> list[AuditAllocation]:
+    # 回读必须覆盖全部动态阈值字段，否则 sigma/hybrid 规则回读后 k 会退化为 0
     return [
         AuditAllocation(
             symbol=str(row["symbol"]),
@@ -81,6 +82,11 @@ def frozen_allocations(snapshot: dict[str, object]) -> list[AuditAllocation]:
             threshold_pct=float(row["threshold_pct"]),
             signal_rule=str(row.get("signal_rule", "percent")),
             atr_k=float(row.get("atr_k", 0.0)),
+            sigma_period=int(row.get("sigma_period", 60)),
+            buy_k=float(row.get("buy_k", 0.0)),
+            sell_k=float(row.get("sell_k", 0.0)),
+            buy_alpha_pct=float(row.get("buy_alpha_pct", 0.0)),
+            sell_alpha_pct=float(row.get("sell_alpha_pct", 0.0)),
         )
         for row in snapshot["parameters"]
     ]

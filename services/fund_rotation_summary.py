@@ -3,11 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from services.fund_rotation_metrics import (
-    _calculate_nav_returns,
-    _calculate_sharpe_ratio,
-    _calculate_trade_win_stats,
+from core.metrics import (
+    annual_volatility,
+    annualized_return,
+    max_drawdown,
+    seeded_returns,
+    sharpe_ratio,
 )
+from services.fund_rotation_metrics import _calculate_trade_win_stats
 from services.fund_rotation_models import EXECUTION_AFTER_CLOSE, RotationInput
 
 def _execution_mode_label(execution_mode: str) -> str:
@@ -30,10 +33,10 @@ def _build_summary(
     final_value = float(nav_df["账户净值"].iloc[-1])
     total_return = final_value / initial_capital - 1
     days = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days
-    annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
-    daily_returns = _calculate_nav_returns(nav_df, initial_capital)
-    annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
-    sharpe = _calculate_sharpe_ratio(daily_returns)
+    annual_return = annualized_return(total_return, days)
+    daily_returns = seeded_returns(nav_df["账户净值"], initial_capital)
+    annual_vol = annual_volatility(daily_returns)
+    sharpe = sharpe_ratio(daily_returns)
     max_drawdown = float(drawdown_df["回撤(%)"].min()) if not drawdown_df.empty else 0
     switch_count = int((trades_df["操作"] == "调仓").sum()) if not trades_df.empty else 0
     closed_trade_count, winning_trade_count, trade_win_rate = _calculate_trade_win_stats(realized_trade_pnls)
@@ -84,13 +87,11 @@ def _build_timing_summary(
     benchmark_drawdown = benchmark_values / benchmark_values.cummax() - 1
     benchmark_max_drawdown = float(benchmark_drawdown.min() * 100) if not benchmark_drawdown.empty else 0.0
     days = (end_date - start_date).days
-    annual_return = (1 + total_return) ** (365 / days) - 1 if days > 0 and total_return > -1 else 0
-    benchmark_annual_return = (
-        (1 + benchmark_return) ** (365 / days) - 1 if days > 0 and benchmark_return > -1 else 0
-    )
-    daily_returns = _calculate_nav_returns(result_df, initial_capital)
-    annual_vol = float(daily_returns.std() * np.sqrt(252)) if not daily_returns.empty else 0.0
-    sharpe = _calculate_sharpe_ratio(daily_returns)
+    annual_return = annualized_return(total_return, days)
+    benchmark_annual_return = annualized_return(benchmark_return, days)
+    daily_returns = seeded_returns(result_df["账户净值"], initial_capital)
+    annual_vol = annual_volatility(daily_returns)
+    sharpe = sharpe_ratio(daily_returns)
     latest = result_df.iloc[-1]
     trade_count = len(trades_df)
     buy_count = int((trades_df["操作"] == "买入").sum()) if not trades_df.empty else 0

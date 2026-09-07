@@ -449,6 +449,8 @@ def run_primary_asset(
         "train_end": train_end,
         "test_start": test_start,
         "test_end": test_end,
+        # 独立 OOS 胜率去重所需的 holdout 测试窗（70/30 切分的测试段）
+        "holdout_test_window": (test_start, test_end),
         "candidates": candidates,
     }
 
@@ -603,7 +605,20 @@ def build_decision_summary(
         dynamic_wf_scores: list[float] = []
         current_wf_scores: list[float] = []
         fixed_wf_scores: list[float] = []
+        # 独立 OOS 胜率：70/30 holdout 测试窗与最后一折 Walk-Forward 测试窗重叠
+        # （WF 折铺到序列末尾），holdout 与最后一折不能同时计入，否则同段行情
+        # 被统计两次。口径：holdout 恒计入；丢弃与 holdout 测试窗重叠的最后一折。
+        holdout_test_start, holdout_test_end = result["holdout_test_window"]
+        dropped_folds: list[int] = []
         for _fold, group in walk_full.groupby("fold") if not walk_full.empty else []:
+            fold_test_start = pd.Timestamp(group["test_start"].iloc[0])
+            fold_test_end = pd.Timestamp(group["test_end"].iloc[0])
+            overlaps_holdout = not (
+                fold_test_end < holdout_test_start or fold_test_start > holdout_test_end
+            )
+            if overlaps_holdout:
+                dropped_folds.append(int(_fold))
+                continue
             current_row = _model_row(group, "current_fixed")
             fixed_row = _model_row(group, "joint_fixed")
             dynamic_row = _model_row(group, DYNAMIC_FAMILIES)
@@ -726,6 +741,7 @@ def build_decision_summary(
                 "walk_forward_better_current": wf_better_current,
                 "walk_forward_better_joint_fixed": wf_better_fixed,
                 "independent_oos_win_rate": oos_win_rate,
+                "oos_dedup_dropped_folds": "、".join(str(f) for f in dropped_folds) or "无",
                 "stable_parameter_platform": stable_platform,
                 "trade_count_ratio_vs_current": trade_ratio,
                 "trade_count_within_125pct": trade_ok,

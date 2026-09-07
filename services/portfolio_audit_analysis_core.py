@@ -287,6 +287,67 @@ def atr_parameter_analysis(
     return pd.DataFrame(rows)
 
 
+def _continuous_path_metrics(
+    market_frame: pd.DataFrame,
+    item: AuditAllocation,
+    settings: AuditSettings,
+    *,
+    path_start: pd.Timestamp,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """连续路径口径的测试段指标：从 path_start 起跑一次严格引擎（状态继承训练段），
+    再按测试窗切出策略与一直持有基准的指标。两端使用同一核算口径。"""
+    run_settings = replace(settings, start_date=path_start, end_date=test_end)
+    strategy = _run_portfolio_audit(
+        {item.symbol: market_frame},
+        [replace(item, weight_pct=100)],
+        run_settings,
+    )
+    hold = _run_portfolio_audit(
+        {item.symbol: market_frame},
+        [replace(item, weight_pct=100, strategy="hold")],
+        run_settings,
+    )
+    return (
+        _test_window_metrics(strategy, test_start, test_end),
+        _test_window_metrics(hold, test_start, test_end),
+    )
+
+
+def _test_window_metrics(result: AuditRunResult, test_start: pd.Timestamp, test_end: pd.Timestamp) -> dict[str, float]:
+    """从连续路径的 daily 中切出测试窗并计算指标（回撤与收益的锚点是窗前最后一天）。"""
+    daily = result.daily.copy()
+    daily["trade_date"] = pd.to_datetime(daily["trade_date"])
+    daily = daily.sort_values("trade_date").reset_index(drop=True)
+    mask = daily["trade_date"].between(pd.Timestamp(test_start), pd.Timestamp(test_end))
+    window = daily.loc[mask]
+    if window.empty:
+        return {
+            "total_return_pct": float("nan"),
+            "annual_return_pct": float("nan"),
+            "max_drawdown_pct": float("nan"),
+            "trading_days": 0,
+        }
+    values = pd.to_numeric(window["portfolio_value"], errors="coerce")
+    prior = daily.loc[daily["trade_date"] < pd.Timestamp(test_start)]
+    seed_value = float(prior["portfolio_value"].iloc[-1]) if not prior.empty else float(values.iloc[0])
+    seeded = pd.concat([pd.Series([seed_value]), values.reset_index(drop=True)], ignore_index=True)
+    returns = seeded.pct_change().dropna()
+    total_return = float(values.iloc[-1] / seed_value - 1)
+    days = max(1, int((window["trade_date"].iloc[-1] - window["trade_date"].iloc[0]).days))
+    annual_return = (
+        (1 + total_return) ** (365 / days) - 1 if total_return > -1 else -1.0
+    )
+    drawdown = (seeded / seeded.cummax() - 1).min()
+    return {
+        "total_return_pct": total_return * 100,
+        "annual_return_pct": annual_return * 100,
+        "max_drawdown_pct": float(drawdown) * 100,
+        "trading_days": int(len(window)),
+    }
+
+
 def time_split_analysis(
     market_data: dict[str, pd.DataFrame],
     allocations: list[AuditAllocation],
@@ -294,6 +355,13 @@ def time_split_analysis(
     grid: pd.DataFrame,
     splits: Iterable[float],
 ) -> pd.DataFrame:
+    """样本内选参（快速打分器）→ 样本外连续路径评估。
+
+    测试段指标来自"从训练段起点连续起跑"的严格引擎（与动态阈值研究
+    evaluate_frozen_models 相同口径）：信号状态继承训练段，测试窗指标以
+    窗前最后净值为锚点，不再从空仓重新起步；训练年化与测试年化均按
+    日历日复利口径，避免训练/测试核算引擎不一致污染 decay 指标。
+    """
     rows = []
     for item in allocations:
         if item.strategy == "hold":
@@ -307,6 +375,7 @@ def time_split_analysis(
             cut = max(2, min(len(dates) - 2, int(len(dates) * float(split))))
             train_end = dates[cut - 1]
             test_start = dates[cut]
+            path_start = dates[0]
             candidates = grid[grid["symbol"] == item.symbol].copy()
             train_rows = []
             for candidate in candidates.itertuples():
@@ -316,24 +385,31 @@ def time_split_analysis(
                     ma_period=int(candidate.ma_period),
                     threshold_pct=float(candidate.threshold_pct),
                 )
-                score, train_annual = _fast_training_score(
+                score, _train_annual = _fast_training_score(
                     market_data[item.symbol],
                     candidate_item,
                     pd.Timestamp(settings.start_date) if settings.start_date else dates[0],
                     train_end,
                     settings.commission_rate,
                 )
-                train_rows.append((score, train_annual, candidate_item))
-            _, train_annual, selected = max(train_rows, key=lambda value: (value[0], value[1]))
-            test = _run_portfolio_audit(
-                {item.symbol: market_data[item.symbol]},
-                [selected],
-                replace(settings, initial_capital=10000, start_date=test_start),
+                train_rows.append((score, candidate_item))
+            _, selected = max(train_rows, key=lambda value: value[0])
+            # 训练段年化用同一严格引擎按窗前锚点口径重算，替代快速打分器口径
+            _, train_metrics = _continuous_path_metrics(
+                market_data[item.symbol],
+                selected,
+                settings,
+                path_start=path_start,
+                test_start=path_start,
+                test_end=train_end,
             )
-            hold = _run_portfolio_audit(
-                {item.symbol: market_data[item.symbol]},
-                [replace(item, weight_pct=100, strategy="hold")],
-                replace(settings, initial_capital=10000, start_date=test_start),
+            test_metrics, hold_metrics = _continuous_path_metrics(
+                market_data[item.symbol],
+                selected,
+                settings,
+                path_start=path_start,
+                test_start=test_start,
+                test_end=dates[-1],
             )
             rows.append(
                 {
@@ -344,12 +420,12 @@ def time_split_analysis(
                     "test_start": test_start,
                     "selected_ma_period": selected.ma_period,
                     "selected_threshold_pct": selected.threshold_pct,
-                    "train_annual_return_pct": train_annual,
-                    "test_annual_return_pct": test.summary["annual_return_pct"],
-                    "test_max_drawdown_pct": test.summary["max_drawdown_pct"],
-                    "test_excess_vs_hold_pct": test.summary["total_return_pct"] - hold.summary["total_return_pct"],
-                    "performance_decay_pct": train_annual - test.summary["annual_return_pct"],
-                    "test_trading_days": test.summary["trading_days"],
+                    "train_annual_return_pct": train_metrics["annual_return_pct"],
+                    "test_annual_return_pct": test_metrics["annual_return_pct"],
+                    "test_max_drawdown_pct": test_metrics["max_drawdown_pct"],
+                    "test_excess_vs_hold_pct": test_metrics["total_return_pct"] - hold_metrics["total_return_pct"],
+                    "performance_decay_pct": train_metrics["annual_return_pct"] - test_metrics["annual_return_pct"],
+                    "test_trading_days": test_metrics["trading_days"],
                 }
             )
     return pd.DataFrame(rows)
@@ -364,6 +440,11 @@ def walk_forward_analysis(
     train_days: int = 180,
     test_days: int = 60,
 ) -> pd.DataFrame:
+    """Walk-forward：每折训练段快速选参 → 测试段连续路径评估。
+
+    与 time_split 相同口径修正：测试段从折首日起跑一次严格引擎并按窗切指标，
+    信号状态继承训练段，不再空仓重启；excess_vs_hold 与策略共用同一锚点。
+    """
     rows = []
     for item in allocations:
         if item.strategy == "hold":
@@ -388,15 +469,13 @@ def walk_forward_analysis(
                     )
                     candidates.append((score, annual_return, candidate))
             _, _, selected = max(candidates, key=lambda value: (value[0], value[1]))
-            test = _run_portfolio_audit(
-                {item.symbol: market_data[item.symbol]},
-                [selected],
-                replace(settings, initial_capital=10000, start_date=test_start, end_date=test_end),
-            )
-            hold = _run_portfolio_audit(
-                {item.symbol: market_data[item.symbol]},
-                [replace(item, weight_pct=100, strategy="hold")],
-                replace(settings, initial_capital=10000, start_date=test_start, end_date=test_end),
+            test_metrics, hold_metrics = _continuous_path_metrics(
+                market_data[item.symbol],
+                selected,
+                settings,
+                path_start=train_start,
+                test_start=test_start,
+                test_end=test_end,
             )
             rows.append(
                 {
@@ -408,9 +487,9 @@ def walk_forward_analysis(
                     "test_end": test_end,
                     "selected_ma_period": selected.ma_period,
                     "selected_threshold_pct": selected.threshold_pct,
-                    "test_total_return_pct": test.summary["total_return_pct"],
-                    "test_excess_vs_hold_pct": test.summary["total_return_pct"] - hold.summary["total_return_pct"],
-                    "test_trading_days": test.summary["trading_days"],
+                    "test_total_return_pct": test_metrics["total_return_pct"],
+                    "test_excess_vs_hold_pct": test_metrics["total_return_pct"] - hold_metrics["total_return_pct"],
+                    "test_trading_days": test_metrics["trading_days"],
                 }
             )
             offset += test_days

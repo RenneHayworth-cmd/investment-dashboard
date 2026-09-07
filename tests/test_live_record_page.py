@@ -49,6 +49,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
             patch("services.live_trading.list_live_trades", return_value=pd.DataFrame()),
+            patch("services.live_trading.list_live_cash_flows", return_value=pd.DataFrame()),
             patch("components.live_record.dashboard.list_live_trades", return_value=pd.DataFrame()),
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=pd.DataFrame()),
             patch(
@@ -106,6 +107,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
             patch("services.live_trading.list_live_trades", return_value=trades),
+            patch("services.live_trading.list_live_cash_flows", return_value=pd.DataFrame()),
             patch("components.live_record.dashboard.list_live_trades", return_value=trades),
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=pd.DataFrame()),
             patch("services.live_trading.live_close_refresh_due", return_value=False),

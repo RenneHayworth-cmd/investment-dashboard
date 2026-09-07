@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import pandas as pd
 
+from services.ma_timing_core import (
+    ma_threshold_series,
+    ma_threshold_states,
+)
 from services.position_models import (
     ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES,
     ETF_512890_TRANSFER_SOURCE_CODES,
@@ -15,61 +19,101 @@ from services.position_models import (
     normalize_etf_base_code,
 )
 
+
+def _clean_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    data = df[["date", "price"]].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["price"] = pd.to_numeric(data["price"], errors="coerce")
+    return data.dropna(subset=["date", "price"]).sort_values("date").reset_index(drop=True)
+
+
+def _timing_states_and_ma(
+    data: pd.DataFrame, *, ma_period: int, threshold_pct: float
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """统一状态机信号：返回 (逐日仓位0/1, 均线, 收盘价)，索引为日期。"""
+    prices = pd.Series(
+        data["price"].to_numpy(dtype=float),
+        index=pd.DatetimeIndex(data["date"]),
+    )
+    frame = ma_threshold_series(prices, ma_period, threshold_pct)
+    states = ma_threshold_states(prices, ma_period, threshold_pct)
+    return states, frame["ma"], frame["close"]
+
+
+def _state_transition_rows(
+    states: pd.Series, prices: pd.Series, ma_values: pd.Series
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    price_values = prices.to_numpy(dtype=float)
+    ma_raw_values = ma_values.to_numpy(dtype=float)
+    previous_state = 0
+    for position_index, (trade_date, state_value) in enumerate(states.items()):
+        state = int(state_value)
+        if state != previous_state:
+            rows.append(
+                {
+                    "date": pd.Timestamp(trade_date),
+                    "state": state,
+                    "price": float(price_values[position_index]),
+                    "ma": float(ma_raw_values[position_index]),
+                }
+            )
+        previous_state = state
+    return rows
+
+
 def calculate_etf_timing_snapshot(
     df: pd.DataFrame,
     *,
     ma_period: int,
     threshold_pct: float,
 ) -> dict[str, object]:
-    data = df[["date", "price"]].copy() if {"date", "price"}.issubset(df.columns) else pd.DataFrame()
-    if data.empty:
-        return {}
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    data["price"] = pd.to_numeric(data["price"], errors="coerce")
-    data = data.dropna(subset=["date", "price"]).sort_values("date").reset_index(drop=True)
+    data = (
+        _clean_price_frame(df)
+        if df is not None and {"date", "price"}.issubset(df.columns)
+        else pd.DataFrame()
+    )
     if data.empty:
         return {}
 
-    ma_col = f"ma_{int(ma_period)}"
-    data[ma_col] = data["price"].rolling(window=int(ma_period)).mean()
-    threshold = float(threshold_pct) / 100
-    position = 0
-    latest_action = "等待均线"
-    transition_date = None
-    transition_price = None
-    previous_transition_date = None
-    previous_transition_price = None
-    previous_interval_return_pct = pd.NA
-    for _, row in data.iterrows():
-        ma_value = pd.to_numeric(row[ma_col], errors="coerce")
-        if pd.isna(ma_value):
-            continue
-        price = float(row["price"])
-        desired_position = (
-            1
-            if price > float(ma_value) * (1 + threshold)
-            else 0
-            if price < float(ma_value) * (1 - threshold)
-            else position
-        )
-        if desired_position != position:
-            previous_transition_date = transition_date
-            previous_transition_price = transition_price
-            latest_action = "买入" if desired_position else "卖出"
-            transition_date = pd.Timestamp(row["date"])
-            transition_price = price
-            previous_interval_return_pct = (
-                (transition_price / previous_transition_price - 1) * 100
-                if previous_transition_price is not None and previous_transition_price != 0
-                else pd.NA
-            )
-        else:
-            latest_action = "持有" if position else "空仓"
-        position = desired_position
+    states, ma_values, prices = _timing_states_and_ma(
+        data, ma_period=ma_period, threshold_pct=threshold_pct
+    )
+    if pd.isna(pd.to_numeric(ma_values.iloc[-1], errors="coerce")):
+        # 均线尚未形成（原始实现返回"等待均线"）
+        return {
+            "策略参数": f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
+            "策略均线": pd.to_numeric(ma_values.iloc[-1], errors="coerce"),
+            "策略偏离(%)": pd.NA,
+            "择时判断": "等待均线",
+            "状态转换时间": pd.NA,
+            "策略区间涨幅(%)": pd.NA,
+            "上一状态转换时间": pd.NA,
+            "策略上一区间涨幅(%)": pd.NA,
+        }
+    transitions = _state_transition_rows(states, prices, ma_values)
+    latest_state = int(states.iloc[-1])
+    latest_transition = transitions[-1] if transitions else None
+    previous_transition = transitions[-2] if len(transitions) >= 2 else None
 
-    latest = data.iloc[-1]
-    latest_ma = pd.to_numeric(latest[ma_col], errors="coerce")
-    latest_price = float(latest["price"])
+    if latest_transition is not None and latest_transition["date"] == states.index[-1]:
+        latest_action = "买入" if latest_state == 1 else "卖出"
+    else:
+        latest_action = "持有" if latest_state else "空仓"
+
+    transition_date = latest_transition["date"] if latest_transition else None
+    transition_price = latest_transition["price"] if latest_transition else None
+    previous_transition_date = previous_transition["date"] if previous_transition else None
+    previous_transition_price = previous_transition["price"] if previous_transition else None
+    previous_interval_return_pct = (
+        (transition_price / previous_transition_price - 1) * 100
+        if previous_transition_price is not None and previous_transition_price != 0
+        else pd.NA
+    )
+
+    latest_date = states.index[-1]
+    latest_ma = pd.to_numeric(ma_values.iloc[-1], errors="coerce")
+    latest_price = float(prices.iloc[-1])
     deviation_pct = (
         (latest_price / float(latest_ma) - 1) * 100
         if not pd.isna(latest_ma) and float(latest_ma) != 0
@@ -121,40 +165,22 @@ def calculate_etf_timing_transitions(
     if df is None or df.empty or not {"date", "price"}.issubset(df.columns):
         return pd.DataFrame(columns=columns)
 
-    data = df[["date", "price"]].copy()
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    data["price"] = pd.to_numeric(data["price"], errors="coerce")
-    data = data.dropna(subset=["date", "price"]).sort_values("date").reset_index(drop=True)
+    data = _clean_price_frame(df)
     if data.empty:
         return pd.DataFrame(columns=columns)
 
-    ma_col = f"ma_{int(ma_period)}"
-    data[ma_col] = data["price"].rolling(window=int(ma_period)).mean()
-    threshold = float(threshold_pct) / 100
-    position = 0
-    rows = []
-    for _, row in data.iterrows():
-        ma_value = pd.to_numeric(row[ma_col], errors="coerce")
-        if pd.isna(ma_value):
-            continue
-        price = float(row["price"])
-        desired_position = (
-            1
-            if price > float(ma_value) * (1 + threshold)
-            else 0
-            if price < float(ma_value) * (1 - threshold)
-            else position
-        )
-        if desired_position != position:
-            rows.append(
-                {
-                    "日期": pd.Timestamp(row["date"]),
-                    "收盘价": price,
-                    "均线": float(ma_value),
-                    "原始信号": "买入" if desired_position else "卖出",
-                }
-            )
-        position = desired_position
+    states, ma_values, prices = _timing_states_and_ma(
+        data, ma_period=ma_period, threshold_pct=threshold_pct
+    )
+    rows = [
+        {
+            "日期": transition["date"],
+            "收盘价": transition["price"],
+            "均线": transition["ma"],
+            "原始信号": "买入" if transition["state"] == 1 else "卖出",
+        }
+        for transition in _state_transition_rows(states, prices, ma_values)
+    ]
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -178,23 +204,12 @@ def _calculate_etf_timing_position_series(
     if data.empty:
         return pd.Series(dtype="int64")
 
-    ma_values = data["price"].rolling(window=int(ma_period)).mean()
-    threshold = float(threshold_pct) / 100
-    position = 0
-    dates: list[pd.Timestamp] = []
-    positions: list[int] = []
-    for row_index, row in data.iterrows():
-        ma_value = pd.to_numeric(ma_values.iloc[row_index], errors="coerce")
-        if pd.isna(ma_value):
-            continue
-        price = float(row["price"])
-        if price > float(ma_value) * (1 + threshold):
-            position = 1
-        elif price < float(ma_value) * (1 - threshold):
-            position = 0
-        dates.append(pd.Timestamp(row["date"]))
-        positions.append(position)
-    return pd.Series(positions, index=pd.DatetimeIndex(dates), dtype="int64")
+    states, ma_values, _prices = _timing_states_and_ma(
+        data, ma_period=ma_period, threshold_pct=threshold_pct
+    )
+    # 与原始实现一致：仅保留均线已形成的日期
+    valid = ma_values.notna()
+    return states[valid].astype("int64")
 
 
 def _timing_action_position(value: object) -> int | None:

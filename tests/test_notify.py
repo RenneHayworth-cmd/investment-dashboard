@@ -5,7 +5,11 @@ import unittest
 import urllib.parse
 from pathlib import Path
 from unittest.mock import Mock, patch
-from fastapi.testclient import TestClient
+
+try:
+    from fastapi.testclient import TestClient
+except ImportError:  # FastAPI 是通知网关的可选依赖，未安装时跳过 HTTP 网关用例
+    TestClient = None
 
 from services.notify.channels import (
     NtfyBridgeChannel,
@@ -206,12 +210,13 @@ class NotifyEngineTests(unittest.TestCase):
             self.assertEqual(call_kwargs["topic"], "trades")
 
 
+@unittest.skipIf(TestClient is None, "fastapi 未安装，跳过 HTTP 网关用例")
 class NotifyHttpServerTests(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         db_path = Path(self.td.name) / "test_api_notify.db"
         self.engine = NotifyEngine(db_path=db_path)
-        
+
         mock_serverchan = Mock()
         mock_serverchan.is_configured.return_value = True
         mock_serverchan.send.return_value = DeliveryResult("serverchan", True, "ok")

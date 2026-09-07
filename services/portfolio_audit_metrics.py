@@ -3,19 +3,20 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from core.metrics import annualized_return, seeded_returns
+
 
 def calculate_performance_summary(daily: pd.DataFrame, initial_capital: float) -> dict[str, object]:
     values = pd.to_numeric(daily["portfolio_value"], errors="coerce")
     dates = pd.to_datetime(daily["trade_date"])
-    seeded = pd.concat([pd.Series([initial_capital]), values.reset_index(drop=True)], ignore_index=True)
-    returns = seeded.pct_change().dropna()
-    drawdown = seeded / seeded.cummax() - 1
+    returns = seeded_returns(values, float(initial_capital))
+    drawdown_series = _drawdown_fraction(values, float(initial_capital))
     total_return = float(values.iloc[-1] / initial_capital - 1)
     days = max(1, int((dates.iloc[-1] - dates.iloc[0]).days))
-    annual_return = (1 + total_return) ** (365 / days) - 1 if total_return > -1 else -1.0
+    annual_return = annualized_return(total_return, days)
     volatility = float(returns.std() * np.sqrt(252)) if len(returns) > 1 else 0.0
-    sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if len(returns) > 1 and returns.std() > 0 else 0.0
-    max_drawdown = float(drawdown.min())
+    sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if len(returns) > 1 and returns.std() > 1e-12 else 0.0
+    max_drawdown = float(drawdown_series.min())
     return {
         "start_date": dates.iloc[0].strftime("%Y-%m-%d"),
         "end_date": dates.iloc[-1].strftime("%Y-%m-%d"),
@@ -28,6 +29,11 @@ def calculate_performance_summary(daily: pd.DataFrame, initial_capital: float) -
         "sharpe_ratio": sharpe,
         "calmar_ratio": annual_return / abs(max_drawdown) if max_drawdown < 0 else np.nan,
     }
+
+
+def _drawdown_fraction(values: pd.Series, initial_capital: float) -> pd.Series:
+    seeded = pd.concat([pd.Series([initial_capital]), values.reset_index(drop=True)], ignore_index=True)
+    return seeded / seeded.cummax() - 1
 
 
 def position_statistics(daily: pd.DataFrame) -> pd.DataFrame:

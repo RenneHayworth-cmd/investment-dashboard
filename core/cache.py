@@ -1,7 +1,6 @@
 from contextlib import closing
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -11,6 +10,11 @@ import pandas as pd
 
 from core.db import get_conn
 from core.paths import RAW_DIR
+
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl，退化为无跨进程锁的占位实现
+    fcntl = None
 
 
 def _dataset_paths(symbol: str, source: str, period: str) -> tuple[Path, Path]:
@@ -22,6 +26,11 @@ def _dataset_paths(symbol: str, source: str, period: str) -> tuple[Path, Path]:
 
 @contextmanager
 def _dataset_lock(lock_path: Path, *, exclusive: bool):
+    if fcntl is None:
+        # Windows：msvcrt 提供 locking，但与 POSIX flock 语义差异大；
+        # Streamlit 单进程部署下无需跨进程锁，占位保持接口一致。
+        yield
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
         fcntl.flock(

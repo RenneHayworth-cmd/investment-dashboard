@@ -40,6 +40,10 @@ def sanitize_index_report_market_dates(report_df: pd.DataFrame | None) -> pd.Dat
     return result.sort_values("日期").reset_index(drop=True)
 
 def build_summary(report_df: pd.DataFrame) -> pd.DataFrame:
+    # display_index_symbol 经由 index_frames 延迟导入：index_frames 顶层反向依赖本模块，
+    # 直接模块级导入会形成循环导入。
+    from services.index_frames import display_index_symbol
+
     report_df = sanitize_index_report_market_dates(report_df)
     if report_df is None or report_df.empty:
         return pd.DataFrame()

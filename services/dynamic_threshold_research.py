@@ -6,6 +6,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from core.metrics import longest_underwater_days
 from services.portfolio_audit import (
     AuditAllocation,
     AuditSettings,
@@ -162,19 +163,10 @@ def _longest_underwater_days(
     initial_value: float,
     initial_date: pd.Timestamp,
 ) -> int:
-    peak = float(initial_value)
-    peak_date = pd.Timestamp(initial_date)
-    longest = 0
-    for date, value in zip(pd.to_datetime(dates), pd.to_numeric(values, errors="coerce")):
-        if not np.isfinite(value):
-            continue
-        if value >= peak - 1e-10:
-            if value > peak:
-                peak = float(value)
-                peak_date = pd.Timestamp(date)
-        else:
-            longest = max(longest, int((pd.Timestamp(date) - peak_date).days))
-    return longest
+    # 统一实现见 core.metrics.longest_underwater_days（显式 initial_date 种子变体）
+    return longest_underwater_days(
+        values, dates=dates, initial_capital=float(initial_value), initial_date=pd.Timestamp(initial_date)
+    )
 
 
 def period_metrics(

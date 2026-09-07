@@ -7,6 +7,14 @@ from typing import Callable, Iterable
 import numpy as np
 import pandas as pd
 
+from core.metrics import (
+    annual_volatility,
+    annualized_return,
+    longest_underwater_days,
+    max_drawdown,
+    seeded_returns,
+    sharpe_ratio,
+)
 from services.annual_etf_models import (
     ALL_SLOTS,
     SCORE_WEIGHTS,
@@ -319,19 +327,8 @@ def _research_strategy(
 
 
 def _longest_underwater_days(values: pd.Series, dates: pd.Series, initial_value: float) -> int:
-    peak = float(initial_value)
-    peak_date = pd.Timestamp(dates.iloc[0]) - pd.Timedelta(days=1)
-    longest = 0
-    for date, value in zip(pd.to_datetime(dates), pd.to_numeric(values, errors="coerce")):
-        if not np.isfinite(value):
-            continue
-        if value >= peak - 1e-10:
-            if value > peak:
-                peak = float(value)
-                peak_date = pd.Timestamp(date)
-        else:
-            longest = max(longest, int((pd.Timestamp(date) - peak_date).days))
-    return int(longest)
+    # 统一实现见 core.metrics.longest_underwater_days
+    return longest_underwater_days(values, dates=dates, initial_capital=float(initial_value))
 
 
 def performance_metrics(
@@ -355,19 +352,13 @@ def performance_metrics(
     observations = observations.sort_values("date").reset_index(drop=True)
     values = observations["value"]
     dates = observations["date"]
-    seeded = pd.concat([pd.Series([float(initial_capital)]), values], ignore_index=True)
-    returns = seeded.pct_change().dropna()
+    returns = seeded_returns(values, float(initial_capital))
     total_return = float(values.iloc[-1] / initial_capital - 1)
     elapsed = max(1, int((dates.iloc[-1] - dates.iloc[0]).days))
-    annual_return = (1 + total_return) ** (365 / elapsed) - 1 if total_return > -1 else -1.0
-    volatility = float(returns.std(ddof=1) * np.sqrt(252)) if len(returns) > 1 else 0.0
-    risk_free_daily = (1 + cash_annual_rate) ** (1 / 252) - 1
-    sharpe = (
-        float((returns.mean() - risk_free_daily) / returns.std(ddof=1) * np.sqrt(252))
-        if len(returns) > 1 and returns.std(ddof=1) > 0
-        else 0.0
-    )
-    drawdown = seeded / seeded.cummax() - 1
+    annual_return = annualized_return(total_return, elapsed)
+    volatility = annual_volatility(returns)
+    sharpe = sharpe_ratio(returns, risk_free_annual=float(cash_annual_rate))
+    mdd = max_drawdown(values, initial_capital=float(initial_capital))
     return {
         "start_date": dates.iloc[0],
         "end_date": dates.iloc[-1],
@@ -376,10 +367,12 @@ def performance_metrics(
         "net_profit": float(values.iloc[-1] - initial_capital),
         "total_return_pct": total_return * 100,
         "annual_return_pct": annual_return * 100,
-        "max_drawdown_pct": float(drawdown.min() * 100),
+        "max_drawdown_pct": mdd,
         "annual_volatility_pct": volatility * 100,
         "sharpe_ratio": sharpe,
-        "longest_underwater_days": _longest_underwater_days(values, dates, initial_capital),
+        "longest_underwater_days": longest_underwater_days(
+            values, dates=dates, initial_capital=float(initial_capital)
+        ),
     }
 
 
