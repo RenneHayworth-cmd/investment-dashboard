@@ -9,7 +9,7 @@ if (fs.existsSync(credentialsFile)) {
 export default defineConfig({
  testDir: './tests', workers: 1, timeout: 45000, reporter: 'list',
  outputDir: '/tmp/position-web-verification/browser',
- use: { baseURL: process.env.WEB_TEST_URL || 'https://localhost', ignoreHTTPSErrors: true, httpCredentials, trace: 'off' },
+ use: { baseURL: process.env.WEB_TEST_URL || 'https://portfolio.nineskyit.top', ignoreHTTPSErrors: process.env.WEB_TEST_INSECURE_TLS === '1', httpCredentials, trace: 'off' },
  projects: [
   { name: 'iphone-webkit', use: { ...devices['iPhone 13'], browserName: 'webkit' } },
   { name: 'mobile-chromium', use: { ...devices['Pixel 7'], browserName: 'chromium', launchOptions: {args:['--disable-dev-shm-usage','--disable-gpu']}  } },

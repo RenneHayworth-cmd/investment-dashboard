@@ -51,9 +51,9 @@ Vite 将同源 `/api` 代理至本机8000。开发端口只绑定回环地址。
 | `TICKFLOW_API_KEY` | 仅注入后端容器 |
 | `WEB_USERNAME` | Caddy 单用户登录名 |
 | `WEB_PASSWORD_HASH` | bcrypt 密码散列；`.env` 中使用单引号包围，保留 `$` |
-| `WEB_DOMAIN` | 已指向服务器的域名；未配置时 `localhost` |
+| `WEB_DOMAIN` | 已指向服务器的域名；默认 `portfolio.nineskyit.top` |
 | `WEB_ORIGIN` | 精确的 HTTPS origin，保护刷新请求 |
-| `WEB_BIND_IP` | 默认127.0.0.1；准备好公网域名后可设为0.0.0.0 |
+| `WEB_BIND_IP` | 默认0.0.0.0，对公网开放80/443；本机调试可设127.0.0.1 |
 | `POSITION_DATA_DIR` | 宿主机数据目录，默认 `/srv/investment-dashboard` |
 | `INVESTMENT_RUNTIME_DIR` | 非 Docker 运行时的数据路径；Docker 固定 `/runtime` |
 
@@ -82,11 +82,14 @@ Caddy 统一提供静态前端、认证、HTTPS及反向代理，无跨域前端
 在镜像升级后仍有效。不要执行 `docker compose down -v`，它会删除证书卷。
 回退可检出上一已验证 commit 后重建；运行数据不随源码回退。
 
-当前没有域名配置时：`https://localhost` 使用 Caddy 本地 CA，**不代表公网
-受信任 HTTPS 已完成**。域名、DNS和 Lightsail 80/443入站规则准备好后，配置
-`WEB_DOMAIN`、`WEB_ORIGIN`、`WEB_BIND_IP` 并重新创建容器，由 Caddy申请证书。
-本机 curl 成功不能替代外部网络访问检查。宿主机现有公网 IP 是否静态分配，
-须由 Lightsail 控制面核实。
+正式入口为 `https://portfolio.nineskyit.top`，DNS指向本机公网IP
+`18.139.5.171`。Caddy使用Let’s Encrypt自动签发、续期的公网可信证书；
+HTTP自动308跳转HTTPS。现有Basic Auth保护首页和全部API，匿名访问返回401。
+证书和ACME状态保存在持久化Caddy卷中，重启无需重新申请证书。
+
+如改回本机开发，可显式配置 `WEB_DOMAIN=localhost`、
+`WEB_ORIGIN=https://localhost`、`WEB_BIND_IP=127.0.0.1`；此模式使用本地CA，
+不能当作公网可信HTTPS。域名/IP变更必须同时核验DNS及Lightsail入站规则。
 
 ## 状态与数据语义
 
@@ -138,8 +141,9 @@ npm --prefix web/frontend run build
 npm --prefix web/frontend run test:smoke
 ```
 
-浏览器测试使用已运行的站点，默认`https://localhost`。测试专用配置接受
-`WEB_TEST_URL`和`WEB_CREDENTIALS_FILE`；仅本机CA测试允许忽略证书校验。
+浏览器测试使用已运行的站点，默认`https://portfolio.nineskyit.top`且严格校验证书。测试专用配置接受
+`WEB_TEST_URL`和`WEB_CREDENTIALS_FILE`；只有显式设置
+`WEB_TEST_INSECURE_TLS=1`的本机CA测试才忽略证书校验。
 不能把这项忽略当作公网HTTPS验证。WebKit iPhone、Chromium手机及桌面场景
 覆盖真实API、合成完整业务数据、四个视图、图表、横向溢出及认证。
 合成夹具从真实service产生，不是线上假行情。测试产物位于`/tmp/position-web-verification`。
@@ -166,5 +170,16 @@ volumes。可靠备份时短暂停止backend再复制整个数据目录，包含
 - ETF和两个指数均初始化至2026-09-09；当时正式日期缺口为0。
 - 后端重启前后24个正式CSV文件的SHA256完全一致。
 - 本机CA证书校验、登录访问、无认证401和刷新请求保护403均通过。
-- 公网尚未启用：Caddy仅绑定127.0.0.1，需提供域名/DNS后配置公共入口。
-  Lightsail入站规则及静态IP分配尚未经控制面验证，不能据此声称手机公网可达。
+- 初次验收仅本机入口；现已完成下述正式域名切换。
+
+## 正式公网验收（2026-09-10）
+
+- 域名：`portfolio.nineskyit.top` → `18.139.5.171`；宿主机监听0.0.0.0:80/443。
+- 系统UFW未启用；Let’s Encrypt多地HTTP-01验证成功，证实外部80端口可达。
+- Let’s Encrypt YE2证书已签发，SAN匹配域名，有效期至2026-12-09 03:43:24 UTC。
+  Caddy自动续期，证书卷持久化；两个服务重启后证书、认证和接口仍正常。
+- HTTP返回308并跳转同路径HTTPS，匿名HTTPS返回401，认证首页/API返回200。
+- 意大利、波兰、乌克兰独立节点均通过公网443取得预期401认证响应；
+  [外部探测记录](https://check-host.net/check-report/4ad0fbc6k290)。未向探测服务发送凭据。
+- 正式域名启用严格TLS验证的9项WebKit/Chromium手机和桌面测试全部通过。
+- 认证和TickFlow密钥未变更。重启后15只ETF和两个指数正式缓存均无目标日期缺口。

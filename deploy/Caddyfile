@@ -1,4 +1,4 @@
-{$WEB_DOMAIN:localhost} {
+{$WEB_DOMAIN:portfolio.nineskyit.top} {
     encode zstd gzip
     basic_auth {
         {$WEB_USERNAME} {$WEB_PASSWORD_HASH}

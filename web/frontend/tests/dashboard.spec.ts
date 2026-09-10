@@ -46,7 +46,7 @@ test('完整数据下四个视图、预览、图表与窄屏', async ({ page }) 
 
 test('无鉴权入口被拒绝',async ({ baseURL })=>{
  const status=await new Promise<number|undefined>((resolve,reject)=>{
-  https.get(`${baseURL}/api/dashboard`,{rejectUnauthorized:false},response=>{response.resume();resolve(response.statusCode)}).on('error',reject)
+  https.get(`${baseURL}/api/dashboard`,{rejectUnauthorized:process.env.WEB_TEST_INSECURE_TLS !== '1'},response=>{response.resume();resolve(response.statusCode)}).on('error',reject)
  })
  expect(status).toBe(401)
 })
