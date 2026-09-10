@@ -313,7 +313,8 @@ def load_or_fetch_spread(
                 )
             latest_spread_df = calculate_spreads(data, base_contract)
             spread_df = (
-                _merge_current_day_refresh(cached_df, latest_spread_df, "date")
+                (_merge_current_day_refresh(cached_df, latest_spread_df, "date")
+                 if realtime_preview else _merge_by_date(cached_df, latest_spread_df, "date"))
                 if cached_df is not None and cache_ready
                 else latest_spread_df
             )

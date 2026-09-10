@@ -1,0 +1,170 @@
+# 持仓分析 Web
+
+只增加 `pages/5_持仓分析.py` 对应的观察池与模拟策略 Web 入口。Streamlit
+页面保留；没有迁移 ETF/期货真实账户记录。后端导入原仓库 services，
+不包含第二份 MA、仓位、512890 或收益算法。
+
+## 本次环境与审计
+
+- 开发分支 `feat/portfolio-web`；Ubuntu / Python 3.12 / Node 22。
+- 原始四组 position 测试无法收集：`position_close_audit` 未提交到仓库。
+  已补齐该审计适配模块，使用既有 jobs 表，仅记录标的、目标日期与结果；
+  不存储调用参数、密钥或原始异常。原四组测试修复后为 123 passed / 4 subtests。
+- ETF 来源与复权校验：`position_market` → `fund_analysis`；161128 保留
+  EastMoney/AkShare → 经复权元数据确认的新浪历史/正式收盘备用源。
+- 正式过滤与目标交易日：`position_sessions` → `market_calendar`。
+- MA、半仓、512890 承接及近期指导：`position_timing`。
+- 固定模拟组合/交易预判：`position_performance` → `fund_rotation`。
+  初始50万元、2026-08-05、100份整手、0.006%单边费用等从业务层读取。
+- 衍生品：`position_derivatives` → `futures_spread` / `futures_options_analysis`。
+  修复正式价差更新使用盘中合并函数的问题：正式路径只追加未见日期；
+  盘中覆盖只发生在瞬时对象中，不写缓存。
+- 指数参考：`position_timing` 读取 long/history/final/correction overlay；
+  更新经过稳定门面 `services.update_tasks`，只选择微盘股、中证500。
+  内部 orchestration 依赖兼容门面注入，不应直接作为外部入口调用。
+- `components/position/realtime.py` 的 session/fragment 编排不被 Web 导入。
+  Web 服务替换这部分运行状态管理，策略运算仍然共用。
+
+## 运行与环境变量
+
+开发后端（项目虚拟环境）：
+
+```bash
+.venv/bin/python -m pip install -r web/backend/requirements.lock
+.venv/bin/python -m uvicorn web.backend.app:app --host 127.0.0.1 --port 8000
+```
+
+开发前端（Node 22）：
+
+```bash
+cd web/frontend
+npm ci
+npm run dev
+```
+
+Vite 将同源 `/api` 代理至本机8000。开发端口只绑定回环地址。
+`.env` 由后端 dotenv 或 Compose 读取；不得进入镜像、前端或 Git。
+示例 `.env.example` 只包含空变量。生产所需配置：
+
+| 变量 | 作用 |
+| --- | --- |
+| `TICKFLOW_API_KEY` | 仅注入后端容器 |
+| `WEB_USERNAME` | Caddy 单用户登录名 |
+| `WEB_PASSWORD_HASH` | bcrypt 密码散列；`.env` 中使用单引号包围，保留 `$` |
+| `WEB_DOMAIN` | 已指向服务器的域名；未配置时 `localhost` |
+| `WEB_ORIGIN` | 精确的 HTTPS origin，保护刷新请求 |
+| `WEB_BIND_IP` | 默认127.0.0.1；准备好公网域名后可设为0.0.0.0 |
+| `POSITION_DATA_DIR` | 宿主机数据目录，默认 `/srv/investment-dashboard` |
+| `INVESTMENT_RUNTIME_DIR` | 非 Docker 运行时的数据路径；Docker 固定 `/runtime` |
+
+本次生成的 Web 密码保存在服务器 `/srv/investment-dashboard/web-access.txt`，
+权限0600。不在聊天、日志或 Git 输出。Caddy 只接收散列，前端没有密钥输入框。
+修改密码时生成新的 bcrypt hash 并更新 `.env`，重新创建 Caddy 容器。
+
+## 生产启动、升级与日志
+
+仓库根目录执行：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail 100 backend
+```
+
+Docker daemon 已设开机启动，两个服务均为 `unless-stopped`。API 只暴露于
+Docker 内部网络；没有宿主机8000端口、数据库端口、API调试文档或目录浏览。
+Caddy 统一提供静态前端、认证、HTTPS及反向代理，无跨域前端配置。
+刷新 POST 额外要求同源和自定义请求头，不允许浏览器绕过节流。
+
+升级先快进同步已审查的 feature branch，再运行上述 Compose 命令。
+后端 Python 和前端 npm 均有锁文件。镜像中的源码不绑定宿主机，因此修改源码
+后需 build。运行目录始终挂载到同一 `/runtime`，SQLite 内部的绝对 CSV 路径
+在镜像升级后仍有效。不要执行 `docker compose down -v`，它会删除证书卷。
+回退可检出上一已验证 commit 后重建；运行数据不随源码回退。
+
+当前没有域名配置时：`https://localhost` 使用 Caddy 本地 CA，**不代表公网
+受信任 HTTPS 已完成**。域名、DNS和 Lightsail 80/443入站规则准备好后，配置
+`WEB_DOMAIN`、`WEB_ORIGIN`、`WEB_BIND_IP` 并重新创建容器，由 Caddy申请证书。
+本机 curl 成功不能替代外部网络访问检查。宿主机现有公网 IP 是否静态分配，
+须由 Lightsail 控制面核实。
+
+## 状态与数据语义
+
+- **仅一个 API worker、一个后端副本**。多 worker 不共享 Python 内存，不可
+  随意扩容。当前硬件约1 GB内存，已配置2 GB swap。
+- 唯一后台写线程负责串行刷新与发布不可变 JSON 快照，HTTP GET 不触发
+  昂贵计算或数据源网络请求。页面每5秒只读取服务器快照，后台每30秒检查。
+- 启动先展示本地缓存，再自动补齐缺失正式历史；Web不要求用户输入Key。
+- 报价批次复用 `position_runtime` 的带锁缓存、10/30/2分钟时段和午间成功
+  去重规则。多设备请求及手动刷新都不能绕过行情节奏。
+- 15:00停止报价，15:05后仅在相应ETF正式收盘已确认时清除该ETF预览；
+  缺失时保留当天最后报价，显示旧正式日期和目标日缺口。
+- 正式数据逐标的检查；失败按目标日及10分钟间隔重试，目标日变化立即重查。
+  无缺口的指数不调用更新器。已有缓存因来源失败保留，错误持续显示。
+- 报价、衍生品预览、JSON快照和模拟计算结果只在内存中，不写数据库/CSV。
+  重启后盘中报价丢失，正式历史仍在。模拟结果每次从正式数据重建，停止于
+  第一处不完整交易日，不将预览写入近期指导、模拟成交或正式收益。
+- ETF正式缓存保持版本及复权口径。漂移重建失败仍显示最后行情，暂停正式
+  策略计算；不以过期或空缓存冒充当天正式收盘。
+
+## API 合约 v1
+
+主页面只请求 `GET /api/dashboard`：包含正式/预览ETF和指数、逐标的日期、
+目标正式日期、缺失标的、刷新进度、指导、模拟摘要/持仓/交易/每日收益、
+交易预判、衍生品。金额和百分数不重新计算，直接序列化 service 的中文字段。
+NaN/NaT/pd.NA/Infinity转换为null，时间使用`YYYY-MM-DD HH:MM:SS`（上海时区）。
+
+细分接口复用同一个快照，不重复计算：
+
+- `GET /api/health`：进程健康和缓存就绪状态。
+- `GET /api/timing/etf`、`/api/timing/index`：`formal`和`preview`分开返回。
+- `GET /api/guidance/recent`：正式收盘指导。
+- `GET /api/strategy/summary|positions|performance|trades`：`data`及warnings/errors。
+- `GET /api/strategy/trade-preview`：盘中预计操作，独立warnings/errors。
+- `GET /api/derivatives`、`/api/spreads`：当前显示对象。
+- `GET /api/instruments/{code}`：快照内已有历史，用于展开走势。
+- `POST /api/refresh`：202，要求`X-Position-Client: web`，合并并发请求。
+
+未读入缓存时 dashboard 返回503，前端保持加载状态并重试。认证由Caddy保护
+所有路径；生产 traceback 不返回浏览器，数据源错误经过secret和URL清理。
+
+## 验证
+
+```bash
+.venv/bin/python -m pytest -q tests/test_position*.py
+.venv/bin/python -m compileall app.py core services pages
+npm --prefix web/frontend run build
+.venv/bin/python tests/export_position_web_fixture.py
+npm --prefix web/frontend run test:smoke
+```
+
+浏览器测试使用已运行的站点，默认`https://localhost`。测试专用配置接受
+`WEB_TEST_URL`和`WEB_CREDENTIALS_FILE`；仅本机CA测试允许忽略证书校验。
+不能把这项忽略当作公网HTTPS验证。WebKit iPhone、Chromium手机及桌面场景
+覆盖真实API、合成完整业务数据、四个视图、图表、横向溢出及认证。
+合成夹具从真实service产生，不是线上假行情。测试产物位于`/tmp/position-web-verification`。
+
+## 备份与恢复
+
+行情、SQLite、输出统一位于宿主机`POSITION_DATA_DIR`；Caddy证书存于named
+volumes。可靠备份时短暂停止backend再复制整个数据目录，包含DB和CSV，完成
+后立即启动backend。也可用SQLite backup API制作在线数据库副本，但CSV需在
+同一无写入窗口复制，不能只备份数据库。备份文件与登录凭据应限制读取权限。
+恢复到新主机后重新挂载至`/runtime`，保留UID1000可写。不要将这些文件提交Git。
+
+官方部署参考：[FastAPI进程与内存](https://fastapi.tiangolo.com/deployment/concepts/)、
+[Caddy认证](https://caddyserver.com/docs/caddyfile/directives/basic_auth)。
+
+## 本次验收记录（2026-09-10）
+
+- 相关 Python 回归：301 passed，4 subtests；其中 Web/API 21项。
+- 两个旧指数源测试补充固定时钟，避免8月样例随时间移出30天窗口。
+- compileall 与 TypeScript/Vite production build 通过。
+- 最终已部署版本：iPhone WebKit、手机Chromium、桌面共9项浏览器测试通过，
+  包括四个视图、图表、整页横向溢出、数字单元格溢出和无认证拒绝。
+- 真实正式数据的摘要、持仓、每日收益、交易与直接service调用完全一致。
+- ETF和两个指数均初始化至2026-09-09；当时正式日期缺口为0。
+- 后端重启前后24个正式CSV文件的SHA256完全一致。
+- 本机CA证书校验、登录访问、无认证401和刷新请求保护403均通过。
+- 公网尚未启用：Caddy仅绑定127.0.0.1，需提供域名/DNS后配置公共入口。
+  Lightsail入站规则及静态IP分配尚未经控制面验证，不能据此声称手机公网可达。

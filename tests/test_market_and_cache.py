@@ -121,6 +121,14 @@ class _FakeSession:
         return _FakeResponse()
 
 
+class AugustFixtureDateTime(datetime):
+    """Keep source-parser fixtures inside their requested 30-day display window."""
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 8, 8, 16, 0)
+        return value.replace(tzinfo=tz) if tz is not None else value
+
+
 class MarketAndCacheTests(unittest.TestCase):
     @staticmethod
     def _mx_dto(code, title, headers, fields):
@@ -436,6 +444,7 @@ class MarketAndCacheTests(unittest.TestCase):
     @patch("services.index_ma20.get_index_data_from_yahoo")
     @patch("services.index_ma20.fetch_eastmoney_completed_global_row")
     @patch("akshare.index_global_hist_em")
+    @patch("services.index_ma20.datetime", AugustFixtureDateTime)
     def test_global_index_keeps_yahoo_history_when_eastmoney_history_fails(
         self,
         akshare_mock,
@@ -470,6 +479,7 @@ class MarketAndCacheTests(unittest.TestCase):
         self.assertEqual(result.iloc[-1]["韩国KOSPI_收盘价"], 104.0)
 
     @patch("requests.Session")
+    @patch("services.index_ma20.datetime", AugustFixtureDateTime)
     def test_cboe_vix_history_parses_official_daily_file(self, session_factory):
         class CboeResponse:
             text = "DATE,OPEN,HIGH,LOW,CLOSE\n08/04/2026,15,17,14,16.5\n08/05/2026,16,18,15,15.81\n"

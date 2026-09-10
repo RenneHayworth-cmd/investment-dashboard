@@ -5,3 +5,11 @@ __pycache__/
 cache.db
 data/
 output/
+.env
+node_modules/
+web/frontend/dist/
+.env.*
+!.env.example
+.pytest_cache/
+playwright-report/
+test-results/

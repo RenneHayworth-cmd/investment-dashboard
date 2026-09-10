@@ -4,7 +4,9 @@ import os
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
-if os.name == "nt":
+if os.environ.get("INVESTMENT_RUNTIME_DIR"):
+    RUNTIME_DIR = Path(os.environ["INVESTMENT_RUNTIME_DIR"]).expanduser().resolve()
+elif os.name == "nt":
     RUNTIME_DIR = Path.home() / "investment_dashboard_data"
 else:
     RUNTIME_DIR = ROOT_DIR

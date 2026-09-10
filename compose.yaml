@@ -1,0 +1,52 @@
+name: position-web
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    environment:
+      TICKFLOW_API_KEY: ${TICKFLOW_API_KEY:?Set TICKFLOW_API_KEY in .env}
+      INVESTMENT_RUNTIME_DIR: /runtime
+      WEB_ORIGIN: ${WEB_ORIGIN:-https://localhost}
+      INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS: '12'
+      INVESTMENT_DASHBOARD_ALERT_TICKFLOW_MAX_RETRIES: '0'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    volumes:
+      - ${POSITION_DATA_DIR:-/srv/investment-dashboard}:/runtime
+    expose: ['8000']
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    security_opt: ['no-new-privileges:true']
+    cap_drop: ['ALL']
+    logging:
+      options: {max-size: '5m', max-file: '3'}
+  caddy:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    restart: unless-stopped
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:-localhost}
+      WEB_USERNAME: ${WEB_USERNAME:?Set WEB_USERNAME}
+      WEB_PASSWORD_HASH: ${WEB_PASSWORD_HASH:?Set WEB_PASSWORD_HASH}
+    ports:
+      - '${WEB_BIND_IP:-127.0.0.1}:80:80'
+      - '${WEB_BIND_IP:-127.0.0.1}:443:443'
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+    security_opt: ['no-new-privileges:true']
+    logging:
+      options: {max-size: '5m', max-file: '3'}
+volumes:
+  caddy_data:
+  caddy_config:

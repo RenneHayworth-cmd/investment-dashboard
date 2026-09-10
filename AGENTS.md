@@ -583,3 +583,18 @@ git diff --stat
 ```
 
 Commit only relevant source changes. Do not revert unrelated user changes.
+
+## Position Web
+
+- `web/backend/` adapts existing `services/position_*` to FastAPI; never duplicate
+  MA, parking, fee, or simulation algorithms in HTTP adapters or TypeScript.
+- `web/frontend/` is the Chinese mobile React UI. Keep formal and preview fields
+  distinct. Existing Streamlit pages remain supported.
+- Run one API worker/replica. The coordinator owns shared transient quotes and
+  uses the existing runtime cadence. GET endpoints read published snapshots.
+- `INVESTMENT_RUNTIME_DIR` overrides runtime paths; Compose binds external data
+  to `/runtime`. Keep secrets, quote caches, DBs and build outputs out of Git/images.
+- Index updates must use the stable `services.update_tasks` facade and select
+  only the position reference indexes. No recent formal gap means no network.
+- Validate Web changes with `tests/test_position_web.py`, existing position tests,
+  frontend build and browser smoke tests. See `deploy/README.md` for operations.
