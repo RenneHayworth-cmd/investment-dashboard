@@ -7,6 +7,7 @@ import fcntl
 import os
 from pathlib import Path
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 
@@ -90,33 +91,47 @@ def run_scheduled_update(
             f"{names_text}；{credential_note}。"
         )
 
-    result = run_index_ma20_update(
-        api_key=resolved_api_key,
-        days=INDEX_REPORT_DISPLAY_DAYS,
-        cache_source="auto",
-        use_fresh_cache=False,
-        index_names=pending,
-        max_workers=4,
-    )
-    if result.status != "success":
-        return 1, f"{time_text} 自动更新失败：{result.message}"
-
-    remaining = find_pending_post_close_index_names(now=now, index_names=pending)
-    remaining |= find_pending_futures_current_contract_index_names(
-        market_now=now,
-        index_names=pending,
-    )
+    remaining = set(pending)
+    errors = []
+    attempts = 0
+    for delay in (0, 30, 60):
+        if delay:
+            print(f"正式数据仍缺失：{'、'.join(ordered_index_names(remaining))}；{delay}秒后复核并重试。", flush=True)
+            time.sleep(delay)
+            # 等待期间手动更新可能已补齐，先复核再决定是否联网。
+            remaining = find_pending_post_close_index_names(now=now, index_names=remaining) | find_pending_futures_current_contract_index_names(
+                market_now=now, index_names=remaining,
+            )
+            if not remaining:
+                break
+        attempts += 1
+        result = run_index_ma20_update(
+            api_key=resolved_api_key,
+            days=INDEX_REPORT_DISPLAY_DAYS,
+            cache_source="auto",
+            use_fresh_cache=False,
+            index_names=remaining,
+            max_workers=4 if attempts == 1 else 1,
+        )
+        errors.extend(result.errors or [])
+        if result.status != "success":
+            errors.append(result.message)
+        remaining = find_pending_post_close_index_names(now=now, index_names=remaining) | find_pending_futures_current_contract_index_names(
+            market_now=now, index_names=remaining,
+        )
+        if not remaining:
+            break
     updated = pending - remaining
     parts = [
-        f"{time_text} 自动更新完成",
+        f"{time_text} 自动更新{'仍有缺失' if remaining else '完成'}（共{attempts}轮请求）",
         f"已补齐 {len(updated)}/{len(pending)} 个指数",
     ]
     if updated:
         parts.append("已更新：" + "、".join(ordered_index_names(updated)))
     if remaining:
         parts.append("仍待补齐：" + "、".join(ordered_index_names(remaining)))
-    if result.errors:
-        parts.append("数据源提示：" + " | ".join(result.errors))
+    if errors:
+        parts.append("数据源提示：" + " | ".join(dict.fromkeys(errors)))
     parts.append(credential_note)
     return (2 if remaining else 0), "；".join(parts) + "。"
 

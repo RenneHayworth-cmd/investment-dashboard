@@ -17,6 +17,9 @@ from components.position.cards_tables import (
 from components.position.formatting import position_key
 from components.position.performance import render_position_timing_performance
 from services import position_analysis as position
+from services.index_realtime import fetch_realtime_index_quotes
+from services.position_timing import build_recent_position_operation_guidance
+from services.position_close_audit import fetch_audited_close, recent_close_attempts
 
 
 def render_etf_timing_section_impl(
@@ -61,16 +64,28 @@ def render_etf_timing_section_impl(
         pd.isna(last_attempt)
         or (market_now.replace(tzinfo=None) - last_attempt).total_seconds() >= 600
     )
+    retry_clicked = False
+    if position.etf_final_close_ready(market_now) and stale_codes:
+        st.warning(f"ETF正式收盘尚缺 {len(stale_codes)} 只，目标日期 {target_date}。")
+        if not updates_enabled:
+            st.caption("本页面尚未开启更新，请先点击“加载持仓信息”。")
+        elif not retry_ready:
+            st.caption(f"本会话上次尝试：{last_attempt:%Y-%m-%d %H:%M:%S}；自动重试间隔10分钟。")
+        if not save_to_cache:
+            st.warning("未勾选“更新后保存到本地缓存”，取得的正式收盘不会写入本地。")
+        retry_clicked = st.button("立即重试ETF正式收盘", disabled=not updates_enabled)
     if (
         updates_enabled
         and position.etf_final_close_ready(market_now)
         and stale_codes
-        and retry_ready
+        and (retry_ready or retry_clicked)
     ):
         with st.spinner(f"正在自动更新 {target_date:%Y-%m-%d} ETF收盘数据..."):
             refreshed_by_code = {
-                code: position.load_or_fetch_etf(
+                code: fetch_audited_close(
                     code,
+                    fetcher=position.load_or_fetch_etf,
+                    target_date=target_date,
                     api_key=api_key,
                     count=count,
                     adjust=adjust,
@@ -484,8 +499,14 @@ def render_etf_timing_section_impl(
         )
 
     st.subheader("ETF择时状态")
+    with st.expander("ETF正式收盘更新记录"):
+        attempts = recent_close_attempts()
+        if attempts.empty:
+            st.caption("暂无持久化尝试记录；本次改动前的请求无法追溯。")
+        else:
+            st.dataframe(attempts, hide_index=True, width="stretch")
     render_etf_timing_table(
-        position.build_etf_timing_table(timing_items),
+        position.build_etf_timing_table(timing_items).rename(columns={"组合权重比例": "组合权重"}),
         value_formatter=value_formatter,
     )
     if timing_preview_active:
@@ -528,18 +549,47 @@ def render_etf_timing_section_impl(
                 )
 
     st.subheader("指数择时参考")
+    index_state = st.session_state.get("position_index_realtime_preview", {})
+    index_quotes = index_state.get("quotes", {}) if index_state.get("date") == preview_date else {}
+    index_error = index_state.get("error", "") if index_state.get("date") == preview_date else ""
+    if updates_enabled and derivative_refresh_due and position.etf_intraday_quote_ready(market_now):
+        names = set(position.POSITION_INDEX_TIMING_STRATEGIES)
+        try:
+            fetched = fetch_realtime_index_quotes(
+                now=market_now, max_workers=2, force_index_names=names,
+            )
+            valid = {
+                name: quote for name, quote in fetched.items()
+                if pd.notna(stamp := pd.to_datetime(quote.get("quote_time"), errors="coerce"))
+                and stamp.date() == market_now.date()
+                and pd.notna(price := pd.to_numeric(quote.get("price"), errors="coerce"))
+                and price > 0
+            }
+            index_quotes = {**index_quotes, **valid}
+            missing = names - valid.keys()
+            index_error = "、".join(sorted(missing)) + "：未取得当日有效报价" if missing else ""
+        except Exception as exc:
+            index_error = f"指数实时报价失败：{exc}"
+        st.session_state["position_index_realtime_preview"] = {
+            "date": preview_date, "quotes": index_quotes, "error": index_error,
+        }
     render_etf_timing_table(
-        position.build_position_index_timing_table(),
+        position.build_position_index_timing_table(
+            realtime_quotes=index_quotes, market_now=market_now,
+        ).rename(columns={"最新收盘": "最新价"}),
         value_formatter=value_formatter,
     )
+    if index_error:
+        st.warning(f"{index_error}；保留上次有效报价，无报价时显示正式收盘缓存。")
     st.caption(
         "BK1158微盘股使用MA15/2.5%，中证500使用MA15/1%；"
-        "仅读取指数监控的正式收盘缓存并延续上一状态，"
-        "不计入ETF组合权重、50万元策略或近一周操作指引。"
+        "随ETF刷新实时预判，区间内延续上一正式状态；仅买入变化标红、卖出变化标绿，持续持有或空仓不着色。"
+        "实时预判不写入正式缓存，"
+        "不计入ETF组合权重或50万元策略；正式收盘状态变化计入近一周操作指引。"
     )
 
     st.subheader("近一周操作指引")
-    guidance_df = position.build_recent_etf_operation_guidance(formal_items, days=7)
+    guidance_df = build_recent_position_operation_guidance(formal_items, days=7)
     if guidance_df.empty:
         st.info("最近7个自然日没有新的调仓指引，继续按上方当前仓位执行。")
     else:

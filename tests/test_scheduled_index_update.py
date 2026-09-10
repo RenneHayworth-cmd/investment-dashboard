@@ -10,6 +10,36 @@ from services.update_tasks import UpdateResult
 
 
 class ScheduledIndexUpdateTests(unittest.TestCase):
+    def test_retries_only_missing_index_when_source_lags(self):
+        pending = {"国证自由现金流", "上证指数"}
+        with (
+            patch.object(scheduled, "find_pending_post_close_index_names",
+                         side_effect=[pending, {"国证自由现金流"}, {"国证自由现金流"}, set()]),
+            patch.object(scheduled, "find_pending_futures_current_contract_index_names", return_value=set()),
+            patch.object(scheduled, "run_index_ma20_update", return_value=UpdateResult("success", "ok")) as update,
+            patch.object(scheduled.time, "sleep") as sleep,
+        ):
+            code, message = scheduled.run_scheduled_update()
+        self.assertEqual(code, 0)
+        self.assertIn("已补齐 2/2", message)
+        self.assertEqual(update.call_count, 2)
+        self.assertEqual(update.call_args.kwargs["index_names"], {"国证自由现金流"})
+        self.assertEqual(update.call_args.kwargs["max_workers"], 1)
+        sleep.assert_called_once_with(30)
+
+    def test_manual_completion_during_delay_skips_retry_request(self):
+        with (
+            patch.object(scheduled, "find_pending_post_close_index_names",
+                         side_effect=[{"国证自由现金流"}, {"国证自由现金流"}, set()]),
+            patch.object(scheduled, "find_pending_futures_current_contract_index_names", return_value=set()),
+            patch.object(scheduled, "run_index_ma20_update", return_value=UpdateResult("failed", "temporary error")) as update,
+            patch.object(scheduled.time, "sleep"),
+        ):
+            code, message = scheduled.run_scheduled_update()
+        self.assertEqual(code, 0)
+        self.assertIn("已补齐 1/1", message)
+        update.assert_called_once()
+
     def test_dry_run_lists_pending_indexes_without_network_or_writes(self):
         now = datetime(2026, 8, 13, 15, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
         with (
@@ -83,18 +113,19 @@ class ScheduledIndexUpdateTests(unittest.TestCase):
             patch.object(
                 scheduled,
                 "find_pending_post_close_index_names",
-                side_effect=[pending, {"恒生科技"}],
+                side_effect=[pending] + [{"恒生科技"}] * 5,
             ),
             patch.object(
                 scheduled,
                 "find_pending_futures_current_contract_index_names",
-                side_effect=[set(), set()],
+                return_value=set(),
             ),
             patch.object(
                 scheduled,
                 "run_index_ma20_update",
                 return_value=UpdateResult("success", "partial", errors=["港股源暂不可用"]),
             ),
+            patch.object(scheduled.time, "sleep"),
         ):
             exit_code, message = scheduled.run_scheduled_update()
 

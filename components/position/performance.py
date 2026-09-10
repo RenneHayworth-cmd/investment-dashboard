@@ -15,6 +15,7 @@ from components.position_table import (
     position_text_cell,
     render_position_table,
 )
+from core.return_calendar import render_return_calendar
 from core.ui import (
     DEFAULT_CHART_HEIGHT,
     apply_plotly_layout,
@@ -211,6 +212,7 @@ def render_position_timing_performance(
     *,
     realtime_quotes: dict[str, dict[str, object]] | None = None,
     market_now: datetime | None = None,
+    render_calendar=render_return_calendar,
 ) -> None:
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     st.subheader("50万元ETF均线策略每日盈亏")
@@ -310,6 +312,18 @@ def render_position_timing_performance(
         key="position_timing_performance_chart",
     )
     st.caption("横坐标仅排列正式日线中的实际交易日，周末和节假日已自动跳过。")
+
+    returns = result.daily[["日期", "每日盈亏", "每日收益率(%)"]].rename(
+        columns={"日期": "date", "每日盈亏": "pnl_amount", "每日收益率(%)": "return_pct"}
+    )
+    first_date = pd.Timestamp(result.daily["日期"].min()) if not result.daily.empty else None
+    render_calendar(
+        returns,
+        title="50万元ETF策略收益日历",
+        key_prefix="position_timing_return_calendar",
+        first_date=first_date,
+        caption="每日收益率 = 当日盈亏 ÷ 前一日策略总资产（持仓市值+现金），期间收益按日几何复合；周末与节假日已自动标注。",
+    )
 
     holding_tab, trade_tab, daily_tab = st.tabs(
         ["策略持仓情况", "策略交易明细", "每日盈亏明细"]

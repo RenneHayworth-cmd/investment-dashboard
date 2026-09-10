@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -21,6 +22,7 @@ from scripts.monitor_position_timing_trades import (
 )
 from services import position_analysis as position
 from services import position_performance
+from scripts import monitor_position_timing_trades as monitor
 
 
 class PositionTimingTradeAlertTests(unittest.TestCase):
@@ -166,6 +168,8 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
                 no_action_at_1450=True,
                 last_outcome="no_action",
                 last_notification_at="2026-08-28T14:50:00+08:00",
+                delivered_channels={"14:50": ["Server酱", "Hermes微信"]},
+                delivery_errors={"14:50": []},
             )
             save_notification_state(state, path)
             self.assertEqual(load_notification_state(path), state)
@@ -239,6 +243,73 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
         self.assertEqual(errors, ())
         serverchan_mock.assert_called_once_with("SCT_TEST", "测试标题", "测试正文")
         hermes_mock.assert_called_once_with("测试标题", "测试正文")
+
+    def test_rate_limit_retries_only_hermes(self):
+        with (
+            patch("scripts.monitor_position_timing_trades.send_serverchan_message") as server,
+            patch("scripts.monitor_position_timing_trades.send_hermes_weixin_message",
+                  side_effect=[RuntimeError("iLink sendmessage rate limited"), {}]) as hermes,
+            patch("scripts.monitor_position_timing_trades.time.sleep") as sleep,
+        ):
+            channels, errors = send_notification_channels("TEST_KEY", "测试", "正文")
+        self.assertEqual(channels, ("Server酱", "Hermes微信"))
+        self.assertEqual(errors, ())
+        server.assert_called_once()
+        self.assertEqual(hermes.call_count, 2)
+        sleep.assert_called_once_with(35)
+
+    def test_all_failed_logs_safe_categories(self):
+        with (
+            patch("scripts.monitor_position_timing_trades.send_serverchan_message",
+                  side_effect=TimeoutError("https://example/SECRET_KEY")),
+            patch("scripts.monitor_position_timing_trades.send_hermes_weixin_message",
+                  side_effect=RuntimeError("Hermes微信推送超时（60秒）。")),
+            self.assertLogs(level="ERROR") as logs,
+        ):
+            channels, errors = send_notification_channels("SECRET_KEY", "测试", "正文")
+        self.assertEqual(channels, ())
+        self.assertEqual(len(errors), 2)
+        self.assertIn("网络或发送超时", str(logs.output))
+        self.assertNotIn("SECRET_KEY", str(logs.output))
+
+    def test_partial_delivery_is_saved_but_not_marked_complete(self):
+        state = PositionTimingNotificationState(trade_date="2026-08-28")
+        with (
+            patch.object(monitor, "parse_args", return_value=SimpleNamespace(
+                force=True, dry_run=False, test_notification=False)),
+            patch.object(monitor, "configure_logging"),
+            patch.object(monitor, "datetime") as clock,
+            patch.object(monitor, "single_instance_lock", return_value=nullcontext(True)),
+            patch.object(monitor, "load_notification_state", return_value=state),
+            patch.object(monitor, "load_serverchan_sendkey", return_value="KEY"),
+            patch.dict("os.environ", {"TICKFLOW_API_KEY": ""}),
+            patch.object(monitor, "send_notification_channels", return_value=(
+                ("Server酱",), ("Hermes微信失败",))),
+            patch.object(monitor, "save_notification_state") as save,
+            patch.object(monitor, "send_serverchan_message") as fallback,
+        ):
+            clock.now.return_value = self.market_now
+            self.assertEqual(monitor.main(), 1)
+        saved = save.call_args.args[0]
+        self.assertEqual(saved.delivered_channels["14:50"], ["Server酱"])
+        self.assertNotIn("14:50", saved.notified_slots)
+        self.assertFalse(saved.no_action_at_1450)
+        fallback.assert_not_called()
+
+    def test_exhausted_retries_preserve_serverchan_success(self):
+        with (
+            patch("scripts.monitor_position_timing_trades.send_serverchan_message") as server,
+            patch("scripts.monitor_position_timing_trades.send_hermes_weixin_message",
+                  side_effect=RuntimeError("rate limited")) as hermes,
+            patch("scripts.monitor_position_timing_trades.time.sleep") as sleep,
+        ):
+            channels, errors = send_notification_channels("KEY", "测试", "正文",
+                                                         already_sent=("Server酱",))
+        server.assert_not_called()
+        self.assertEqual(hermes.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [35, 60, 60])
+        self.assertEqual(channels, ("Server酱",))
+        self.assertEqual(len(errors), 1)
 
     def test_notification_channel_failure_does_not_block_other_channel(self):
         with (

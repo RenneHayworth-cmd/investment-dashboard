@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 
 from core.cache import load_dataset
@@ -186,8 +189,12 @@ def _load_position_index_timing_history(index_name: str) -> pd.DataFrame | None:
     return merge_raw_index_data(None, effective_history)
 
 
-def build_position_index_timing_table() -> pd.DataFrame:
-    """从指数监控正式日线缓存构建持仓页的指数择时参考。"""
+def build_position_index_timing_table(*, realtime_quotes: dict | None = None, market_now: datetime | None = None) -> pd.DataFrame:
+    """基于正式历史和可选的当日报价计算指数择时，报价仅参与本次预判。"""
+    from services.position_sessions import etf_intraday_quote_ready, etf_final_close_ready
+    from services.market_calendar import get_market_window, is_market_holiday, previous_trading_day
+
+    now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     rows: list[dict[str, object]] = []
     for index_name, strategy in POSITION_INDEX_TIMING_STRATEGIES.items():
         ma_period = int(strategy["ma_period"])
@@ -232,6 +239,44 @@ def build_position_index_timing_table() -> pd.DataFrame:
             rows.append(row)
             continue
 
+        quote = (realtime_quotes or {}).get(index_name, {})
+        quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+        price = pd.to_numeric(quote.get("price"), errors="coerce")
+        latest_formal_date = timing_history["date"].max().date()
+        preview = bool(
+            pd.notna(quote_time)
+            and quote_time.date() == now.date()
+            and pd.notna(price) and price > 0
+            and (etf_intraday_quote_ready(now) or etf_final_close_ready(now))
+            and latest_formal_date < now.date()
+        )
+        if preview:
+            # 滞回状态依赖完整历史，不只依赖最后一个 MA 窗口。
+            market = get_market_window("A股")
+            previous_session = previous_trading_day(market, now.date())
+            observed_dates = set(timing_history["date"].dt.date)
+            missing_dates = [
+                day.date()
+                for day in pd.bdate_range(timing_history["date"].min(), previous_session)
+                if day.date() not in observed_dates and not is_market_holiday(market, day.date())
+            ]
+            if missing_dates:
+                row.update({
+                    "数据截止日": now.strftime("%Y-%m-%d"),
+                    "最新收盘": float(price),
+                    "数据状态": (
+                        f"实时报价 {quote_time:%H:%M:%S}；正式历史缺少"
+                        f"{missing_dates[0]:%Y-%m-%d}起共{len(missing_dates)}个交易日，"
+                        "请补齐指数正式数据；暂停择时预判"
+                    ),
+                })
+                rows.append(row)
+                continue
+            timing_history = pd.concat([
+                timing_history,
+                pd.DataFrame([{"date": pd.Timestamp(now.date()), "price": float(price)}]),
+            ], ignore_index=True)
+
         latest = timing_history.iloc[-1]
         previous_close = (
             float(timing_history.iloc[-2]["price"])
@@ -274,7 +319,9 @@ def build_position_index_timing_table() -> pd.DataFrame:
                 "上一区间涨幅(%)": snapshot.get(
                     "策略上一区间涨幅(%)", pd.NA
                 ),
-                "数据状态": "正式收盘缓存",
+                "数据状态": (
+                    f"实时预判 {quote_time:%H:%M:%S}" if preview else "正式收盘缓存"
+                ),
             }
         )
         rows.append(row)
@@ -676,6 +723,51 @@ def build_recent_etf_operation_guidance(
     ).reset_index(drop=True)
 
 
+def build_recent_position_operation_guidance(items: list[PositionItem], *, days: int = 7) -> pd.DataFrame:
+    """合并ETF与指数正式收盘转换，统一最近自然日窗口。"""
+    etf_guidance = build_recent_etf_operation_guidance(items, days=days)
+    histories = {
+        name: _load_position_index_timing_history(name)
+        for name in POSITION_INDEX_TIMING_STRATEGIES
+    }
+    latest_dates = [
+        pd.to_datetime(item.dataframe["date"]).max()
+        for item in items
+        if item.category == "ETF" and item.formal_history_valid
+        and item.dataframe is not None and not item.dataframe.empty
+        and "date" in item.dataframe
+    ]
+    rows = []
+    for name, history in histories.items():
+        if history is None or history.empty:
+            continue
+        latest_dates.append(pd.to_datetime(history["trade_date"]).max())
+        strategy = POSITION_INDEX_TIMING_STRATEGIES[name]
+        transitions = calculate_etf_timing_transitions(
+            history.rename(columns={"trade_date": "date", "close": "price"}),
+            ma_period=strategy["ma_period"], threshold_pct=strategy["threshold_pct"],
+        )
+        for _, transition in transitions.iterrows():
+            action = transition["原始信号"]
+            rows.append({
+                "日期": pd.Timestamp(transition["日期"]).strftime("%Y-%m-%d"),
+                "ETF名称": f"{name}指数" if name == "微盘股" else name,
+                "代码": strategy["code"],
+                "策略参数": f"MA{strategy['ma_period']} / {strategy['threshold_pct']:.1f}%",
+                "操作指引": action,
+                "操作后仓位": "持有" if action == "买入" else "空仓",
+                "触发收盘价": round(float(transition["收盘价"]), 3),
+            })
+    result = pd.concat([etf_guidance, pd.DataFrame(rows, columns=etf_guidance.columns)], ignore_index=True)
+    if latest_dates and not result.empty:
+        end = max(latest_dates).normalize()
+        start = end - pd.Timedelta(days=max(int(days), 1) - 1)
+        dates = pd.to_datetime(result["日期"])
+        result = result[dates.between(start, end)]
+        result = result.sort_values(["日期", "代码"], ascending=[False, True])
+    return result.rename(columns={"ETF名称": "标的名称"}).reset_index(drop=True)
+
+
 def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
     columns = [
         "ETF名称",
@@ -691,6 +783,7 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
         "区间涨幅(%)",
         "上一状态转换时间",
         "上一区间涨幅(%)",
+        "数据状态",
     ]
     rows = []
     parking_snapshot = calculate_512890_parking_snapshot(items)
@@ -717,6 +810,13 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
             "区间涨幅(%)": "-" if is_parking_etf else pd.NA,
             "上一状态转换时间": "-" if is_parking_etf else pd.NA,
             "上一区间涨幅(%)": "-" if is_parking_etf else pd.NA,
+            "数据状态": (
+                "正式历史待校验" if not item.formal_history_valid
+                else item.status if item.status in {"实时预判", "早盘预判", "午间预判", "收盘待确认"}
+                else "实时预判" if item.status == "盘中"
+                else "无正式缓存" if item.dataframe is None or item.dataframe.empty
+                else "正式收盘缓存"
+            ),
         }
         if is_parking_etf:
             row.update(

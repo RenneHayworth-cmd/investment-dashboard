@@ -198,8 +198,8 @@ def build_recent_etf_operation_guidance(items: list[PositionItem], *, days: int=
 def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
     return _call(_timing, 'build_etf_timing_table', items)
 
-def build_position_index_timing_table() -> pd.DataFrame:
-    return _call(_timing, 'build_position_index_timing_table')
+def build_position_index_timing_table(*, realtime_quotes: dict | None = None, market_now: datetime | None = None) -> pd.DataFrame:
+    return _call(_timing, 'build_position_index_timing_table', realtime_quotes=realtime_quotes, market_now=market_now)
 
 def build_position_timing_performance(items: list[PositionItem], *, start_date: str | pd.Timestamp=POSITION_TIMING_START_DATE, initial_capital: float=POSITION_TIMING_INITIAL_CAPITAL, transaction_cost: float=POSITION_TIMING_TRANSACTION_COST, lot_size: int=POSITION_TIMING_LOT_SIZE, market_now: datetime | None=None) -> PositionTimingPerformanceResult:
     return _call(_performance, 'build_position_timing_performance', items, start_date=start_date, initial_capital=initial_capital, transaction_cost=transaction_cost, lot_size=lot_size, market_now=market_now)

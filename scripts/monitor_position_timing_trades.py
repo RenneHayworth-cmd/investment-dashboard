@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 
@@ -42,6 +43,8 @@ class PositionTimingNotificationState:
     no_action_at_1450: bool = False
     last_outcome: str = ""
     last_notification_at: str = ""
+    delivered_channels: dict[str, list[str]] = field(default_factory=dict)
+    delivery_errors: dict[str, list[str]] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +85,8 @@ def load_notification_state(path: Path = STATE_PATH) -> PositionTimingNotificati
         no_action_at_1450=bool(payload.get("no_action_at_1450", False)),
         last_outcome=str(payload.get("last_outcome") or ""),
         last_notification_at=str(payload.get("last_notification_at") or ""),
+        delivered_channels=dict(payload.get("delivered_channels") or {}),
+        delivery_errors=dict(payload.get("delivery_errors") or {}),
     )
 
 
@@ -116,29 +121,56 @@ def send_notification_channels(
     sendkey: str,
     title: str,
     description: str,
+    *,
+    already_sent: tuple[str, ...] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Send through both WeChat paths without one failure blocking the other."""
-    sent_channels: list[str] = []
+    sent_channels: list[str] = list(already_sent)
     errors: list[str] = []
 
-    if sendkey:
+    if "Server酱" in sent_channels:
+        pass
+    elif sendkey:
         try:
             send_serverchan_message(sendkey, title, description)
             sent_channels.append("Server酱")
         except Exception as exc:
-            errors.append(f"Server酱推送失败（{type(exc).__name__}）")
+            errors.append(f"Server酱推送失败（{_delivery_error_kind(exc)}）")
     else:
         errors.append(f"Server酱未配置SendKey（{SERVERCHAN_SENDKEY_FILE}）")
 
-    try:
-        send_hermes_weixin_message(title, description)
-        sent_channels.append("Hermes微信")
-    except Exception as exc:
-        errors.append(f"Hermes微信推送失败（{type(exc).__name__}）")
+    if "Hermes微信" not in sent_channels:
+        # Bound retries below the eight-minute task deadline. Do not retry
+        # ambiguous timeouts, which may hide an already delivered message.
+        delays = (35, 60, 60)
+        for attempt in range(len(delays) + 1):
+            try:
+                send_hermes_weixin_message(title, description)
+                sent_channels.append("Hermes微信")
+                break
+            except Exception as exc:
+                if "rate limited" not in str(exc).lower() or attempt == len(delays):
+                    errors.append(f"Hermes微信推送失败（{_delivery_error_kind(exc)}）")
+                    break
+                logging.warning("Hermes微信接口拒绝发送，等待%d秒后进行第%d次重试",
+                                delays[attempt], attempt + 1)
+                time.sleep(delays[attempt])
 
     if not sent_channels:
-        raise RuntimeError("；".join(errors))
+        logging.error("notification_all_failed errors=%s", " | ".join(errors))
     return tuple(sent_channels), tuple(errors)
+
+
+def _delivery_error_kind(exc: Exception) -> str:
+    """Keep actionable categories without logging credentials in URLs or CLI output."""
+    detail = str(exc).lower()
+    if "rate limited" in detail:
+        return "微信接口拒绝发送（Hermes归类为限流）"
+    if "timeout" in detail or "超时" in detail or "timeout" in type(exc).__name__.lower():
+        return "网络或发送超时"
+    if "proxy" in detail or "proxy" in type(exc).__name__.lower():
+        return "代理连接失败"
+    return type(exc).__name__
 
 
 @contextmanager
@@ -271,10 +303,11 @@ def main() -> int:
         )
         if delivery_errors:
             logging.warning("notification_partial_failure errors=%s", " | ".join(delivery_errors))
-        print(f"成功：ETF均线策略测试通知已发送（{'、'.join(sent_channels)}）。")
+        fully_delivered = {"Server酱", "Hermes微信"}.issubset(sent_channels)
+        print(f"{'成功' if fully_delivered else '未全部送达'}：ETF均线策略测试通知（已发送：{'、'.join(sent_channels) or '无'}）。")
         if delivery_errors:
             print(f"警告：{'；'.join(delivery_errors)}")
-        return 0
+        return 0 if fully_delivered else 1
 
     market = get_market_window("A股")
     if market is None or not is_market_trading_day(market, now):
@@ -341,9 +374,14 @@ def main() -> int:
             sendkey,
             title,
             description,
+            already_sent=tuple(state.delivered_channels.get(slot, [])),
         )
-        state.notified_slots = sorted(set(state.notified_slots + [slot]))
-        if outcome == "no_action" and slot == "14:50":
+        state.delivered_channels[slot] = list(sent_channels)
+        state.delivery_errors[slot] = list(delivery_errors)
+        fully_delivered = {"Server酱", "Hermes微信"}.issubset(sent_channels)
+        if fully_delivered:
+            state.notified_slots = sorted(set(state.notified_slots + [slot]))
+        if fully_delivered and outcome == "no_action" and slot == "14:50":
             state.no_action_at_1450 = True
         state.last_outcome = outcome
         state.last_notification_at = now.isoformat(timespec="seconds")
@@ -357,10 +395,10 @@ def main() -> int:
         )
         if delivery_errors:
             logging.warning("notification_partial_failure errors=%s", " | ".join(delivery_errors))
-        print(f"成功：{title}（已发送：{'、'.join(sent_channels)}）")
+        print(f"{'成功' if fully_delivered else '未全部送达'}：{title}（已发送：{'、'.join(sent_channels) or '无'}）")
         if delivery_errors:
             print(f"警告：{'；'.join(delivery_errors)}")
-        return 0
+        return 0 if fully_delivered else 1
 
 
 if __name__ == "__main__":

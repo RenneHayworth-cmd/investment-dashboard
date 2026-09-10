@@ -60,6 +60,7 @@ def _item(
 
 
 def _patch_page(stack: ExitStack, *, cached: bool):
+    stack.enter_context(patch("components.position.realtime.fetch_realtime_index_quotes", return_value={}))
     stack.enter_context(patch("core.db.init_db"))
     etf = stack.enter_context(
         patch(
@@ -151,7 +152,7 @@ def _patch_page(stack: ExitStack, *, cached: bool):
     )
     stack.enter_context(
         patch(
-            "services.position_analysis.build_recent_etf_operation_guidance",
+            "components.position.realtime.build_recent_position_operation_guidance",
             return_value=pd.DataFrame(),
         )
     )
@@ -246,12 +247,16 @@ render_position_timing_performance([])
         self.assertEqual(list(app.exception), [])
         self.assertEqual(
             [item.value for item in app.subheader],
-            ["50万元ETF均线策略每日盈亏"],
+            ["50万元ETF均线策略每日盈亏", "50万元ETF策略收益日历"],
         )
         self.assertEqual(
             [item.label for item in app.tabs],
             ["策略持仓情况", "策略交易明细", "每日盈亏明细"],
         )
+        segmented_labels = [item.label for item in app.segmented_control]
+        self.assertIn("时间范围", segmented_labels)
+        self.assertIn("统计周期", segmented_labels)
+        self.assertIn("显示口径", segmented_labels)
         self.assertEqual(len(app.get("plotly_chart")), 1)
         position_tables = [
             item.value

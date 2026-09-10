@@ -423,7 +423,7 @@ class PositionAnalysisTests(unittest.TestCase):
             page_source,
         )
         self.assertIn(
-            "build_recent_etf_operation_guidance(formal_items, days=7)",
+            "build_recent_position_operation_guidance(formal_items, days=7)",
             realtime_source,
         )
         self.assertNotIn("近一月操作指引", realtime_source)
@@ -2716,8 +2716,8 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(table["代码"].tolist(), ["513260", "518850", "512890"])
         self.assertEqual(table.iloc[0]["ETF名称"], "恒生科技ETF汇添富")
         self.assertEqual(
-            table.columns.tolist()[-4:],
-            ["状态转换时间", "区间涨幅(%)", "上一状态转换时间", "上一区间涨幅(%)"],
+            table.columns.tolist()[-5:],
+            ["状态转换时间", "区间涨幅(%)", "上一状态转换时间", "上一区间涨幅(%)", "数据状态"],
         )
         self.assertEqual(table.iloc[0]["上一状态转换时间"], "2026-06-18")
         self.assertEqual(table.iloc[0]["上一区间涨幅(%)"], -2.5)
@@ -3083,7 +3083,7 @@ class PositionFacadeContractTests(unittest.TestCase):
         "load_or_fetch_spread": "(contracts: 'list[str]', *, base_contract: 'str | None' = None, api_key: 'str' = '', max_workers: 'int' = 2, allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "load_or_fetch_option": "(code: 'str', *, period: 'str' = '1d', count: 'int' = 500, ma_periods: 'list[int] | tuple[int, ...]' = (5, 20, 60), allow_fetch: 'bool' = True, force_refresh: 'bool' = False, save_to_cache: 'bool' = True, realtime_preview: 'bool' = False, market_now: 'datetime | None' = None) -> 'PositionItem'",
         "refresh_position_derivative_items": "(items: 'list[PositionItem]', *, api_key: 'str' = '', max_workers: 'int' = 2, option_count: 'int' = 500, market_now: 'datetime | None' = None) -> 'tuple[list[PositionItem], list[str]]'",
-        "build_position_index_timing_table": "() -> 'pd.DataFrame'",
+        "build_position_index_timing_table": "(*, realtime_quotes: 'dict | None' = None, market_now: 'datetime | None' = None) -> 'pd.DataFrame'",
     }
 
     def test_existing_import_surface_and_signatures_are_stable(self):
