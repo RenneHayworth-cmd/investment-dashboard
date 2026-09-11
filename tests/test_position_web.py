@@ -91,6 +91,11 @@ def test_preview_does_not_change_formal_guidance_or_strategy():
     assert result['preview_codes']
     assert result['guidance'] == baseline['guidance']
     assert result['strategy'] == baseline['strategy']
+    assert result['strategy_live']['complete']
+    assert result['strategy_live'] != baseline['strategy_live']
+    expected_live = performance.build_position_timing_intraday_valuation(
+        performance.build_position_timing_performance(formal, market_now=NOW), quotes, market_now=NOW)
+    assert result['strategy_live'] == json_value(expected_live)
     assert result['trade_preview'] == json_value(performance.build_position_timing_trade_preview(formal, quotes, market_now=NOW))
     for old, item in zip(before, formal):
         pd.testing.assert_frame_equal(old, item.dataframe)
@@ -110,6 +115,56 @@ def test_after_close_retains_quote_until_formal_arrives():
     confirmed = payload(formal, quote, after)
     assert confirmed['preview_codes'] == []
     assert confirmed['quote_time'] == ''
+    assert pending['strategy_live']['mode'] == 'pending_close'
+    assert confirmed['strategy_live']['mode'] == 'formal'
+    assert confirmed['strategy_live']['daily_pnl'] is None
+    assert confirmed['strategy']['daily'][-1]['日期'].startswith('2026-08-10')
+
+
+def test_live_does_not_execute_preview_actions():
+    formal = items()
+    quotes = {item.code: {'price': 130., 'quote_time': NOW} for item in formal}
+    baseline = payload(formal, quotes)
+    fabricated_preview = performance.PositionTimingTradePreviewResult(
+        actions=pd.DataFrame([{'代码': '159501', '操作': '买入', '数量': 9999999}]))
+    with patch.object(performance, 'build_position_timing_trade_preview', return_value=fabricated_preview):
+        changed = payload(formal, quotes)
+    assert baseline['trade_preview'] != changed['trade_preview']
+    assert baseline['strategy_live'] == changed['strategy_live']
+    assert baseline['strategy'] == changed['strategy']
+
+
+def test_partial_formal_confirmation_keeps_all_valuation_quotes():
+    formal = items()
+    quotes = {item.code: {'price': 130., 'quote_time': NOW} for item in formal}
+    before = payload(formal, quotes)
+    held = before['strategy']['positions'][0]['代码']
+    item = next(item for item in formal if item.code == held)
+    item.dataframe = pd.concat([item.dataframe, pd.DataFrame({'date': [pd.Timestamp('2026-08-10')], 'price': [130.]})], ignore_index=True)
+    item.latest_date = '2026-08-10'
+    after = payload(formal, quotes, NOW.replace(hour=15, minute=6))
+    assert held not in after['preview_codes']
+    assert after['strategy_live']['complete']
+    assert after['strategy_live']['daily_pnl'] == before['strategy_live']['daily_pnl']
+    assert after['strategy_live']['mode'] == 'pending_close'
+
+
+def test_runtime_snapshot_update_changes_only_live_valuation_without_fetch():
+    state = Coordinator(clock=lambda: NOW)
+    state.items = items()
+    shared = {item.code: {'price': 130., 'quote_time': NOW} for item in state.items}
+    with patch('web.backend.coordinator.list_datasets', return_value=pd.DataFrame()), \
+         patch.object(runtime, 'load_runtime_etf_quotes', side_effect=lambda **kw: shared), \
+         patch.object(runtime, 'fetch_tickflow_etf_quotes', side_effect=AssertionError('new fetch')), \
+         patch('core.cache.save_dataset', side_effect=AssertionError('persisted preview')):
+        state._publish(NOW)
+        first = state.payload
+        for quote in shared.values():
+            quote['price'] = 140.
+        state._publish(NOW.replace(second=30))
+        second = state.payload
+    assert first['strategy'] == second['strategy']
+    assert first['strategy_live']['daily_pnl'] != second['strategy_live']['daily_pnl']
 
 
 def test_missing_data_is_explicit_and_not_zero():

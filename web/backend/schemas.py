@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -25,8 +25,21 @@ class Strategy(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class StrategyLive(BaseModel):
+    mode: Literal['unavailable', 'intraday', 'pending_close', 'formal']
+    available: bool
+    complete: bool
+    valuation_date: str
+    formal_date: str
+    quote_time: str
+    missing_codes: list[str]
+    daily_pnl: float | None
+    estimated_assets: float | None
+    warnings: list[str]
+
+
 class Dashboard(BaseModel):
-    schema_version: int = 1
+    schema_version: int = 2
     generated_at: str
     expected_formal_date: str
     session: str
@@ -45,6 +58,7 @@ class Dashboard(BaseModel):
     guidance: list[dict[str, Any]]
     strategy_parameters: dict[str, Any]
     strategy: Strategy
+    strategy_live: StrategyLive
     trade_preview: dict[str, Any]
     derivatives: list[Instrument]
     spreads: list[Instrument]

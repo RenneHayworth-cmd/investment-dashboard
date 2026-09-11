@@ -56,6 +56,7 @@ def build_dashboard(items, derivatives, quotes, index_quotes, now):
     """Keep formal objects untouched; preview objects retain their formal dataframe."""
     target = sessions.latest_final_etf_trade_date(now)
     current = runtime.filter_current_etf_realtime_quotes(quotes, market_now=now, retain_after_close=True)
+    valuation_quotes = current
     if sessions.etf_final_close_ready(now):
         current = {code: quote for code, quote in current.items()
                    if any(models.normalize_etf_base_code(item.code) == code and not formal_current(item, now) for item in items)}
@@ -64,6 +65,7 @@ def build_dashboard(items, derivatives, quotes, index_quotes, now):
         allow_close_retention=now.time() >= models.ETF_REALTIME_TIMING_END_TIME,
     ) for item in items]
     result = performance.build_position_timing_performance(items, market_now=now)
+    live = performance.build_position_timing_intraday_valuation(result, valuation_quotes, market_now=now)
     preview = performance.build_position_timing_trade_preview(items, current, market_now=now)
     band = runtime._runtime_quote_refresh_band(now)
     quote_times = [pd.Timestamp(quote["quote_time"]) for quote in current.values() if quote.get("quote_time")]
@@ -90,7 +92,7 @@ def build_dashboard(items, derivatives, quotes, index_quotes, now):
                              "开始日期": json_value(performance.POSITION_TIMING_START_DATE),
                              "单边费率": performance.POSITION_TIMING_TRANSACTION_COST,
                              "整手份数": performance.POSITION_TIMING_LOT_SIZE},
-        strategy=json_value(result), trade_preview=json_value(preview),
+        strategy=json_value(result), strategy_live=json_value(live), trade_preview=json_value(preview),
         derivatives=[instrument(item) for item in derivatives if item.category != "期货价差"],
         spreads=[instrument(item) for item in derivatives if item.category == "期货价差"],
     )

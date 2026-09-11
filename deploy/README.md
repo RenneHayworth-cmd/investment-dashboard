@@ -110,12 +110,41 @@ HTTP自动308跳转HTTPS。现有Basic Auth保护首页和全部API，匿名访�
 - ETF正式缓存保持版本及复权口径。漂移重建失败仍显示最后行情，暂停正式
   策略计算；不以过期或空缓存冒充当天正式收盘。
 
-## API 合约 v1
+## API 合约 v2
 
 主页面只请求 `GET /api/dashboard`：包含正式/预览ETF和指数、逐标的日期、
 目标正式日期、缺失标的、刷新进度、指导、模拟摘要/持仓/交易/每日收益、
 交易预判、衍生品。金额和百分数不重新计算，直接序列化 service 的中文字段。
 NaN/NaT/pd.NA/Infinity转换为null，时间使用`YYYY-MM-DD HH:MM:SS`（上海时区）。
+
+`schema_version=2` 新增独立的 `strategy_live`，不改变 `strategy.daily`：
+
+- `mode`：`intraday`（盘中）、`pending_close`（收盘待确认）、`formal`
+  （显示正式 daily）或 `unavailable`。
+- `formal_date` 是正式持仓基准日，盘中必须为上一完整 A 股交易日；
+  `valuation_date` 是上海当前日期，`quote_time` 是参与估值报价中最早的时间。
+- `available` 和 `complete` 同为 true 才能展示实时金额。缺少有效持仓报价时，
+  `missing_codes` 列出代码，`daily_pnl`、`estimated_assets` 为 null，不返回部分合计。
+- `services.position_performance.build_position_timing_intraday_valuation` 使用正式
+  positions 的数量和最后正式价格，对共享内存报价计算
+  `Σ 数量 × (实时价 − 正式价)`，估算资产为最后正式资产加该盈亏。
+  不执行交易预判、不估算成交费用、不改变现金和正式 NAV。未持有标的不需要报价。
+- 只接受上海当日、不晚于估值时刻的正数有限报价；正式基准过旧时暂停估值。
+  15:00 后保留有效报价并标记待确认；15:05 后，原有 audited formal close 流程
+  确认完整日线、正式 daily 包含当天后，切换为当天正式盈亏。不会另建策略数据库。
+- 所有盘中估值只在内存和 API 快照中，不能写 CSV、SQLite、正式持仓或收益曲线。
+  Coordinator 调用现有共享行情，不因该估值增加行情请求。
+
+概览只展示盘中预判、近期操作指引和指数参考；50万元策略摘要只在策略页。
+预判及 ETF 卡片的红/绿背景严格来自 `trade_preview.actions` 的买入/卖出；
+正式操作指引仅操作文字着色，且不包含盘中预览。记录指标与 ETF 区间数据直接显示，
+走势图仍按需加载。
+
+2026-09-11 验收：268 项 Python 回归及4项子测试通过，覆盖持仓、提醒和共享缓存；
+编译及前端构建通过。候选构建12项浏览器测试通过，正式 HTTPS 部署18项测试通过，
+包含 iPhone WebKit、手机 Chromium 和桌面。线上新估值使用2026-09-10正式持仓与
+9月11日共享报价；部署前后正式策略和指引一致。缺报价与收盘确认切换通过固定时钟
+测试验证，未伪造生产日期或交易；当日实际收盘切换仍由既有正式日线确认流程触发。
 
 细分接口复用同一个快照，不重复计算：
 

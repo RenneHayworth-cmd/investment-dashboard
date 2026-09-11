@@ -11,38 +11,51 @@ const fmt = (v: Value | undefined, digits = 2) => typeof v === 'number' ? v.toLo
 const sign = (v: Value | undefined) => typeof v === 'number' && v > 0 ? 'up' : typeof v === 'number' && v < 0 ? 'down' : ''
 const signed = (v: Value | undefined, suffix = '') => typeof v === 'number' ? `${v > 0 ? '+' : ''}${fmt(v)}${suffix}` : '—'
 const label = (v: Value | undefined) => v == null || v === '-' ? '待数据' : String(v)
+const actionClass = (action: Value | undefined) => action === '买入' ? 'action-buy' : action === '卖出' ? 'action-sell' : ''
+const actionTextClass = (action: Value | undefined) => action === '买入' ? 'up' : action === '卖出' ? 'down' : ''
 function Notices({ messages }: { messages: string[] }) { return <>{messages.filter(Boolean).map((m, i) => <p key={i} className="notice" role="status">{m}</p>)}</> }
-function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={/盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], /净值|价格|参考价|均线/.test(k) ? 4 : 2)}</dd></div>)}</dl> }
-function RecordCard({ row }: { row: Row }) {
+function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], /数量/.test(k) ? 0 : /净值|价格|参考价|均线/.test(k) ? 4 : 2)}</dd></div>)}</dl> }
+function RecordCard({ row, tradeAction = false }: { row: Row; tradeAction?: boolean }) {
  const priority = ['基金名称','ETF名称','标的名称','代码','日期','操作','择时判断','策略参数','最新收盘','持仓数量','持仓市值','账户权重(%)','当日盈亏','每日盈亏','每日收益率(%)','净值','成交价','成交金额']
- const primary = priority.filter(k => k in row).slice(0,6)
- const shown = primary.length ? primary : Object.keys(row).slice(0,5)
+ const shown = priority.filter(k => k in row)
  const remaining = Object.keys(row).filter(k=>!shown.includes(k))
- return <article className="record"><Fields row={row} keys={shown}/>{remaining.length>0&&<details><summary>更多指标</summary><Fields row={row} keys={remaining}/></details>}</article>
+ return <article data-code={String(row['代码'] || '')} className={`record ${tradeAction ? actionClass(row['操作']) : ''}`}><Fields row={row} keys={[...shown,...remaining]}/></article>
 }
 function Rows({ rows, empty = '暂无记录', limit = 30 }: { rows: Row[]; empty?: string; limit?: number }) {
  const [all, setAll] = useState(false)
  return rows.length ? <><div className="record-grid">{(all ? rows : rows.slice(0,limit)).map((r,i) => <RecordCard row={r} key={i}/>)}</div>{rows.length > limit && <Button variant="outline" onClick={() => setAll(!all)}>{all ? '收起记录' : `查看全部 ${rows.length} 条`}</Button>}</> : <p className="empty">{empty}</p>
 }
 function StrategySummary({ data }: { data: Dashboard }) {
- const s = data.strategy.summary, latest = data.strategy.daily.at(-1)
- return <section className="panel strategy-summary"><div className="section-title"><h2>50万元择时策略</h2><span className="badge">模拟 · 正式收盘</span></div>
+ const s = data.strategy.summary, latest = data.strategy.daily.at(-1), live = data.strategy_live
+ const estimating = live.mode === 'intraday' || live.mode === 'pending_close'
+ const complete = live.available && live.complete
+ const pnl = estimating ? (complete ? live.daily_pnl : null) : latest?.['每日盈亏']
+ const pnlLabel = estimating ? '今日实时盈亏' : live.mode === 'formal' && live.formal_date === live.valuation_date ? '今日正式盈亏' : '最近正式盈亏'
+ return <section className="panel strategy-summary"><div className="section-title"><h2>50万元择时策略</h2><span className={`badge ${estimating ? 'preview' : ''}`}>{live.mode === 'pending_close' ? '收盘待确认 / 实时估算' : estimating ? '盘中实时 · 不写缓存' : '正式收盘'}</span></div>
  <p className="muted">{String(s['开始日期'] || data.strategy_parameters['开始日期']).slice(0,10)} 起 · 数据截至 {String(s['正式数据截止日'] || '等待完整正式数据')}</p>
- <div className="asset"><span>策略资产（元）</span><strong>{fmt(s['策略资产'])}</strong></div>
- <div className="metrics"><div><span>累计收益</span><b className={sign(s['累计收益率(%)'])}>{signed(s['累计收益率(%)'], '%')}</b></div><div><span>当日盈亏</span><b className={sign(latest?.['每日盈亏'])}>{signed(latest?.['每日盈亏'])}</b></div><div><span>净值</span><b>{fmt(s['当前净值'], 4)}</b></div><div><span>当前仓位</span><b>{s['当前仓位比例(%)'] == null ? '—' : `${fmt(s['当前仓位比例(%)'])}%`}</b></div></div>
- <Notices messages={[...data.strategy.errors, ...data.strategy.warnings]}/>
+ <div className="asset"><span>{pnlLabel}（元）</span><strong className={sign(pnl)} data-testid="strategy-pnl">{signed(pnl)}</strong></div>
+ {estimating && <p className="section-note">正式仓位基准 {live.formal_date || '待数据'} · 持仓报价时间 {live.quote_time || '暂无'}<br/>按已有正式持仓估值，未执行今日预判买卖；正式净值保持不变。</p>}
+ {estimating && !complete && <p className="notice">实时估值数据不完整{live.missing_codes.length ? `，缺少持仓报价：${live.missing_codes.join('、')}` : '，等待有效正式持仓及报价'}。</p>}
+ {estimating && complete && <div className="live-assets"><span>盘中估算策略资产（元）</span><b>{fmt(live.estimated_assets)}</b></div>}
+ <div className="metrics"><div><span>最后正式策略资产</span><b>{fmt(s['策略资产'])}</b></div><div><span>正式累计收益</span><b className={sign(s['累计收益率(%)'])}>{signed(s['累计收益率(%)'], '%')}</b></div><div><span>正式净值</span><b>{fmt(s['当前净值'], 4)}</b></div><div><span>正式仓位</span><b>{s['当前仓位比例(%)'] == null ? '—' : `${fmt(s['当前仓位比例(%)'])}%`}</b></div></div>
+ <Notices messages={[...data.strategy.errors, ...data.strategy.warnings, ...live.warnings]}/>
  </section>
 }
-function EtfCard({ formal, preview, item, data }: { formal: Row; preview?: Row; item?: Instrument; data: Dashboard }) {
+function TradePreview({ data }: { data: Dashboard }) {
+ const preview = data.trade_preview
+ return <section className="section" data-testid="trade-preview"><div className="section-title"><h2>ETF盘中实时预判</h2><span className="badge preview">仅盘中预览 · 不记录成交</span></div><p className="section-note">预判日期 {preview.preview_date || '暂无'} · 行情时间 {preview.quote_time || '暂无'}</p><Notices messages={[...preview.errors,...preview.warnings]}/>{preview.actions.length ? <div className="record-grid">{preview.actions.map((row,i)=><RecordCard key={i} row={row} tradeAction/>)}</div> : <p className="empty">当前无盘中买卖预判</p>}</section>
+}
+function EtfCard({ formal, preview, item, data, action }: { formal: Row; preview?: Row; item?: Instrument; data: Dashboard; action?: Value }) {
  const code = String(formal['代码']), active = data.preview_codes.includes(code), shown = active && preview ? preview : formal
- return <article className="panel etf-card"><div className="card-heading"><div><span className="code">{code}</span><h3>{String(formal['ETF名称'])}</h3></div><span className="param">{code === '512890' ? '承接资产' : String(formal['策略参数'])}</span></div>
+ return <article data-code={code} className={`panel etf-card ${actionClass(action)}`}><div className="card-heading"><div><span className="code">{code}</span><h3>{String(formal['ETF名称'])}</h3></div><span className="param">{code === '512890' ? '承接资产' : String(formal['策略参数'])}</span></div>
+ {actionClass(action) && <p className={`trade-label ${actionTextClass(action)}`}>预判{String(action)}</p>}
  <div className="price"><strong>{fmt(shown['最新价'],4)}</strong><span className={sign(shown['当日涨跌幅(%)'])}>{signed(shown['当日涨跌幅(%)'], '%')}</span></div>
  <div className="signal"><span>正式状态 <b>{label(formal['择时判断'])}</b></span><span className={active ? 'preview' : 'muted'}>{active ? `预览 ${label(shown['择时判断'])}` : '无盘中预览'}</span></div>
  <div className="metrics mini"><div><span>{active ? '预览均线' : '对应均线'}</span><b>{fmt(shown['对应均线'],4)}</b></div><div><span>偏离率</span><b className={sign(shown['偏离率(%)'])}>{signed(shown['偏离率(%)'],'%')}</b></div><div><span>组合权重</span><b>{fmt(shown['组合权重比例'])}</b></div></div>
  <p className="muted small">正式日期 {data.formal_dates[code] || '无'}{active ? ` · 预览 ${data.quote_time || '无'}` : ''}</p>
  {data.missing_formal_codes.includes(code) && <p className="notice">正式数据未达到目标日 {data.expected_formal_date}；当前状态仅对应上述正式日期。</p>}
  {item?.error && <p className="notice">{item.error}</p>}
- <details><summary>区间表现与数据来源</summary><Fields row={formal} keys={['状态转换时间','区间涨幅(%)','上一状态转换时间','上一区间涨幅(%)','数据状态']}/><p className="muted small">{item?.source} · 缓存更新 {item?.cache_time || '无'}</p></details>
+ <div className="interval-metrics"><p className="section-note">区间表现与数据来源</p><Fields row={formal} keys={['状态转换时间','区间涨幅(%)','上一状态转换时间','上一区间涨幅(%)','数据状态']}/><p className="muted small">{item?.source} · 缓存更新 {item?.cache_time || '无'}</p></div>
  </article>
 }
 function Derivatives({ data }: { data: Dashboard }) {
@@ -65,18 +78,19 @@ function App() {
  },[])
  async function refresh(){setBusy(true);try{const r=await fetch('/api/refresh',{method:'POST',headers:{'X-Position-Client':'web'}});if(!r.ok)throw Error();setMessage((await r.json()).message)}catch{setMessage('刷新请求失败，请稍后重试')}finally{setBusy(false)}}
  const tabs=[{name:'概览',icon:LayoutDashboard},{name:'ETF',icon:Activity},{name:'策略',icon:Wallet},{name:'衍生品',icon:ArrowDownUp}]
+ const actionByCode = new Map(data?.trade_preview.actions.map(row=>[String(row['代码']),row['操作']]) || [])
  return <><header><div className="brand"><BarChart3 size={22}/><div><h1>持仓分析</h1><span>市场观察与择时模拟</span></div></div><Button variant="outline" onClick={refresh} disabled={busy || data?.refreshing}><RefreshCw size={15}/>{data?.refreshing ? '更新中' : '刷新'}</Button></header>
  <main><div className="page-intro"><span className="eyebrow">投资工作台 / {tab}</span><h2>{tab==='概览'?'今日观察':tab==='ETF'?'ETF 择时':tab==='策略'?'策略表现':'衍生品监控'}</h2></div>
  <Notices messages={[error,message]}/>
  {!data ? <div className="panel skeleton"><p>正在读取服务器已有缓存…</p><p className="muted">首次初始化可能需要数分钟；取得数据后会自动显示。</p></div> : <>
  <div className="status-strip"><div><span className="dot"/>{data.session} · 上海时间</div><span>正式缓存更新 {data.formal_updated_at || '暂无'}</span><span>实时报价 {data.quote_time || '暂无当日报价'}</span>{data.refreshing && <span role="status">{data.refresh_stage}</span>}</div>
  <Notices messages={[data.refresh_error, data.missing_quote_codes.length ? `当前刷新时段尚缺有效报价：${data.missing_quote_codes.join('、')}。对应标的保留正式状态。` : '']}/>
- {(tab==='概览'||tab==='策略')&&<StrategySummary data={data}/>}
- {tab==='概览'&&<><section className="section"><div className="section-title"><h2>近期操作指导</h2><span className="badge">正式收盘 · 近7天</span></div><p className="section-note">不含盘中预览。正式数据缺失时，不应将“暂无记录”理解为已确认无需操作。</p><Rows rows={data.guidance} empty="当前正式缓存暂无新的操作记录" limit={4}/></section><section className="section"><div className="section-title"><h2>ETF 观察池</h2><button className="text-button" onClick={()=>setTab('ETF')}>查看全部 {data.etf_formal.length} →</button></div><div className="card-grid">{data.etf_formal.slice(0,4).map(row=><EtfCard key={String(row['代码'])} formal={row} preview={data.etf_preview.find(p=>p['代码']===row['代码'])} item={data.items.find(i=>i.code===row['代码'])} data={data}/>)}</div></section></>}
- {tab==='ETF'&&<><label className="search"><Search size={18}/><input placeholder="搜索代码或基金名称" value={query} onChange={e=>setQuery(e.target.value)}/></label><p className="section-note">按正式均线偏离率排序。正式信号与实时预览分别显示；预览不产生正式操作记录。</p><div className="card-grid">{data.etf_formal.filter(r=>`${r['代码']}${r['ETF名称']}`.includes(query)).map(row=><EtfCard key={String(row['代码'])} formal={row} preview={data.etf_preview.find(p=>p['代码']===row['代码'])} item={data.items.find(i=>i.code===row['代码'])} data={data}/>)}</div></>}
- {tab==='策略'&&<><section className="panel"><h2>正式净值曲线</h2>{data.strategy.daily.length ? <Chart rows={data.strategy.daily}/> : <p className="empty">正式数据不足，暂不生成净值曲线</p>}<p className="section-note">初始资金 {fmt(data.strategy_parameters['初始资金'])} 元 · {String(data.strategy_parameters['开始日期']).slice(0,10)} 起 · 前复权正式收盘 · 同收盘成交 · {fmt(data.strategy_parameters['整手份数'],0)} 份整手 · 单边费率 {fmt(data.strategy_parameters['单边费率'],5)}。初始持有须先退出再买入，承接仓位按业务规则延迟激活。</p><details><summary>策略摘要与费用</summary><Fields row={data.strategy.summary}/></details></section><section className="section"><h2>模拟策略当前仓位</h2><p className="section-note">按正式收盘估值，与真实账户持仓无关。</p><Rows rows={data.strategy.positions} empty="暂无可确认的模拟持仓"/></section><section className="section"><h2>盘中交易预判</h2><span className="badge preview">仅预览 · 不记录成交</span><Notices messages={[...data.trade_preview.errors,...data.trade_preview.warnings]}/><Rows rows={data.trade_preview.actions} empty="暂无可用交易预判"/></section><section className="section"><h2>模拟交易记录</h2><Rows rows={[...data.strategy.trades].reverse()} empty="暂无模拟成交" limit={15}/></section><section className="section"><h2>每日收益与盈亏</h2><Rows rows={[...data.strategy.daily].reverse()} limit={10}/></section></>}
+ {tab==='策略'&&<StrategySummary data={data}/>}
+ {tab==='概览'&&<><TradePreview data={data}/><section className="section" data-testid="guidance"><div className="section-title"><h2>近期操作指引</h2><span className="badge">正式收盘 · 近7天</span></div><p className="section-note">不含盘中预览。正式数据缺失时，不应将“暂无记录”理解为已确认无需操作。</p><Rows rows={data.guidance} empty="当前正式缓存暂无新的操作记录" limit={4}/></section></>}
+ {tab==='ETF'&&<><label className="search"><Search size={18}/><input placeholder="搜索代码或基金名称" value={query} onChange={e=>setQuery(e.target.value)}/></label><p className="section-note">按正式均线偏离率排序。正式信号与实时预览分别显示；预览不产生正式操作记录。</p><div className="card-grid">{data.etf_formal.filter(r=>`${r['代码']}${r['ETF名称']}`.includes(query)).map(row=><EtfCard key={String(row['代码'])} formal={row} preview={data.etf_preview.find(p=>p['代码']===row['代码'])} item={data.items.find(i=>i.code===row['代码'])} data={data} action={actionByCode.get(String(row['代码']))}/>)}</div></>}
+ {tab==='策略'&&<><section className="panel"><h2>正式净值曲线</h2>{data.strategy.daily.length ? <Chart rows={data.strategy.daily}/> : <p className="empty">正式数据不足，暂不生成净值曲线</p>}<p className="section-note">初始资金 {fmt(data.strategy_parameters['初始资金'])} 元 · {String(data.strategy_parameters['开始日期']).slice(0,10)} 起 · 前复权正式收盘 · 同收盘成交 · {fmt(data.strategy_parameters['整手份数'],0)} 份整手 · 单边费率 {fmt(data.strategy_parameters['单边费率'],5)}。初始持有须先退出再买入，承接仓位按业务规则延迟激活。</p><h3>策略摘要与费用</h3><Fields row={data.strategy.summary}/></section><section className="section"><h2>模拟策略当前仓位</h2><p className="section-note">按正式收盘估值，与真实账户持仓无关。</p><Rows rows={data.strategy.positions} empty="暂无可确认的模拟持仓"/></section><TradePreview data={data}/><section className="section"><h2>模拟交易记录</h2><Rows rows={[...data.strategy.trades].reverse()} empty="暂无模拟成交" limit={15}/></section><section className="section"><h2>每日收益与盈亏</h2><Rows rows={[...data.strategy.daily].reverse()} limit={10}/></section></>}
  {tab==='衍生品'&&<Derivatives data={data}/>}
- {(tab==='概览'||tab==='ETF')&&<section className="section"><h2>指数择时参考</h2><p className="section-note">独立参考，不计入 ETF 权重或50万元模拟策略。</p><Notices messages={data.missing_index_codes.length ? [`指数正式数据尚缺目标日 ${data.expected_formal_date}：${data.missing_index_codes.join('、')}，请以各行日期为准。`] : []}/><Rows rows={data.index_formal}/>{data.index_preview.length>0&&<details><summary>查看指数实时预判</summary><Rows rows={data.index_preview}/></details>}</section>}
+ {(tab==='概览'||tab==='ETF')&&<section className="section"><h2>指数择时参考</h2><p className="section-note">独立参考，不计入 ETF 权重或50万元模拟策略。</p><Notices messages={data.missing_index_codes.length ? [`指数正式数据尚缺目标日 ${data.expected_formal_date}：${data.missing_index_codes.join('、')}，请以各行日期为准。`] : []}/><Rows rows={data.index_formal}/>{data.index_preview.length>0&&<div><h3>指数实时预判</h3><Rows rows={data.index_preview}/></div>}</section>}
  <footer>页面快照 {data.generated_at} · 正式目标日 {data.expected_formal_date}<br/>所有盘中预览仅保留在服务器内存中</footer>
  </>}
  </main><nav aria-label="主要导航">{tabs.map(({name,icon:Icon})=><button key={name} aria-current={tab===name?'page':undefined} onClick={()=>{setTab(name);window.scrollTo({top:0})}}><Icon size={20}/><span>{name}</span></button>)}</nav></>

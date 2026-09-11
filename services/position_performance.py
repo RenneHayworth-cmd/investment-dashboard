@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, time as datetime_time
+import math
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -15,7 +16,7 @@ from services.fund_rotation import (
     RotationInput,
     run_portfolio_timing_backtest,
 )
-from services.market_calendar import get_market_window, is_market_trading_day
+from services.market_calendar import get_market_window, is_market_trading_day, previous_trading_day
 from services.position_models import (
     ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES,
     ETF_DISPLAY_NAMES,
@@ -25,7 +26,7 @@ from services.position_models import (
     PositionItem,
     normalize_etf_base_code,
 )
-from services.position_sessions import filter_final_etf_rows, latest_final_etf_trade_date
+from services.position_sessions import filter_final_etf_rows, latest_final_etf_trade_date, etf_final_close_ready
 
 
 POSITION_TIMING_START_DATE = pd.Timestamp("2026-08-05")
@@ -54,6 +55,103 @@ class PositionTimingTradePreviewResult:
     quote_time: str = ""
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PositionTimingIntradayValuation:
+    mode: str = "unavailable"
+    available: bool = False
+    complete: bool = False
+    valuation_date: str = ""
+    formal_date: str = ""
+    quote_time: str = ""
+    missing_codes: list[str] = field(default_factory=list)
+    daily_pnl: float | None = None
+    estimated_assets: float | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def build_position_timing_intraday_valuation(
+    formal: PositionTimingPerformanceResult,
+    quotes: dict[str, dict[str, object]],
+    *,
+    market_now: datetime | None = None,
+) -> PositionTimingIntradayValuation:
+    """Mark the last completed strategy holdings to today's transient quotes.
+
+    Pure valuation: no trade preview, execution, fee, network, cache write or
+    mutation of formal results. The formal positions' latest price is their
+    valuation-date close, never quote.previous_close or position cost basis.
+    """
+    def number(raw: object) -> float:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    zone = ZoneInfo("Asia/Shanghai")
+    now = market_now or datetime.now(zone)
+    now = now.replace(tzinfo=zone) if now.tzinfo is None else now.astimezone(zone)
+    market = get_market_window("A股")
+    trading = market is not None and is_market_trading_day(market, now)
+    intraday = trading and now.time() >= market.sessions[0][0]
+    result = PositionTimingIntradayValuation(
+        valuation_date=now.date().isoformat(),
+        mode=("pending_close" if now.time() >= datetime_time(15, 0) else "intraday") if intraday else "unavailable",
+    )
+    if formal.errors or formal.daily.empty:
+        result.warnings.append("正式策略结果不完整，暂不能计算今日实时盈亏。")
+        return result
+    latest = formal.daily.iloc[-1]
+    stamp = pd.to_datetime(latest.get("日期"), errors="coerce")
+    assets = number(latest.get("账户资产"))
+    if pd.isna(stamp) or not math.isfinite(assets):
+        result.warnings.append("正式估值日期或账户资产无效。")
+        return result
+    result.formal_date = stamp.date().isoformat()
+    if stamp.date() == now.date() and etf_final_close_ready(now):
+        result.mode, result.complete = "formal", True
+        return result  # UI uses formal.daily; no competing live NAV/P&L.
+    if not intraday:
+        result.mode, result.complete = "formal", True
+        return result
+    expected = previous_trading_day(market, now.date())
+    if stamp.date() != expected:
+        result.warnings.append(f"正式持仓基准为 {result.formal_date}，尚未达到上一完整交易日 {expected}。")
+        return result
+
+    normalized = {normalize_etf_base_code(code): quote for code, quote in (quotes or {}).items()}
+    amounts, times = [], []
+    for row in formal.positions.to_dict(orient="records"):
+        code = normalize_etf_base_code(row.get("代码", ""))
+        quantity = number(row.get("持仓数量"))
+        close = number(row.get("最新价"))
+        if quantity == 0:
+            continue
+        quote = normalized.get(code, {})
+        price = number(quote.get("price"))
+        quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+        if pd.notna(quote_time):
+            quote_time = quote_time.tz_localize(zone) if quote_time.tzinfo is None else quote_time.tz_convert(zone)
+        if (not all(math.isfinite(float(v)) and float(v) > 0 for v in (quantity, close, price))
+                or pd.isna(quote_time) or quote_time.date() != now.date() or quote_time > now):
+            result.missing_codes.append(code)
+            continue
+        amounts.append(float(quantity) * (float(price) - float(close)))
+        times.append(quote_time)
+    # Use the oldest included quote as the completeness timestamp.
+    result.quote_time = min(times).strftime("%Y-%m-%d %H:%M:%S") if times else ""
+    if result.missing_codes:
+        result.missing_codes = sorted(set(result.missing_codes))
+        result.warnings.append("实时估值数据不完整，缺少有效持仓报价或正式价格：" + "、".join(result.missing_codes))
+        return result
+    if formal.positions.empty and number(latest.get("持仓市值", 0)) != 0:
+        result.warnings.append("正式持仓明细与持仓市值不一致，暂不估值。")
+        return result
+    result.available = result.complete = True
+    result.daily_pnl = round(math.fsum(amounts), 2)
+    result.estimated_assets = round(float(assets) + result.daily_pnl, 2)
+    return result
 
 
 POSITION_TIMING_TRADE_ACTION_COLUMNS = [
@@ -829,6 +927,8 @@ __all__ = [
     "POSITION_TIMING_TRADE_ACTION_COLUMNS",
     "PositionTimingPerformanceResult",
     "PositionTimingTradePreviewResult",
+    "PositionTimingIntradayValuation",
+    "build_position_timing_intraday_valuation",
     "build_position_timing_performance",
     "build_position_timing_trade_preview",
 ]
