@@ -13,14 +13,15 @@ const signed = (v: Value | undefined, suffix = '') => typeof v === 'number' ? `$
 const label = (v: Value | undefined) => v == null || v === '-' ? '待数据' : String(v)
 const actionClass = (action: Value | undefined) => action === '买入' ? 'action-buy' : action === '卖出' ? 'action-sell' : ''
 const actionTextClass = (action: Value | undefined) => action === '买入' ? 'up' : action === '卖出' ? 'down' : ''
+const recordAction = (row: Row) => row['操作'] ?? row['操作指引']
 const fieldDigits = (key: string) => /数量/.test(key) ? 0 : /价格|参考价|均线|收盘|成交价/.test(key) ? 3 : /净值/.test(key) ? 4 : 2
 function Notices({ messages }: { messages: string[] }) { return <>{messages.filter(Boolean).map((m, i) => <p key={i} className="notice" role="status">{m}</p>)}</> }
-function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], fieldDigits(k))}</dd></div>)}</dl> }
+function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' || k === '操作指引' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], fieldDigits(k))}</dd></div>)}</dl> }
 function RecordCard({ row, tradeAction = false }: { row: Row; tradeAction?: boolean }) {
  const priority = ['基金名称','ETF名称','标的名称','代码','日期','操作','择时判断','策略参数','最新收盘','持仓数量','持仓市值','账户权重(%)','当日盈亏','每日盈亏','每日收益率(%)','净值','成交价','成交金额']
  const shown = priority.filter(k => k in row)
  const remaining = Object.keys(row).filter(k=>!shown.includes(k))
- return <article data-code={String(row['代码'] || '')} className={`record ${tradeAction ? actionClass(row['操作']) : ''}`}><Fields row={row} keys={[...shown,...remaining]}/></article>
+ return <article data-code={String(row['代码'] || '')} className={`record ${tradeAction ? actionClass(recordAction(row)) : ''}`}><Fields row={row} keys={[...shown,...remaining]}/></article>
 }
 function Rows({ rows, empty = '暂无记录', limit = 30, actionCards = false }: { rows: Row[]; empty?: string; limit?: number; actionCards?: boolean }) {
  const [all, setAll] = useState(false)

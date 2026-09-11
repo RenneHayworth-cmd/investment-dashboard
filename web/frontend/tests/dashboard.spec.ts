@@ -18,6 +18,14 @@ test('部署首页和真实 API 可用', async ({ page, request }) => {
  await expect(page.getByRole('heading',{name:'持仓分析',exact:true})).toBeVisible()
  await expect(page.getByRole('heading',{name:'ETF盘中实时预判'})).toBeVisible({timeout:30000})
  await expect(page.getByRole('heading',{name:'50万元择时策略'})).toHaveCount(0)
+ // Validate the production response rendered on screen, not only fixtures.
+ const actualCards = page.getByTestId('guidance').locator('.record')
+ for (let i=0; i<await actualCards.count(); i++) {
+  const card = actualCards.nth(i)
+  const operation = card.locator('.fields > div').filter({has:page.locator('dt', {hasText:/^操作指引$/})}).locator('dd')
+  const action = await operation.innerText()
+  await expect(card).toHaveCSS('background-color',action==='买入'?'rgb(255, 240, 241)':action==='卖出'?'rgb(237, 248, 241)':'rgb(255, 255, 255)')
+ }
  await page.getByRole('button',{name:'ETF',exact:true}).click()
  await expect(page.getByPlaceholder('搜索代码或基金名称')).toBeVisible()
  await expect(page.getByText('159501',{exact:true})).toBeVisible()
@@ -61,11 +69,12 @@ test('fixture 完整数据四个视图、图表与窄屏', async ({ page }) => {
  expect(errors).toEqual([])
 })
 
-test('fixture 买卖卡只依据 action，指引仅操作文字着色', async ({ page }) => {
+test('fixture 买卖卡与真实指引字段的背景和文字着色', async ({ page }) => {
  const fixture=fixtureData()
  const codes = fixture.etf_formal.slice(0,3).map((row: Record<string,unknown>)=>row['代码'])
  fixture.trade_preview.actions = ['买入','卖出'].map((action,i)=>({操作:action,代码:codes[i],基金名称:`测试基金${i}`,数量:100,参考价:1.2345,预计金额:123.45,原因:'服务返回的实际持仓差额'}))
- fixture.guidance = structuredClone(fixture.trade_preview.actions)
+ // Formal guidance uses 操作指引, unlike preview's 操作.
+ fixture.guidance = fixture.trade_preview.actions.map(({操作, ...row}: Record<string, unknown>)=>({...row, 操作指引:操作}))
  await page.route('**/api/dashboard', route=>route.fulfill({json:fixture}))
  await page.goto('/')
  const preview=page.getByTestId('trade-preview'), guidance=page.getByTestId('guidance')
