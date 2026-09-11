@@ -244,6 +244,22 @@ def test_shared_runtime_reuses_quote_batch_and_lunch_success():
             runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear(); runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.update(old_state)
 
 
+def test_manual_refresh_forces_one_current_band_quote_batch():
+    with runtime._RUNTIME_ETF_QUOTE_CACHE_LOCK:
+        old_state = dict(runtime._RUNTIME_ETF_QUOTE_FETCH_STATE)
+        runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear()
+    try:
+        quotes = {'159501': {'symbol': '159501.SZ', 'price': 110., 'quote_time': NOW}}
+        with patch.object(runtime, 'fetch_tickflow_etf_quotes', return_value=quotes) as fetch:
+            runtime.refresh_runtime_etf_quotes(['159501'], api_key='test', market_now=NOW)
+            runtime.refresh_runtime_etf_quotes(['159501'], api_key='test', market_now=NOW.replace(second=30), force=True)
+            assert fetch.call_count == 2
+    finally:
+        with runtime._RUNTIME_ETF_QUOTE_CACHE_LOCK:
+            runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear()
+            runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.update(old_state)
+
+
 def test_initialization_is_503_not_fabricated_data():
     client = TestClient(create_app(Coordinator(), start_worker=False))
     assert client.get('/api/dashboard').status_code == 503

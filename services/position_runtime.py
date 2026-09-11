@@ -71,8 +71,13 @@ def refresh_runtime_etf_quotes(
     *,
     api_key: str,
     market_now: datetime | None = None,
+    force: bool = False,
 ) -> dict[str, dict[str, object]]:
-    """Refresh one process-wide ETF quote batch and reuse it across pages."""
+    """Refresh one process-wide ETF quote batch and reuse it across pages.
+
+    ``force`` is reserved for an explicit server-side refresh request. It
+    bypasses interval de-duplication only while the normal quote band is open.
+    """
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     requested_scope = {
         normalize_etf_base_code(code) for code in codes if str(code or "").strip()
@@ -117,7 +122,8 @@ def refresh_runtime_etf_quotes(
             or not scope_covered
             or pd.isna(last_attempt)
             or (
-                not lunch_already_succeeded
+            force
+            or not lunch_already_succeeded
                 and (market_now_naive - pd.Timestamp(last_attempt)).total_seconds()
                 >= refresh_seconds
             )

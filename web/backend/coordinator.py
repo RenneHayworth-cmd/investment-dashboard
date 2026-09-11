@@ -47,6 +47,7 @@ class Coordinator:
         self.source_errors = {}
         self.formal_errors = {}
         self.last_manual = float("-inf")
+        self.manual_refresh_requested = False
         self.refreshing = False
         self.error = ""
         self.stage = "读取本地缓存"
@@ -68,6 +69,7 @@ class Coordinator:
             if self.refreshing or monotonic() - self.last_manual < 30:
                 return False
             self.last_manual = monotonic()
+            self.manual_refresh_requested = True
             self.wake.set()
             return True
 
@@ -126,6 +128,9 @@ class Coordinator:
 
     def _cycle(self):
         now = self.clock()
+        with self.lock:
+            manual_refresh = self.manual_refresh_requested
+            self.manual_refresh_requested = False
         self.stage = "读取本地缓存"
         self._load_local(now)
         self._publish(now)
@@ -138,7 +143,12 @@ class Coordinator:
             self.stage = "刷新共享行情"
             before = runtime.load_runtime_etf_quote_state().get("last_attempt")
             try:
-                runtime.refresh_runtime_etf_quotes(models.DEFAULT_ETF_CODES, api_key=self.api_key, market_now=now)
+                runtime.refresh_runtime_etf_quotes(
+                    models.DEFAULT_ETF_CODES,
+                    api_key=self.api_key,
+                    market_now=now,
+                    force=manual_refresh,
+                )
             except Exception as exc:
                 self.source_errors["quotes"] = f"TickFlow实时行情：{redact(str(exc))}"
             else:
