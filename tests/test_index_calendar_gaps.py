@@ -66,6 +66,27 @@ def test_real_old_gap_still_blocks_hysteresis_preview():
     assert all('2023-01-10起共1个交易日' in status for status in rows['数据状态'])
 
 
+def test_only_microcap_approved_gaps_allow_preview_without_fabricated_rows():
+    history = history_since_2022()
+    gaps = pd.to_datetime(['2026-04-03','2026-04-07','2026-05-25','2026-07-01'])
+    history = history[~history.trade_date.isin(gaps)]
+    original = history.copy(deep=True)
+    rows = preview(history).set_index('代码')
+    assert rows.loc['BK1158','择时判断'] == '买入'
+    assert '暂忽略4个已知历史缺口' in rows.loc['BK1158','数据状态']
+    assert pd.isna(rows.loc['000905','择时判断'])
+    pd.testing.assert_frame_equal(history, original)
+    # An additional genuine missing session remains blocking.
+    history = history[history.trade_date != pd.Timestamp('2026-09-10')]
+    assert pd.isna(preview(history).set_index('代码').loc['BK1158','择时判断'])
+
+
+def test_insufficient_ma_rows_still_do_not_produce_preview_signal():
+    rows = preview(history_since_2022().tail(5))
+    assert rows['择时判断'].isna().all()
+    assert (rows['数据状态'] == '正式缓存不足').all()
+
+
 def test_unknown_calendar_year_is_not_reported_as_missing_trading_days():
     history = pd.concat([pd.DataFrame({'trade_date':[pd.Timestamp('2021-12-31')],'close':[100.]}),history_since_2022()])
     rows = preview(history)

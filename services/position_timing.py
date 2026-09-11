@@ -38,6 +38,12 @@ POSITION_INDEX_TIMING_STRATEGIES = {
     "中证500": {"code": "000905", "ma_period": 15, "threshold_pct": 1.0},
 }
 
+# User-approved temporary exception for BK1158 only. Never fabricate rows or
+# treat these dates as exchange holidays; remove after same-source backfill.
+POSITION_INDEX_ALLOWED_HISTORY_GAPS = {
+    "BK1158": frozenset({"2026-04-03", "2026-04-07", "2026-05-25", "2026-07-01"}),
+}
+
 POSITION_INDEX_TIMING_COLUMNS = [
     "指数名称",
     "代码",
@@ -250,8 +256,9 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
             and (etf_intraday_quote_ready(now) or etf_final_close_ready(now))
             and latest_formal_date < now.date()
         )
+        ignored_dates = []
         if preview:
-            # 滞回状态依赖完整历史，不只依赖最后一个 MA 窗口。
+            # Keep gap protection except the explicitly accepted BK1158 dates.
             market = get_market_window("A股")
             previous_session = previous_trading_day(market, now.date())
             uncovered = uncovered_calendar_years(market, timing_history["date"].min().date(), previous_session)
@@ -273,6 +280,9 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
                 for day in pd.bdate_range(timing_history["date"].min(), previous_session)
                 if day.date() not in observed_dates and not is_market_holiday(market, day.date())
             ]
+            allowed = POSITION_INDEX_ALLOWED_HISTORY_GAPS.get(str(strategy["code"]), frozenset())
+            ignored_dates = [day for day in missing_dates if day.isoformat() in allowed]
+            missing_dates = [day for day in missing_dates if day.isoformat() not in allowed]
             if missing_dates:
                 row.update({
                     "数据截止日": now.strftime("%Y-%m-%d"),
@@ -334,7 +344,7 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
                 ),
                 "数据状态": (
                     f"实时预判 {quote_time:%H:%M:%S}" if preview else "正式收盘缓存"
-                ),
+                ) + (f"；暂忽略{len(ignored_dates)}个已知历史缺口，按现有有效数据计算，待补齐" if ignored_dates else ""),
             }
         )
         rows.append(row)
