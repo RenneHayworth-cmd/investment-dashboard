@@ -131,6 +131,33 @@ test('fixture 空预判保持不确定语义并展示警告', async ({ page }) =
  await noOverflow(page)
 })
 
+test('fixture 逐标的盈亏手机单行及实时正式切换', async ({ page }) => {
+ const fixture=fixtureData()
+ fixture.strategy_live.by_symbol=[
+  {代码:'159501',基金名称:'纳指ETF嘉实很长的基金名称用于检查窄屏',当日盈亏:1234.56},
+  {代码:'510500',基金名称:'中证500ETF',当日盈亏:-78.9},
+  {代码:'512890',基金名称:'红利低波ETF',当日盈亏:null},
+ ]
+ await page.route('**/api/dashboard',route=>route.fulfill({json:fixture}))
+ await page.goto('/')
+ await page.getByRole('button',{name:'策略',exact:true}).click()
+ const card=page.getByTestId('symbol-pnl')
+ await expect(card.getByRole('heading',{name:'逐标的实时盈亏'})).toBeVisible()
+ await expect(card.locator('.pnl-row b').nth(0)).toHaveCSS('color','rgb(202, 58, 68)')
+ await expect(card.locator('.pnl-row b').nth(1)).toHaveCSS('color','rgb(24, 131, 102)')
+ await expect(card.locator('.pnl-row b').nth(2)).toHaveText('缺报价')
+ expect(await card.locator('.pnl-row').evaluateAll(nodes=>nodes.every(node=>{
+  const rects=Array.from(node.children).map(child=>child.getBoundingClientRect())
+  return Math.max(...rects.map(r=>r.top)) < Math.min(...rects.map(r=>r.bottom))
+ }))).toBe(true)
+ await noOverflow(page)
+ fixture.strategy_live.mode='formal'
+ fixture.strategy.daily_by_symbol=[{代码:'159501',基金名称:'纳指ETF嘉实',当日盈亏:99.}]
+ await expect(card.getByRole('heading',{name:'逐标的正式盈亏'})).toBeVisible({timeout:10000})
+ await expect(card.locator('.pnl-row b')).toHaveText('+99.00')
+ await noOverflow(page)
+})
+
 test('无鉴权入口被拒绝',async ({ baseURL })=>{
  const status=await new Promise<number|undefined>((resolve,reject)=>{
   https.get(`${baseURL}/api/dashboard`,{rejectUnauthorized:process.env.WEB_TEST_INSECURE_TLS !== '1'},response=>{response.resume();resolve(response.statusCode)}).on('error',reject)

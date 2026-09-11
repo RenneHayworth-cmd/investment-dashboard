@@ -133,6 +133,11 @@ NaN/NaT/pd.NA/Infinity转换为null，时间使用`YYYY-MM-DD HH:MM:SS`（上海
 
 `schema_version=2` 新增独立的 `strategy_live`，不改变 `strategy.daily`：
 
+策略摘要下方逐标的盈亏卡复用 `strategy_live.by_symbol`（盘中）与
+`strategy.daily_by_symbol`（正式）。盘中逐行缺报价显示缺失，不影响已有总额的
+完整性保护；正式明细复用原持仓盈亏算法，并包含当日已全部卖出的标的与其费用。
+手机按代码、名称、带正负号金额单行显示，长名称省略，盈利红色、亏损绿色。
+
 - `mode`：`intraday`（盘中）、`pending_close`（收盘待确认）、`formal`
   （显示正式 daily）或 `unavailable`。
 - `formal_date` 是正式持仓基准日，盘中必须为上一完整 A 股交易日；

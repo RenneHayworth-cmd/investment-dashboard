@@ -21,6 +21,7 @@ class Strategy(BaseModel):
     positions: list[dict[str, Any]] = Field(default_factory=list)
     trades: list[dict[str, Any]] = Field(default_factory=list)
     components: list[dict[str, Any]] = Field(default_factory=list)
+    daily_by_symbol: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
@@ -36,6 +37,7 @@ class StrategyLive(BaseModel):
     daily_pnl: float | None
     estimated_assets: float | None
     warnings: list[str]
+    by_symbol: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class Dashboard(BaseModel):

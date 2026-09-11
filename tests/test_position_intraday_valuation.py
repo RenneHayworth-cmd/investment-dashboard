@@ -44,6 +44,7 @@ def test_exact_formal_quantity_and_close_cash_unchanged_no_writes():
         result = value(base, live, market_now=NOW)
     assert result.available and result.complete
     assert result.daily_pnl == -300.  # 100*(11-10) + 200*(18-20)
+    assert [row['当日盈亏'] for row in result.by_symbol] == [100., -400.]
     assert result.estimated_assets == 499700.
     assert result.formal_date == '2026-08-07'
     assert result.quote_time == '2026-08-10 14:52:00'
@@ -67,6 +68,22 @@ def test_incomplete_prices_never_return_partial_pnl(bad):
     assert not result.complete and not result.available
     assert result.missing_codes == ['510500']
     assert result.daily_pnl is None and result.estimated_assets is None
+    assert result.by_symbol[0]['当日盈亏'] == 100.
+    assert result.by_symbol[1]['当日盈亏'] is None
+
+
+def test_closed_today_still_has_formal_pnl_including_sell_fee():
+    from services.position_performance import _build_current_positions
+    trades = pd.DataFrame([
+        {'日期':'2026-08-06','代码':'159501','交易标的':'159501','操作':'买入','份额':100,'成交金额':1000.,'手续费':1.},
+        {'日期':'2026-08-07','代码':'159501','交易标的':'159501','操作':'卖出','份额':100,'成交金额':1100.,'手续费':1.},
+    ])
+    histories = {'159501':pd.DataFrame({'trade_date':pd.to_datetime(['2026-08-06','2026-08-07']),'close':[10.,11.]})}
+    args = dict(valuation_date=pd.Timestamp('2026-08-07'),account_assets=500098.)
+    assert _build_current_positions(trades,histories,**args).empty
+    detail = _build_current_positions(trades,histories,include_closed_today=True,**args)
+    assert detail.iloc[0]['持仓数量'] == 0
+    assert detail.iloc[0]['当日盈亏'] == 99.
 
 
 @pytest.mark.parametrize('minute', [0, 4, 6, 30])

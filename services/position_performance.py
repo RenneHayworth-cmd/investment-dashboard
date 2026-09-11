@@ -45,6 +45,7 @@ class PositionTimingPerformanceResult:
     summary: dict[str, object] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    daily_by_symbol: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -69,6 +70,7 @@ class PositionTimingIntradayValuation:
     daily_pnl: float | None = None
     estimated_assets: float | None = None
     warnings: list[str] = field(default_factory=list)
+    by_symbol: list[dict[str, object]] = field(default_factory=list)
 
 
 def build_position_timing_intraday_valuation(
@@ -128,6 +130,9 @@ def build_position_timing_intraday_valuation(
         close = number(row.get("最新价"))
         if quantity == 0:
             continue
+        detail = {"代码": code, "基金名称": row.get("基金名称") or ETF_DISPLAY_NAMES.get(code, code),
+                  "当日盈亏": None, "数据状态": "缺报价"}
+        result.by_symbol.append(detail)
         quote = normalized.get(code, {})
         price = number(quote.get("price"))
         quote_time = pd.to_datetime(quote.get("quote_time"), errors="coerce")
@@ -138,6 +143,7 @@ def build_position_timing_intraday_valuation(
             result.missing_codes.append(code)
             continue
         amounts.append(float(quantity) * (float(price) - float(close)))
+        detail.update({"当日盈亏": round(amounts[-1], 2), "数据状态": "实时估算"})
         times.append(quote_time)
     # Use the oldest included quote as the completeness timestamp.
     result.quote_time = min(times).strftime("%Y-%m-%d %H:%M:%S") if times else ""
@@ -546,6 +552,7 @@ def _build_current_positions(
     *,
     valuation_date: pd.Timestamp,
     account_assets: float,
+    include_closed_today: bool = False,
 ) -> pd.DataFrame:
     """Rebuild current simulated holdings from each independent strategy sleeve."""
     if trades is None or trades.empty:
@@ -634,7 +641,12 @@ def _build_current_positions(
 
     rows: list[dict[str, object]] = []
     for symbol, state in aggregated.items():
-        if float(state["quantity"]) <= 0:
+        if float(state["quantity"]) <= 0 and not (
+            include_closed_today and (
+                float(prior_aggregated.get(symbol, {}).get("quantity", 0)) > 0
+                or symbol in valuation_buy_costs
+            )
+        ):
             continue
         history = histories.get(symbol, pd.DataFrame())
         history_dates = pd.to_datetime(
@@ -686,7 +698,7 @@ def _build_current_positions(
                 "基金名称": names.get(symbol, ETF_DISPLAY_NAMES.get(symbol, symbol)),
                 "代码": symbol,
                 "持仓数量": int(round(quantity)),
-                "成本价": cost_basis / quantity,
+                "成本价": cost_basis / quantity if quantity > 0 else 0.0,
                 "最新价": latest_price,
                 "持仓市值": market_value,
                 "当日盈亏": daily_pnl,
@@ -882,12 +894,17 @@ def build_position_timing_performance(
         )
     ) if not first_day_trades.empty else []
     latest = daily.iloc[-1]
-    positions = _build_current_positions(
+    position_details = _build_current_positions(
         trades,
         histories,
         valuation_date=pd.Timestamp(latest["日期"]).normalize(),
         account_assets=float(latest["账户资产"]),
+        include_closed_today=True,
     )
+    positions = position_details.loc[position_details["持仓数量"] > 0].reset_index(drop=True)
+    daily_by_symbol = position_details[["代码", "基金名称", "当日盈亏"]].copy()
+    if pd.Timestamp(latest["日期"]).normalize() == start:
+        daily_by_symbol["当日盈亏"] = 0.0  # Initial setup fees are disclosed separately.
     summary = {
         "开始日期": start.strftime("%Y-%m-%d"),
         "正式数据截止日": pd.Timestamp(latest["日期"]).strftime("%Y-%m-%d"),
@@ -913,6 +930,7 @@ def build_position_timing_performance(
         trades=trades,
         positions=positions,
         components=backtest.component_results.copy(),
+        daily_by_symbol=daily_by_symbol,
         summary=summary,
         warnings=warnings,
     )

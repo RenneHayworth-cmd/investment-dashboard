@@ -79,6 +79,7 @@ def test_strategy_http_parity(section, attribute):
     assert client.get('/api/strategy/' + section).json()['data'] == json_value(getattr(expected, attribute))
     assert expected.daily.iloc[0]['账户资产'] == 500_000
     assert expected.daily.iloc[0]['净值'] == 1
+    assert expected.daily_by_symbol['当日盈亏'].sum() == pytest.approx(expected.daily.iloc[-1]['每日盈亏'], abs=0.02)
 
 
 def test_preview_does_not_change_formal_guidance_or_strategy():

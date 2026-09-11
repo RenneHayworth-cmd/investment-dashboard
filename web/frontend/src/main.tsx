@@ -43,6 +43,13 @@ function StrategySummary({ data }: { data: Dashboard }) {
  <Notices messages={[...data.strategy.errors, ...data.strategy.warnings, ...live.warnings]}/>
  </section>
 }
+function SymbolPnl({ data }: { data: Dashboard }) {
+ const live = data.strategy_live, estimating = live.mode === 'intraday' || live.mode === 'pending_close'
+ const rows = (estimating ? live.by_symbol : data.strategy.daily_by_symbol) || []
+ return <section className="panel symbol-pnl" data-testid="symbol-pnl"><div className="section-title"><h2>逐标的{estimating ? '实时' : '正式'}盈亏</h2><span className={`badge ${estimating ? 'preview' : ''}`}>{live.mode === 'pending_close' ? '收盘待确认' : estimating ? '盘中估算' : '正式收盘'}</span></div><p className="muted small">{estimating ? live.quote_time || '等待报价' : live.formal_date || '等待正式数据'} · 元</p>
+ {rows.length ? <div className="pnl-list">{rows.map(row=><div className="pnl-row" key={String(row['代码'])}><span className="pnl-code">{String(row['代码'])}</span><span className="pnl-name" title={String(row['基金名称'])}>{String(row['基金名称'])}</span><b className={sign(row['当日盈亏'])}>{row['当日盈亏'] == null ? '缺报价' : signed(row['当日盈亏'])}</b></div>)}</div> : <p className="empty">{estimating && !live.complete ? '实时估值数据不足' : '暂无当日持仓盈亏'}</p>}
+ </section>
+}
 function TradePreview({ data }: { data: Dashboard }) {
  const preview = data.trade_preview
  return <section className="section" data-testid="trade-preview"><div className="section-title"><h2>ETF盘中实时预判</h2><span className="badge preview">仅盘中预览 · 不记录成交</span></div><p className="section-note">预判日期 {preview.preview_date || '暂无'} · 行情时间 {preview.quote_time || '暂无'}</p><Notices messages={[...preview.errors,...preview.warnings]}/>{preview.actions.length ? <div className="record-grid">{preview.actions.map((row,i)=><RecordCard key={i} row={row} tradeAction/>)}</div> : <p className="empty">当前无盘中买卖预判</p>}</section>
@@ -87,7 +94,7 @@ function App() {
  {!data ? <div className="panel skeleton"><p>正在读取服务器已有缓存…</p><p className="muted">首次初始化可能需要数分钟；取得数据后会自动显示。</p></div> : <>
  <div className="status-strip"><div><span className="dot"/>{data.session} · 上海时间</div><span>正式缓存更新 {data.formal_updated_at || '暂无'}</span><span>实时报价 {data.quote_time || '暂无当日报价'}</span>{data.refreshing && <span role="status">{data.refresh_stage}</span>}</div>
  <Notices messages={[data.refresh_error, data.missing_quote_codes.length ? `当前刷新时段尚缺有效报价：${data.missing_quote_codes.join('、')}。对应标的保留正式状态。` : '']}/>
- {tab==='策略'&&<StrategySummary data={data}/>}
+ {tab==='策略'&&<><StrategySummary data={data}/><SymbolPnl data={data}/></>}
  {tab==='概览'&&<><TradePreview data={data}/><section className="section" data-testid="guidance"><div className="section-title"><h2>近期操作指引</h2><span className="badge">正式收盘 · 近7天</span></div><p className="section-note">不含盘中预览。正式数据缺失时，不应将“暂无记录”理解为已确认无需操作。</p><Rows rows={data.guidance} actionCards empty="当前正式缓存暂无新的操作记录" limit={4}/></section></>}
  {tab==='ETF'&&<><label className="search"><Search size={18}/><input placeholder="搜索代码或基金名称" value={query} onChange={e=>setQuery(e.target.value)}/></label><p className="section-note">按正式均线偏离率排序。正式信号与实时预览分别显示；预览不产生正式操作记录。</p><div className="card-grid">{data.etf_formal.filter(r=>`${r['代码']}${r['ETF名称']}`.includes(query)).map(row=><EtfCard key={String(row['代码'])} formal={row} preview={data.etf_preview.find(p=>p['代码']===row['代码'])} item={data.items.find(i=>i.code===row['代码'])} data={data} action={actionByCode.get(String(row['代码']))}/>)}</div></>}
  {tab==='策略'&&<><section className="panel"><h2>正式净值曲线</h2>{data.strategy.daily.length ? <Chart rows={data.strategy.daily}/> : <p className="empty">正式数据不足，暂不生成净值曲线</p>}<p className="section-note">初始资金 {fmt(data.strategy_parameters['初始资金'])} 元 · {String(data.strategy_parameters['开始日期']).slice(0,10)} 起 · 前复权正式收盘 · 同收盘成交 · {fmt(data.strategy_parameters['整手份数'],0)} 份整手 · 单边费率 {fmt(data.strategy_parameters['单边费率'],5)}。初始持有须先退出再买入，承接仓位按业务规则延迟激活。</p><h3>策略摘要与费用</h3><Fields row={data.strategy.summary}/></section><section className="section"><h2>模拟策略当前仓位</h2><p className="section-note">按正式收盘估值，与真实账户持仓无关。</p><Rows rows={data.strategy.positions} empty="暂无可确认的模拟持仓"/></section><TradePreview data={data}/><section className="section"><h2>模拟交易记录</h2><Rows rows={[...data.strategy.trades].reverse()} empty="暂无模拟成交" limit={15}/></section><section className="section"><h2>每日收益与盈亏</h2><Rows rows={[...data.strategy.daily].reverse()} limit={10}/></section></>}
