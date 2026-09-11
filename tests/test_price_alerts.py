@@ -16,6 +16,8 @@ from services.price_alerts import (
 )
 
 
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+                           "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class PriceAlertTests(unittest.TestCase):
     @patch("services.price_alerts.subprocess.run")
     def test_hermes_weixin_message_uses_cli_home_channel(self, run_mock):

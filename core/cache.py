@@ -136,7 +136,7 @@ def save_dataset(
 
 
 def load_dataset(symbol: str, source: str, data_type: str, period: str = "1d"):
-    _expected_path, lock_path = _dataset_paths(symbol, source, period)
+    expected_path, lock_path = _dataset_paths(symbol, source, period)
     with _dataset_lock(lock_path, exclusive=False):
         with closing(get_conn()) as conn:
             row = conn.execute(
@@ -152,7 +152,11 @@ def load_dataset(symbol: str, source: str, data_type: str, period: str = "1d"):
             return None, None
 
         file_path, last_trade_date, last_update_time, status = row
-        if status != "success" or not Path(file_path).exists():
+        # Host and Docker share files under different absolute runtime roots.
+        # Resolve by the existing dataset identity without rewriting any data.
+        if not Path(file_path).is_file() and expected_path.is_file():
+            file_path = expected_path
+        if status != "success" or not Path(file_path).is_file():
             return None, {"last_trade_date": last_trade_date, "last_update_time": last_update_time}
 
         meta = {"last_trade_date": last_trade_date, "last_update_time": last_update_time}

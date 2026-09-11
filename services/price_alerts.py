@@ -10,6 +10,8 @@ import shutil
 import subprocess
 from typing import Callable
 
+from services.alert_delivery import channel_enabled, DeliveryRejected, DeliveryUncertain
+
 
 SERVERCHAN_SENDKEY_ENV = "SERVERCHAN_SENDKEY"
 SERVERCHAN_SENDKEY_FILE = Path.home() / ".config" / "investment_dashboard" / "serverchan_sendkey"
@@ -63,23 +65,30 @@ def send_serverchan_message(
     *,
     timeout: float = 10,
 ) -> dict:
+    if not channel_enabled("fangtang"):
+        return {"skipped": True, "reason": "方糖渠道已禁用"}
     import requests
 
     normalized_title = str(title).replace("\r", " ").replace("\n", " ").strip()
     if not normalized_title:
-        raise ValueError("Server酱消息标题不能为空。")
+        raise DeliveryRejected("Server酱消息标题不能为空。")
+    try:
+        endpoint = serverchan_endpoint(sendkey)
+    except ValueError:
+        raise DeliveryRejected("Server酱 SendKey 缺失或格式无效") from None
     response = requests.post(
-        serverchan_endpoint(sendkey),
+        endpoint,
         json={"title": normalized_title, "desp": str(description)},
         headers={"Content-Type": "application/json;charset=utf-8"},
         timeout=timeout,
     )
     response.raise_for_status()
     payload = response.json()
+    if not isinstance(payload, dict) or payload.get("code") is None:
+        raise DeliveryUncertain("Server酱未返回有效的送达确认")
     code = payload.get("code")
     if str(code) != "0":
-        message = str(payload.get("message") or payload.get("data") or "未知错误")
-        raise RuntimeError(f"Server酱推送失败：{message}")
+        raise DeliveryRejected("Server酱 API 明确拒绝发送")
     return payload
 
 
@@ -89,6 +98,8 @@ def send_hermes_weixin_message(
     *,
     timeout: float = 60,
 ) -> dict:
+    if not channel_enabled("wechat"):
+        return {"skipped": True, "reason": "微信渠道已禁用"}
     normalized_title = str(title).replace("\r", " ").replace("\n", " ").strip()
     if not normalized_title:
         raise ValueError("Hermes微信消息标题不能为空。")

@@ -13,3 +13,5 @@ web/frontend/dist/
 .pytest_cache/
 playwright-report/
 test-results/
+reminder-state/
+*.sqlite3

@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
-import fcntl
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import sys
@@ -22,8 +22,11 @@ if str(ROOT) not in sys.path:
 from services.fund_analysis import FUND_ADJUST_FORWARD_ADDITIVE  # noqa: E402
 from services.market_calendar import get_market_window, is_market_trading_day  # noqa: E402
 from services import position_analysis as position  # noqa: E402
+from services.alert_delivery import (  # noqa: E402
+    DeliveryLedger, DeliveryUncertain, DeliveryRejected, channel_enabled, enabled_channels,
+    event_key, fingerprint, flag, process_lock, state_dir,
+)
 from services.price_alerts import (  # noqa: E402
-    SERVERCHAN_SENDKEY_FILE,
     load_serverchan_sendkey,
     send_hermes_weixin_message,
     send_serverchan_message,
@@ -31,9 +34,9 @@ from services.price_alerts import (  # noqa: E402
 
 
 ALERT_SLOTS = ((9, 45), (11, 45), (14, 45), (14, 50), (14, 54))
-STATE_PATH = ROOT / "output" / "alerts" / "position_timing_trade_alert.json"
-LOCK_PATH = ROOT / "output" / "alerts" / "position_timing_trade_alert.lock"
-LOG_PATH = ROOT / "output" / "logs" / "position_timing_trade_alert.log"
+STATE_PATH = state_dir() / "position_timing_trade_alert.json"
+LOCK_PATH = state_dir() / "position_timing_trade_alert.lock"
+LOG_PATH = state_dir() / "position_timing_trade_alert.log"
 
 
 @dataclass
@@ -63,10 +66,14 @@ def parse_args() -> argparse.Namespace:
 
 def configure_logging() -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    class RedactedFormatter(logging.Formatter):
+        def format(self, record):
+            return safe_text(super().format(record))
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    handler.setFormatter(RedactedFormatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+        handlers=[handler],
     )
 
 
@@ -123,40 +130,52 @@ def send_notification_channels(
     description: str,
     *,
     already_sent: tuple[str, ...] = (),
+    keys: list[str] | None = None,
+    render=None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Send through both WeChat paths without one failure blocking the other."""
-    sent_channels: list[str] = list(already_sent)
+    """Only enabled channels; production ETF calls always supply event keys."""
+    labels = {"fangtang": "Server酱", "wechat": "Hermes微信"}
+    sent_channels = ([x for x in already_sent if x in
+                      {labels[c] for c in enabled_channels()}] if keys is None else [])
     errors: list[str] = []
 
-    if "Server酱" in sent_channels:
-        pass
-    elif sendkey:
+    for channel in enabled_channels():
+        label = labels[channel]
+        if label in sent_channels:
+            continue
+
+        def send(pending):
+            send_title, send_body = render(pending) if render else (title, description)
+            if channel == "fangtang":
+                if not sendkey:
+                    raise DeliveryRejected("SERVERCHAN_SENDKEY 未配置")
+                send_serverchan_message(sendkey, send_title, send_body)
+                return
+            delays = (35, 60, 60)
+            for attempt in range(len(delays) + 1):
+                try:
+                    send_hermes_weixin_message(send_title, send_body)
+                    return
+                except Exception as exc:
+                    if "rate limited" not in str(exc).lower() or attempt == len(delays):
+                        if "超时" in str(exc) or "timeout" in str(exc).lower():
+                            raise DeliveryUncertain("网络或发送超时") from None
+                        if "rate limited" in str(exc).lower():
+                            raise DeliveryRejected("微信接口限流") from None
+                        raise
+                    time.sleep(delays[attempt])
+
         try:
-            send_serverchan_message(sendkey, title, description)
-            sent_channels.append("Server酱")
+            if keys is None:
+                send([])
+            else:
+                status = DeliveryLedger().deliver(keys, channel, send)
+                logging.info("delivery channel=%s status=%s events=%s", channel, status, keys)
+            sent_channels.append(label)
         except Exception as exc:
-            errors.append(f"Server酱推送失败（{_delivery_error_kind(exc)}）")
-    else:
-        errors.append(f"Server酱未配置SendKey（{SERVERCHAN_SENDKEY_FILE}）")
+            errors.append(f"{label}推送失败（{_delivery_error_kind(exc)}）")
 
-    if "Hermes微信" not in sent_channels:
-        # Bound retries below the eight-minute task deadline. Do not retry
-        # ambiguous timeouts, which may hide an already delivered message.
-        delays = (35, 60, 60)
-        for attempt in range(len(delays) + 1):
-            try:
-                send_hermes_weixin_message(title, description)
-                sent_channels.append("Hermes微信")
-                break
-            except Exception as exc:
-                if "rate limited" not in str(exc).lower() or attempt == len(delays):
-                    errors.append(f"Hermes微信推送失败（{_delivery_error_kind(exc)}）")
-                    break
-                logging.warning("Hermes微信接口拒绝发送，等待%d秒后进行第%d次重试",
-                                delays[attempt], attempt + 1)
-                time.sleep(delays[attempt])
-
-    if not sent_channels:
+    if not sent_channels and errors:
         logging.error("notification_all_failed errors=%s", " | ".join(errors))
     return tuple(sent_channels), tuple(errors)
 
@@ -175,17 +194,8 @@ def _delivery_error_kind(exc: Exception) -> str:
 
 @contextmanager
 def single_instance_lock():
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with process_lock(LOCK_PATH) as acquired:
+        yield acquired
 
 
 def _load_formal_items(*, api_key: str, market_now: datetime):
@@ -207,7 +217,7 @@ def _load_formal_items(*, api_key: str, market_now: datetime):
         )
 
     item_by_code = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("REMINDER_FETCH_WORKERS", "4"))) as executor:
         futures = {executor.submit(load_one, code): code for code in required_codes}
         for future in as_completed(futures):
             code = futures[future]
@@ -286,24 +296,75 @@ def format_notification(preview, *, slot: str) -> tuple[str, str, str]:
     return title, description, "action"
 
 
+def notification_events(preview, *, slot: str, trade_date: str):
+    """Identify existing service results, without deriving any trading signal.
+
+    Prices/timestamps/slots do not create a new BUY/SELL event. A changed net
+    quantity is a revised instruction. Include all sleeve rules for parking.
+    """
+    rules = fingerprint({"timing": position.ETF_TIMING_STRATEGIES,
+                         "weights": position.ETF_PORTFOLIO_WEIGHTS_PCT,
+                         "position": position.ETF_POSITION_STRATEGIES,
+                         "parking_sources": position.ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES,
+                         "start": position.POSITION_TIMING_START_DATE,
+                         "capital": position.POSITION_TIMING_INITIAL_CAPITAL,
+                         "fee": position.POSITION_TIMING_TRANSACTION_COST,
+                         "lot": position.POSITION_TIMING_LOT_SIZE})
+    prefix = (trade_date, "ETF500K", "preview", preview.formal_date or "missing", rules)
+    if preview.errors:
+        return [event_key(*prefix, "error", slot, fingerprint(preview.errors))]
+    if preview.actions.empty:
+        # Retain the original 14:50 -> 14:54 no-action suppression per channel.
+        return [event_key(*prefix, "no_action", "14:50" if slot == "14:54" else slot)]
+    return [event_key(*prefix, row.代码, row.操作, int(row.数量))
+            for row in preview.actions.itertuples(index=False)]
+
+
+def render_pending(preview, keys, pending, slot):
+    if not preview.errors and not preview.actions.empty:
+        mask = [key in pending for key in keys]
+        preview = replace(preview, actions=preview.actions.loc[mask].copy())
+    title, body, _ = format_notification(preview, slot=slot)
+    return title, body
+
+
+def safe_text(value):
+    # Only categories/market text reach journal; never credential-bearing URLs.
+    import re
+    for name in ("TICKFLOW_API_KEY", "SERVERCHAN_SENDKEY"):
+        secret = os.environ.get(name, "")
+        if secret:
+            value = value.replace(secret, "[已隐藏]")
+    return re.sub(r"https?://\S+", "[数据源地址]", value)
+
+
 def main() -> int:
     args = parse_args()
+    args.dry_run = args.dry_run or flag("REMINDER_DRY_RUN")
+    if args.dry_run:
+        # Defence in depth, including --test-notification and direct senders.
+        os.environ["REMINDER_DRY_RUN"] = "true"
     configure_logging()
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    sendkey = load_serverchan_sendkey()
+    sendkey = load_serverchan_sendkey() if channel_enabled("fangtang") else ""
+    expected = {"Server酱" if c == "fangtang" else "Hermes微信" for c in enabled_channels()}
 
     if args.test_notification:
+        if args.dry_run or not expected:
+            print("试运行/渠道禁用：测试消息未发送。")
+            return 0
         sent_channels, delivery_errors = send_notification_channels(
             sendkey,
             "ETF均线策略交易提醒测试",
             (
-                "这是均线择时定时脚本发送的双通道测试消息。\n\n"
+                "这是均线择时定时脚本通过已启用渠道发送的测试消息。\n\n"
                 f"测试时间：{now:%Y-%m-%d %H:%M:%S}"
             ),
+            keys=[event_key(now.date(), "ETF500K", "test")],
         )
         if delivery_errors:
             logging.warning("notification_partial_failure errors=%s", " | ".join(delivery_errors))
-        fully_delivered = {"Server酱", "Hermes微信"}.issubset(sent_channels)
+        fully_delivered = expected.issubset(sent_channels)
         print(f"{'成功' if fully_delivered else '未全部送达'}：ETF均线策略测试通知（已发送：{'、'.join(sent_channels) or '无'}）。")
         if delivery_errors:
             print(f"警告：{'；'.join(delivery_errors)}")
@@ -320,17 +381,17 @@ def main() -> int:
         return 0
     slot = slot or now.strftime("%H:%M")
     trade_date = now.date().isoformat()
-    state = load_notification_state()
-    if state.trade_date != trade_date:
-        state = PositionTimingNotificationState(trade_date=trade_date)
-    if slot in state.notified_slots and not args.force:
-        print(f"跳过：{slot}通知已经发送。")
+    if not args.dry_run and not expected:
+        print("跳过：所有提醒渠道均已禁用。")
         return 0
     api_key = str(os.environ.get("TICKFLOW_API_KEY") or "").strip()
     with single_instance_lock() as acquired:
         if not acquired:
             print("跳过：上一轮ETF均线策略提醒尚未完成。")
             return 0
+        state = load_notification_state()
+        if state.trade_date != trade_date:
+            state = PositionTimingNotificationState(trade_date=trade_date)
 
         if not api_key:
             preview = position.PositionTimingTradePreviewResult(
@@ -348,6 +409,10 @@ def main() -> int:
                     api_key=api_key,
                     market_now=now,
                 )
+                if args.dry_run:
+                    print(f"行情检查：正式ETF项 {len(items)}，有效正式历史 "
+                          f"{sum(bool(i.formal_history_valid and i.dataframe is not None and not i.dataframe.empty) for i in items)}，"
+                          f"实时报价 {len(quotes)}；上海时间 {now:%Y-%m-%d %H:%M:%S}")
                 preview = position.build_position_timing_trade_preview(
                     items,
                     quotes,
@@ -360,25 +425,26 @@ def main() -> int:
                 )
 
         title, description, outcome = format_notification(preview, slot=slot)
+        title, description = safe_text(title), safe_text(description)
+        keys = notification_events(preview, slot=slot, trade_date=trade_date)
         if args.dry_run:
             print(f"试运行：{title}\n{description}")
-            return 0
-
-        if should_suppress_notification(state, outcome=outcome, slot=slot):
-            state.notified_slots = sorted(set(state.notified_slots + [slot]))
-            save_notification_state(state)
-            print(f"跳过：{slot}仍无需操作，已抑制重复通知。")
+            for channel in ("fangtang", "wechat"):
+                for key, status in DeliveryLedger().statuses(keys, channel).items():
+                    print(f"event={key}|{channel} ledger={status} dry_run=true")
+            logging.info("dry_run outcome=%s action_count=%d events=%s", outcome, len(preview.actions), keys)
             return 0
 
         sent_channels, delivery_errors = send_notification_channels(
             sendkey,
             title,
             description,
-            already_sent=tuple(state.delivered_channels.get(slot, [])),
+            keys=keys,
+            render=lambda pending: tuple(safe_text(v) for v in render_pending(preview, keys, pending, slot)),
         )
         state.delivered_channels[slot] = list(sent_channels)
         state.delivery_errors[slot] = list(delivery_errors)
-        fully_delivered = {"Server酱", "Hermes微信"}.issubset(sent_channels)
+        fully_delivered = expected.issubset(sent_channels)
         if fully_delivered:
             state.notified_slots = sorted(set(state.notified_slots + [slot]))
         if fully_delivered and outcome == "no_action" and slot == "14:50":

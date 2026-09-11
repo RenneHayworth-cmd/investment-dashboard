@@ -71,12 +71,11 @@ CSV 缓存写入使用同目录临时文件、文件锁和原子替换；SQLite 
 ## 铁矿石价格微信提醒
 
 `scripts/monitor_iron_ore_price.py` 独立监控铁矿石主连 `I0`。价格首次低于
-730元/吨时通过Server酱推送普通微信；价格持续低于阈值时不重复推送，回到
+730元/吨时通过Hermes推送微信（须明确 `ENABLE_WECHAT=true`）；不使用方糖，也不部署到 Lightsail。价格持续低于阈值时不重复推送，回到
 730元及以上后重新布防。脚本只在铁矿石交易时段联网，并将运行状态写入
 `output/alerts/`、日志写入 `output/logs/`。
 
-SendKey优先读取环境变量 `SERVERCHAN_SENDKEY`，也可保存到仅当前用户可读的
-`~/.config/investment_dashboard/serverchan_sendkey`。配置后可运行
+Hermes 使用现有 `hermes send` 通道。配置后可运行
 `scripts/install_iron_ore_price_alert_task.ps1`，创建每分钟检查一次的Windows计划任务；
 计划任务通过无窗口的 `wscript.exe` 包装器运行，非交易时段会自动跳过。
 
@@ -85,17 +84,19 @@ SendKey优先读取环境变量 `SERVERCHAN_SENDKEY`，也可保存到仅当前�
 `scripts/monitor_position_timing_trades.py` 以「持仓分析」中的固定50万元ETF均线策略为
 唯一持仓基准。A股交易日09:45、11:45、14:45、14:50、14:54分别读取上一正式
 交易日的策略持仓，批量获取当天TickFlow实时行情，在内存中预演当天信号，并将目标
-持仓相对正式持仓的净变化同时通过Server酱和Hermes微信发送；任一通道失败不会阻止
+持仓相对正式持仓的净变化通过明确开启的Server酱或Hermes微信渠道发送；任一通道失败不会阻止
 另一个通道发送，失败通道会记录到任务日志。11:45是在午间休市后发起请求，正常得到
 上午最后一笔、即11:30午间收盘附近的价格；通知保留数据源返回的实际行情时间，不把
 它标成11:45的新成交价。通知按先卖后买列出ETF名称、代码、100股整数手数量、参考
 价、预计金额和触发原因；同一ETF在不同策略袖套中的反向交易会先合并为净数量。盘中
 行情和预演结果都不写入正式日线或策略历史。
 
-前四个时点分别发送当时的判断。若14:50无需操作，14:54仍会静默获取实时行情并重新
+五个原定时点保持计算与检查。若14:50无需操作，14:54仍会静默获取实时行情并重新
 计算；仍无需操作时不重复通知，后续一旦出现交易信号就立即发送。存在交易时每个时点
-都会重新取价并发送当时的可执行数量。脚本仅在A股交易日和上述时刻工作，单实例锁和
-按时点状态文件会阻止重复运行。它复用 `SERVERCHAN_SENDKEY`，从
+都会重新取价；同一事件同一渠道已成功发送则不重发，净操作数量/方向变化作为新事件。
+脚本仅在A股交易日和上述时刻工作，跨平台单实例锁和 SQLite 事件/渠道账本防止重复发送。
+开关缺失时默认不发送，必须明确设置 `ENABLE_FANGTANG` / `ENABLE_WECHAT`。
+它复用 `SERVERCHAN_SENDKEY`，从
 `/home/renne/.local/bin/hermes` 调用已扫码连接的微信通道，并要求计划任务登录Shell可以
 读取 `TICKFLOW_API_KEY`。计划任务触发的 TickFlow 请求（正式缓存补齐及实时行情）采用 10 秒、0 次重试的快速失败策略，
 并在 WSL 内设置 8 分钟硬截止；Windows 任务执行上限为 10 分钟，避免网络异常时遗留进程
@@ -109,8 +110,11 @@ powershell -ExecutionPolicy Bypass -File scripts\install_position_timing_trade_a
 任务不要求Codex、Streamlit或Hermes界面保持打开；Windows当前用户需保持登录，且
 Hermes微信扫码连接需保持有效。电脑睡眠时任务设置会请求唤醒。运行状态保存在
 `output/alerts/position_timing_trade_alert.json`，
-日志保存在 `output/logs/position_timing_trade_alert.log` 和
+脚本日志保存在同一提醒状态目录的 `position_timing_trade_alert.log`，Windows 包装器日志在
 `output/logs/position_timing_trade_alert_task.log`。
+
+Lightsail ETF dry-run 部署、私有 EnvironmentFile、持久化账本和 Windows 后续渠道切换详见
+[ETF 提醒维护文档](deploy/REMINDERS.md)。当前迁移阶段服务器不真实发送，Windows 的生产配置待后续切换。
 
 ### Hermes微信交互网关常驻
 

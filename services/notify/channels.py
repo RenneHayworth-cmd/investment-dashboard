@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from services.notify.models import ChannelType, DeliveryResult, NotificationMessage, Priority
+from services.alert_delivery import channel_enabled
 
 logger = logging.getLogger("services.notify.channels")
 
@@ -46,7 +47,7 @@ class ServerChanChannel(BaseChannel):
         self._sendkey = sendkey or _read_config_file("serverchan_sendkey", "SERVERCHAN_SENDKEY")
 
     def is_configured(self) -> bool:
-        return bool(self._sendkey)
+        return channel_enabled("fangtang") and bool(self._sendkey)
 
     def _get_endpoint(self, sendkey: str) -> str:
         normalized = sendkey.strip()
@@ -57,6 +58,8 @@ class ServerChanChannel(BaseChannel):
         return f"https://sctapi.ftqq.com/{normalized}.send"
 
     def send(self, message: NotificationMessage, timeout: float = 10.0) -> DeliveryResult:
+        if not channel_enabled("fangtang"):
+            return DeliveryResult(self.channel_type.value, False, "方糖渠道已禁用")
         if not self.is_configured():
             return DeliveryResult(self.channel_type.value, False, "ServerChan SendKey 未配置")
         try:
@@ -82,8 +85,8 @@ class ServerChanChannel(BaseChannel):
             err_msg = str(payload.get("message") or payload.get("data") or "未知错误")
             return DeliveryResult(self.channel_type.value, False, f"ServerChan推送失败: {err_msg}", payload)
         except Exception as e:
-            logger.warning("ServerChan send failed: %s", e)
-            return DeliveryResult(self.channel_type.value, False, f"网络请求异常: {e}")
+            logger.warning("ServerChan send failed: %s", type(e).__name__)
+            return DeliveryResult(self.channel_type.value, False, f"网络请求异常: {type(e).__name__}")
 
 
 class NtfyBridgeChannel(BaseChannel):
@@ -138,7 +141,7 @@ class PushPlusChannel(BaseChannel):
         self._token = token or _read_config_file("pushplus_token", "PUSHPLUS_TOKEN")
 
     def is_configured(self) -> bool:
-        return bool(self._token)
+        return channel_enabled("wechat") and bool(self._token)
 
     def send(self, message: NotificationMessage, timeout: float = 10.0) -> DeliveryResult:
         if not self.is_configured():
@@ -168,7 +171,7 @@ class WeComChannel(BaseChannel):
         self._webhook = webhook_url or _read_config_file("wecom_webhook", "WECOM_WEBHOOK")
 
     def is_configured(self) -> bool:
-        return bool(self._webhook)
+        return channel_enabled("wechat") and bool(self._webhook)
 
     def send(self, message: NotificationMessage, timeout: float = 10.0) -> DeliveryResult:
         if not self.is_configured():

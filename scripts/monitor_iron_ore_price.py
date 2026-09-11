@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 import logging
 from pathlib import Path
 import sys
@@ -25,6 +24,7 @@ from services.price_alerts import (  # noqa: E402
     process_price_alert,
     send_hermes_weixin_message,
 )
+from services.alert_delivery import channel_enabled, flag, process_lock  # noqa: E402
 
 
 INDEX_NAME = "铁矿石主连"
@@ -56,17 +56,8 @@ def configure_logging() -> None:
 
 @contextmanager
 def single_instance_lock():
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with process_lock(LOCK_PATH) as acquired:
+        yield acquired
 
 
 def resolve_contract(quote: dict[str, object], now: datetime) -> str:
@@ -83,15 +74,23 @@ def resolve_contract(quote: dict[str, object], now: datetime) -> str:
 
 def main() -> int:
     args = parse_args()
+    args.dry_run = args.dry_run or flag("REMINDER_DRY_RUN")
     configure_logging()
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
 
     if args.test_notification:
+        if args.dry_run or not channel_enabled("wechat"):
+            print("试运行/微信禁用：测试消息未发送。")
+            return 0
         send_hermes_weixin_message(
             "铁矿石价格监控测试",
             f"Hermes微信通知通道配置成功。\n\n测试时间：{now:%Y-%m-%d %H:%M:%S}",
         )
         print("成功：Hermes微信测试通知已发送。")
+        return 0
+
+    if not args.dry_run and not channel_enabled("wechat"):
+        print("跳过：微信提醒已禁用；未改变价格告警状态。")
         return 0
 
     if not args.force and args.test_price is None and not _futures_market_is_open(SYMBOL, now=now):

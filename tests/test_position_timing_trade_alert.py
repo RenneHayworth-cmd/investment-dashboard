@@ -25,6 +25,8 @@ from services import position_performance
 from scripts import monitor_position_timing_trades as monitor
 
 
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+                           "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class PositionTimingTradeAlertTests(unittest.TestCase):
     def setUp(self):
         self.market_now = datetime(2026, 8, 28, 14, 50, tzinfo=ZoneInfo("Asia/Shanghai"))

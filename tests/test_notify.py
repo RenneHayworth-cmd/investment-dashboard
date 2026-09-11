@@ -61,6 +61,8 @@ class NotificationModelTests(unittest.TestCase):
         self.assertEqual(d["actions"][0]["action"], "view")
 
 
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+                           "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class ChannelTests(unittest.TestCase):
     @patch("requests.post")
     def test_serverchan_channel(self, post_mock):
@@ -165,6 +167,9 @@ class NotifyEngineTests(unittest.TestCase):
 
             engine.register_channel(ChannelType.SERVERCHAN, mock_serverchan)
             engine.register_channel(ChannelType.NTFY, mock_ntfy)
+            mock_toast = Mock()
+            mock_toast.send.return_value = DeliveryResult("windows_toast", True, "ok")
+            engine.register_channel(ChannelType.WINDOWS_TOAST, mock_toast)
 
             results = engine.send(
                 title="铁矿石破位",
