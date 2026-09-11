@@ -152,7 +152,7 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
         self.assertTrue(result.actions.empty)
 
     def test_notification_slots_and_state_round_trip(self):
-        expected_slots = ("09:45", "11:45", "14:45", "14:50", "14:54")
+        expected_slots = ("09:45", "11:45", "13:45", "14:50", "14:54")
         for slot in expected_slots:
             hour, minute = (int(value) for value in slot.split(":"))
             self.assertEqual(

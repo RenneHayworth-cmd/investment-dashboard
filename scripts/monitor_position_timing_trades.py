@@ -24,7 +24,7 @@ from services.market_calendar import get_market_window, is_market_trading_day  #
 from services import position_analysis as position  # noqa: E402
 from services.alert_delivery import (  # noqa: E402
     DeliveryLedger, DeliveryUncertain, DeliveryRejected, channel_enabled, enabled_channels,
-    event_key, fingerprint, flag, process_lock, state_dir,
+    event_key, flag, process_lock, state_dir,
 )
 from services.price_alerts import (  # noqa: E402
     load_serverchan_sendkey,
@@ -33,7 +33,7 @@ from services.price_alerts import (  # noqa: E402
 )
 
 
-ALERT_SLOTS = ((9, 45), (11, 45), (14, 45), (14, 50), (14, 54))
+ALERT_SLOTS = ((9, 45), (11, 45), (13, 45), (14, 50), (14, 54))
 STATE_PATH = state_dir() / "position_timing_trade_alert.json"
 LOCK_PATH = state_dir() / "position_timing_trade_alert.lock"
 LOG_PATH = state_dir() / "position_timing_trade_alert.log"
@@ -296,34 +296,12 @@ def format_notification(preview, *, slot: str) -> tuple[str, str, str]:
     return title, description, "action"
 
 
-def notification_events(preview, *, slot: str, trade_date: str):
-    """Identify existing service results, without deriving any trading signal.
-
-    Prices/timestamps/slots do not create a new BUY/SELL event. A changed net
-    quantity is a revised instruction. Include all sleeve rules for parking.
-    """
-    rules = fingerprint({"timing": position.ETF_TIMING_STRATEGIES,
-                         "weights": position.ETF_PORTFOLIO_WEIGHTS_PCT,
-                         "position": position.ETF_POSITION_STRATEGIES,
-                         "parking_sources": position.ETF_512890_ACTIVE_TRANSFER_SOURCE_CODES,
-                         "start": position.POSITION_TIMING_START_DATE,
-                         "capital": position.POSITION_TIMING_INITIAL_CAPITAL,
-                         "fee": position.POSITION_TIMING_TRANSACTION_COST,
-                         "lot": position.POSITION_TIMING_LOT_SIZE})
-    prefix = (trade_date, "ETF500K", "preview", preview.formal_date or "missing", rules)
-    if preview.errors:
-        return [event_key(*prefix, "error", slot, fingerprint(preview.errors))]
-    if preview.actions.empty:
-        # Retain the original 14:50 -> 14:54 no-action suppression per channel.
-        return [event_key(*prefix, "no_action", "14:50" if slot == "14:54" else slot)]
-    return [event_key(*prefix, row.代码, row.操作, int(row.数量))
-            for row in preview.actions.itertuples(index=False)]
+def notification_events(preview, *, slot: str, trade_date: str) -> list[str]:
+    """Return slot-level event key so each scheduled time sends its current operations."""
+    return [event_key(trade_date, "ETF500K", slot)]
 
 
 def render_pending(preview, keys, pending, slot):
-    if not preview.errors and not preview.actions.empty:
-        mask = [key in pending for key in keys]
-        preview = replace(preview, actions=preview.actions.loc[mask].copy())
     title, body, _ = format_notification(preview, slot=slot)
     return title, body
 
@@ -377,7 +355,7 @@ def main() -> int:
 
     slot = alert_slot(now)
     if slot is None and not args.force:
-        print("跳过：当前不在09:45、11:45、14:45、14:50、14:54通知时刻。")
+        print("跳过：当前不在09:45、11:45、13:45、14:50、14:54通知时刻。")
         return 0
     slot = slot or now.strftime("%H:%M")
     trade_date = now.date().isoformat()
@@ -392,6 +370,9 @@ def main() -> int:
         state = load_notification_state()
         if state.trade_date != trade_date:
             state = PositionTimingNotificationState(trade_date=trade_date)
+        if slot in state.notified_slots and not args.force:
+            print(f"跳过：{slot}通知已经发送。")
+            return 0
 
         if not api_key:
             preview = position.PositionTimingTradePreviewResult(
@@ -426,6 +407,11 @@ def main() -> int:
 
         title, description, outcome = format_notification(preview, slot=slot)
         title, description = safe_text(title), safe_text(description)
+        if should_suppress_notification(state, outcome=outcome, slot=slot) and not args.force:
+            state.notified_slots = sorted(set(state.notified_slots + [slot]))
+            save_notification_state(state)
+            print(f"跳过：{slot}仍无需操作，已抑制重复通知。")
+            return 0
         keys = notification_events(preview, slot=slot, trade_date=trade_date)
         if args.dry_run:
             print(f"试运行：{title}\n{description}")
