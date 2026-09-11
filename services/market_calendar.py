@@ -72,9 +72,33 @@ def _date_set(*values: str) -> set[date]:
     return {date.fromisoformat(value) for value in values}
 
 
-# Published 2026 cash-market closures. Weekends are handled separately.
+# Published cash-market closures. Weekends are handled separately.
+# A-share historical sources (SSE annual notices):
+# https://www.sse.com.cn/disclosure/announcement/general/c/c_20211220_5662606.shtml
+# https://www.sse.com.cn/disclosure/announcement/general/c/c_20221227_5714458.shtml
+# https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20231226_5733941.shtml
+# https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20241223_10767110.shtml
 STATIC_MARKET_HOLIDAYS = {
     "A股": _date_set(
+        "2022-01-03",
+        "2022-01-31", "2022-02-01", "2022-02-02", "2022-02-03", "2022-02-04",
+        "2022-04-04", "2022-04-05", "2022-05-02", "2022-05-03", "2022-05-04",
+        "2022-06-03", "2022-09-12",
+        "2022-10-03", "2022-10-04", "2022-10-05", "2022-10-06", "2022-10-07",
+        "2023-01-02",
+        "2023-01-23", "2023-01-24", "2023-01-25", "2023-01-26", "2023-01-27",
+        "2023-04-05", "2023-05-01", "2023-05-02", "2023-05-03",
+        "2023-06-22", "2023-06-23", "2023-09-29",
+        "2023-10-02", "2023-10-03", "2023-10-04", "2023-10-05", "2023-10-06",
+        "2024-01-01",
+        "2024-02-09", "2024-02-12", "2024-02-13", "2024-02-14", "2024-02-15", "2024-02-16",
+        "2024-04-04", "2024-04-05", "2024-05-01", "2024-05-02", "2024-05-03",
+        "2024-06-10", "2024-09-16", "2024-09-17",
+        "2024-10-01", "2024-10-02", "2024-10-03", "2024-10-04", "2024-10-07",
+        "2025-01-01",
+        "2025-01-28", "2025-01-29", "2025-01-30", "2025-01-31", "2025-02-03", "2025-02-04",
+        "2025-04-04", "2025-05-01", "2025-05-02", "2025-05-05", "2025-06-02",
+        "2025-10-01", "2025-10-02", "2025-10-03", "2025-10-06", "2025-10-07", "2025-10-08",
         "2026-01-01", "2026-01-02",
         "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-23",
         "2026-04-06",
@@ -227,7 +251,7 @@ def _get_exchange_calendar(calendar_name: str):
 @lru_cache(maxsize=None)
 def _warn_static_calendar_coverage(market_name: str, year: int) -> None:
     covered_years = sorted({day.year for day in STATIC_MARKET_HOLIDAYS.get(market_name, set())})
-    if not covered_years or year <= max(covered_years):
+    if not covered_years or year in covered_years:
         return
     coverage = "、".join(str(value) for value in covered_years)
     logger.warning(
@@ -240,6 +264,25 @@ def _warn_static_calendar_coverage(market_name: str, year: int) -> None:
 
 def get_market_window(name: str) -> MarketWindow | None:
     return next((market for market in MARKET_WINDOWS if market.name == name), None)
+
+
+def uncovered_calendar_years(market: MarketWindow, start: date, end: date) -> list[int]:
+    """Years whose holiday coverage cannot support a historical gap assertion."""
+    static_years = {day.year for day in STATIC_MARKET_HOLIDAYS.get(market.name, set())}
+    calendar = _get_exchange_calendar(market.calendar_name) if market.calendar_name else None
+    missing = []
+    for year in range(start.year, end.year + 1):
+        if market.name == "美股" or year in static_years:
+            continue
+        if calendar is not None:
+            try:
+                calendar.is_session(pd.Timestamp(max(start, date(year, 1, 1))))
+                calendar.is_session(pd.Timestamp(min(end, date(year, 12, 31))))
+                continue
+            except Exception:
+                pass
+        missing.append(year)
+    return missing
 
 
 def is_market_holiday(market: MarketWindow, day: date) -> bool:

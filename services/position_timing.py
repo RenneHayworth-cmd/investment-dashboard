@@ -192,7 +192,7 @@ def _load_position_index_timing_history(index_name: str) -> pd.DataFrame | None:
 def build_position_index_timing_table(*, realtime_quotes: dict | None = None, market_now: datetime | None = None) -> pd.DataFrame:
     """基于正式历史和可选的当日报价计算指数择时，报价仅参与本次预判。"""
     from services.position_sessions import etf_intraday_quote_ready, etf_final_close_ready
-    from services.market_calendar import get_market_window, is_market_holiday, previous_trading_day
+    from services.market_calendar import get_market_window, is_market_holiday, previous_trading_day, uncovered_calendar_years
 
     now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     rows: list[dict[str, object]] = []
@@ -254,6 +254,19 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
             # 滞回状态依赖完整历史，不只依赖最后一个 MA 窗口。
             market = get_market_window("A股")
             previous_session = previous_trading_day(market, now.date())
+            uncovered = uncovered_calendar_years(market, timing_history["date"].min().date(), previous_session)
+            if uncovered:
+                row.update({
+                    "数据截止日": now.strftime("%Y-%m-%d"),
+                    "最新收盘": float(price),
+                    "数据状态": (
+                        f"实时报价 {quote_time:%H:%M:%S}；交易日历未覆盖"
+                        + "、".join(map(str, uncovered))
+                        + "年，无法核验正式历史完整性；暂停择时预判"
+                    ),
+                })
+                rows.append(row)
+                continue
             observed_dates = set(timing_history["date"].dt.date)
             missing_dates = [
                 day.date()

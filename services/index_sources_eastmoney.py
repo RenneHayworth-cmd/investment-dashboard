@@ -380,14 +380,17 @@ def get_index_data_from_eastmoney_kline(
         board_symbol=akshare_board_symbol,
         hk_em_symbol=akshare_hk_em_symbol,
     )
-    df = _supplement_hk_independent_rows(
-        df,
-        sina_hk_symbol=sina_hk_symbol,
-        hsi_official_series=hsi_official_series,
-        mx_query_name=mx_query_name,
-        mx_expected_code=mx_expected_code,
-        days=days,
-    )
+    # This helper filters Hong Kong closed dates. Never apply it to mainland
+    # boards such as BK1158, which trade on Hong Kong-only holidays.
+    if akshare_hk_em_symbol or sina_hk_symbol or hsi_official_series or (mx_query_name and mx_expected_code):
+        df = _supplement_hk_independent_rows(
+            df,
+            sina_hk_symbol=sina_hk_symbol,
+            hsi_official_series=hsi_official_series,
+            mx_query_name=mx_query_name,
+            mx_expected_code=mx_expected_code,
+            days=days,
+        )
     return build_export_df(df, index_name, days=days)
 
 
