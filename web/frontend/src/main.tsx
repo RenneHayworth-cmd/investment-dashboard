@@ -13,8 +13,9 @@ const signed = (v: Value | undefined, suffix = '') => typeof v === 'number' ? `$
 const label = (v: Value | undefined) => v == null || v === '-' ? '待数据' : String(v)
 const actionClass = (action: Value | undefined) => action === '买入' ? 'action-buy' : action === '卖出' ? 'action-sell' : ''
 const actionTextClass = (action: Value | undefined) => action === '买入' ? 'up' : action === '卖出' ? 'down' : ''
+const fieldDigits = (key: string) => /数量/.test(key) ? 0 : /价格|参考价|均线|收盘|成交价/.test(key) ? 3 : /净值/.test(key) ? 4 : 2
 function Notices({ messages }: { messages: string[] }) { return <>{messages.filter(Boolean).map((m, i) => <p key={i} className="notice" role="status">{m}</p>)}</> }
-function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], /数量/.test(k) ? 0 : /净值|价格|参考价|均线/.test(k) ? 4 : 2)}</dd></div>)}</dl> }
+function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], fieldDigits(k))}</dd></div>)}</dl> }
 function RecordCard({ row, tradeAction = false }: { row: Row; tradeAction?: boolean }) {
  const priority = ['基金名称','ETF名称','标的名称','代码','日期','操作','择时判断','策略参数','最新收盘','持仓数量','持仓市值','账户权重(%)','当日盈亏','每日盈亏','每日收益率(%)','净值','成交价','成交金额']
  const shown = priority.filter(k => k in row)
@@ -49,9 +50,9 @@ function EtfCard({ formal, preview, item, data, action }: { formal: Row; preview
  const code = String(formal['代码']), active = data.preview_codes.includes(code), shown = active && preview ? preview : formal
  return <article data-code={code} className={`panel etf-card ${actionClass(action)}`}><div className="card-heading"><div><span className="code">{code}</span><h3>{String(formal['ETF名称'])}</h3></div><span className="param">{code === '512890' ? '承接资产' : String(formal['策略参数'])}</span></div>
  {actionClass(action) && <p className={`trade-label ${actionTextClass(action)}`}>预判{String(action)}</p>}
- <div className="price"><strong>{fmt(shown['最新价'],4)}</strong><span className={sign(shown['当日涨跌幅(%)'])}>{signed(shown['当日涨跌幅(%)'], '%')}</span></div>
+ <div className="price"><strong>{fmt(shown['最新价'],3)}</strong><span className={sign(shown['当日涨跌幅(%)'])}>{signed(shown['当日涨跌幅(%)'], '%')}</span></div>
  <div className="signal"><span>正式状态 <b>{label(formal['择时判断'])}</b></span><span className={active ? 'preview' : 'muted'}>{active ? `预览 ${label(shown['择时判断'])}` : '无盘中预览'}</span></div>
- <div className="metrics mini"><div><span>{active ? '预览均线' : '对应均线'}</span><b>{fmt(shown['对应均线'],4)}</b></div><div><span>偏离率</span><b className={sign(shown['偏离率(%)'])}>{signed(shown['偏离率(%)'],'%')}</b></div><div><span>组合权重</span><b>{fmt(shown['组合权重比例'])}</b></div></div>
+ <div className="metrics mini"><div><span>{active ? '预览均线' : '对应均线'}</span><b>{fmt(shown['对应均线'],3)}</b></div><div><span>偏离率</span><b className={sign(shown['偏离率(%)'])}>{signed(shown['偏离率(%)'],'%')}</b></div><div><span>组合权重</span><b>{fmt(shown['组合权重比例'])}</b></div></div>
  <p className="muted small">正式日期 {data.formal_dates[code] || '无'}{active ? ` · 预览 ${data.quote_time || '无'}` : ''}</p>
  {data.missing_formal_codes.includes(code) && <p className="notice">正式数据未达到目标日 {data.expected_formal_date}；当前状态仅对应上述正式日期。</p>}
  {item?.error && <p className="notice">{item.error}</p>}
