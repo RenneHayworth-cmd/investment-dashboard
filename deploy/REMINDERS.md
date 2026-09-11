@@ -71,7 +71,7 @@ ETF 动作键：交易日 | ETF500K | preview | 正式持仓基准日 | 策略�
 实际安装入口：`bash deploy/install-etf-reminder.sh`。初次只创建禁用发送的 dry-run 配置；
 再次安装保留私有配置。服务不依赖 Docker 重建，使用仓库 `.venv`。
 
-`position-etf-reminder.timer` 每天上海时间 09:45、11:45、14:45、14:50、14:54 触发。
+`position-etf-reminder.timer` 每天上海时间 09:45、11:45、13:45、14:50、14:54 触发。
 Python 仍调用原交易日判断，节假日跳过；不补跑停机期间错过的盘中时点。
 宿主机可保持 UTC，timer 的 OnCalendar 和 Python 均明确 Asia/Shanghai。
 `position-etf-reminder.service` 为 oneshot，结束退出，不常驻；CPU 上限半个核，

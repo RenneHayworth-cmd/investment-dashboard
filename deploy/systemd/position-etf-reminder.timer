@@ -4,7 +4,7 @@ Description=ETF original five daily notification slots (Asia/Shanghai)
 [Timer]
 OnCalendar=*-*-* 09:45:00 Asia/Shanghai
 OnCalendar=*-*-* 11:45:00 Asia/Shanghai
-OnCalendar=*-*-* 14:45:00 Asia/Shanghai
+OnCalendar=*-*-* 13:45:00 Asia/Shanghai
 OnCalendar=*-*-* 14:50:00 Asia/Shanghai
 OnCalendar=*-*-* 14:54:00 Asia/Shanghai
 AccuracySec=1s

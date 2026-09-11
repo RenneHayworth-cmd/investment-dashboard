@@ -152,35 +152,40 @@ def preview():
                                "基金名称": "测试ETF", "参考价": 2.0, "预计金额": 200, "原因": "择时信号"}]))
 
 
-def test_event_identity_ignores_quote_price_and_slot_but_separates_quantity_and_phase():
+def test_event_identity_separates_slots_for_scheduled_delivery():
     p = preview()
-    key = etf.notification_events(p, slot="14:50", trade_date="2026-09-10")
-    p.actions.loc[0, "参考价"] = 3.0
-    assert etf.notification_events(p, slot="14:54", trade_date="2026-09-10") == key
-    p.actions.loc[0, "数量"] = 200
-    assert etf.notification_events(p, slot="14:54", trade_date="2026-09-10") != key
-    assert "|preview|2026-09-09|" in key[0]
+    key_1345 = etf.notification_events(p, slot="13:45", trade_date="2026-09-10")
+    key_1450 = etf.notification_events(p, slot="14:50", trade_date="2026-09-10")
+    assert key_1345 != key_1450
+    assert key_1345 == [delivery.event_key("2026-09-10", "ETF500K", "13:45")]
+    assert key_1450 == [delivery.event_key("2026-09-10", "ETF500K", "14:50")]
 
 
-def test_partial_batch_only_renders_unsent_symbol(monkeypatch):
+def test_each_slot_delivers_full_actions(monkeypatch):
     enable(monkeypatch)
     p = preview()
-    keys = etf.notification_events(p, slot="14:50", trade_date=p.preview_date)
+    keys_1345 = etf.notification_events(p, slot="13:45", trade_date=p.preview_date)
     with patch.object(etf, "send_serverchan_message") as ft, patch.object(etf, "send_hermes_weixin_message"):
-        etf.send_notification_channels("fake", "标题", "正文", keys=keys,
-            render=lambda pending: etf.render_pending(p, keys, pending, "14:50"))
+        etf.send_notification_channels("fake", "标题", "正文", keys=keys_1345,
+            render=lambda pending: etf.render_pending(p, keys_1345, pending, "13:45"))
         p.actions.loc[1] = {**p.actions.iloc[0].to_dict(), "代码": "159655"}
-        keys = etf.notification_events(p, slot="14:54", trade_date=p.preview_date)
-        etf.send_notification_channels("fake", "标题", "正文", keys=keys,
-            render=lambda pending: etf.render_pending(p, keys, pending, "14:54"))
+        keys_1450 = etf.notification_events(p, slot="14:50", trade_date=p.preview_date)
+        etf.send_notification_channels("fake", "标题", "正文", keys=keys_1450,
+            render=lambda pending: etf.render_pending(p, keys_1450, pending, "14:50"))
         assert ft.call_count == 2
         assert "159655" in ft.call_args.args[2]
-        assert "159501" not in ft.call_args.args[2]
+        assert "159501" in ft.call_args.args[2]
 
 
-def test_no_action_1454_deduplicated_per_channel():
-    p = replace(preview(), actions=pd.DataFrame())
-    assert etf.notification_events(p, slot="14:50", trade_date=p.preview_date) == etf.notification_events(p, slot="14:54", trade_date=p.preview_date)
+def test_no_action_1454_suppressed_when_1450_already_notified():
+    state = etf.PositionTimingNotificationState(
+        trade_date="2026-09-10",
+        notified_slots=["14:50"],
+        no_action_at_1450=True,
+        last_outcome="no_action",
+    )
+    assert etf.should_suppress_notification(state, outcome="no_action", slot="14:54")
+    assert not etf.should_suppress_notification(state, outcome="action", slot="14:54")
 
 
 @pytest.mark.parametrize("script", [etf, iron])
@@ -292,5 +297,5 @@ def test_systemd_scope_is_etf_only():
     units = Path("deploy/systemd")
     assert {p.name for p in units.iterdir()} == {"position-etf-reminder.service", "position-etf-reminder.timer"}
     timer = (units / "position-etf-reminder.timer").read_text()
-    for slot in ("09:45", "11:45", "14:45", "14:50", "14:54"):
+    for slot in ("09:45", "11:45", "13:45", "14:50", "14:54"):
         assert f"OnCalendar=*-*-* {slot}:00 Asia/Shanghai" in timer
