@@ -39,4 +39,3 @@ ProtectHome=read-only
 ReadWritePaths=/srv/investment-dashboard
 StandardOutput=journal
 StandardError=journal
-
