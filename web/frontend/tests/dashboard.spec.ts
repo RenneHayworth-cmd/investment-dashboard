@@ -134,7 +134,7 @@ test('fixture 空预判保持不确定语义并展示警告', async ({ page }) =
 test('fixture 逐标的盈亏手机单行及实时正式切换', async ({ page }) => {
  const fixture=fixtureData()
  fixture.strategy_live.by_symbol=[
-  {代码:'159501',基金名称:'纳指ETF嘉实很长的基金名称用于检查窄屏',当日盈亏:1234.56},
+  {代码:'159501',基金名称:'纳指ETF嘉实很长的基金名称用于检查窄屏',当日盈亏:1234.56,持仓市值:12345.67,持仓数量:1000,成本价:10.123,最新价:12.346,浮动盈亏:2222.67,'浮动收益率(%)':21.96,'账户权重(%)':2.5},
   {代码:'510500',基金名称:'中证500ETF',当日盈亏:-78.9},
   {代码:'512890',基金名称:'红利低波ETF',当日盈亏:null},
  ]
@@ -143,18 +143,27 @@ test('fixture 逐标的盈亏手机单行及实时正式切换', async ({ page }
  await page.getByRole('button',{name:'策略',exact:true}).click()
  const card=page.getByTestId('symbol-pnl')
  await expect(card.getByRole('heading',{name:'逐标的实时盈亏'})).toBeVisible()
- await expect(card.locator('.pnl-row b').nth(0)).toHaveCSS('color','rgb(202, 58, 68)')
- await expect(card.locator('.pnl-row b').nth(1)).toHaveCSS('color','rgb(24, 131, 102)')
- await expect(card.locator('.pnl-row b').nth(2)).toHaveText('缺报价')
- expect(await card.locator('.pnl-row').evaluateAll(nodes=>nodes.every(node=>{
+ await expect(card.locator('.holding-daily b').nth(0)).toHaveCSS('color','rgb(202, 58, 68)')
+ await expect(card.locator('.holding-daily b').nth(1)).toHaveCSS('color','rgb(24, 131, 102)')
+ await expect(card.locator('.holding-daily b').nth(2)).toHaveText('缺报价')
+ expect(await card.locator('.holdings-table tbody tr').evaluateAll(nodes=>nodes.every(node=>{
   const rects=Array.from(node.children).map(child=>child.getBoundingClientRect())
   return Math.max(...rects.map(r=>r.top)) < Math.min(...rects.map(r=>r.bottom))
  }))).toBe(true)
+ const scroller=card.locator('.holdings-scroll')
+ await expect(card.getByText('10.123',{exact:true})).toBeVisible()
+ const before=await card.locator('tbody th').first().boundingBox()
+ await scroller.evaluate(el=>{el.scrollLeft=el.scrollWidth})
+ const after=await card.locator('tbody th').first().boundingBox()
+ expect(Math.abs(after!.x-before!.x)).toBeLessThan(2)
+ const daily=await card.locator('.holding-daily').first().boundingBox()
+ const bounds=await scroller.boundingBox()
+ expect(daily!.x+daily!.width).toBeLessThanOrEqual(bounds!.x+bounds!.width+1)
  await noOverflow(page)
  fixture.strategy_live.mode='formal'
  fixture.strategy.daily_by_symbol=[{代码:'159501',基金名称:'纳指ETF嘉实',当日盈亏:99.}]
  await expect(card.getByRole('heading',{name:'逐标的正式盈亏'})).toBeVisible({timeout:10000})
- await expect(card.locator('.pnl-row b')).toHaveText('+99.00')
+ await expect(card.locator('.holding-daily b')).toHaveText('+99.00')
  await noOverflow(page)
 })
 

@@ -46,6 +46,14 @@ def test_exact_formal_quantity_and_close_cash_unchanged_no_writes():
     assert result.daily_pnl == -300.  # 100*(11-10) + 200*(18-20)
     assert [row['当日盈亏'] for row in result.by_symbol] == [100., -400.]
     assert result.estimated_assets == 499700.
+    first = result.by_symbol[0]
+    assert first['持仓市值'] == 1100.
+    assert first['浮动盈亏'] == 300.
+    assert first['浮动收益率(%)'] == pytest.approx(37.5)
+    assert first['当日收益率(%)'] == pytest.approx(10.)
+    assert first['账户权重(%)'] == pytest.approx(1100 / 499700 * 100)
+    assert first['成本价'] == 8.
+    assert first['最新价'] == 11.
     assert result.formal_date == '2026-08-07'
     assert result.quote_time == '2026-08-10 14:52:00'
     assert result.mode == 'intraday'
@@ -70,6 +78,8 @@ def test_incomplete_prices_never_return_partial_pnl(bad):
     assert result.daily_pnl is None and result.estimated_assets is None
     assert result.by_symbol[0]['当日盈亏'] == 100.
     assert result.by_symbol[1]['当日盈亏'] is None
+    assert result.by_symbol[1]['持仓市值'] is None
+    assert result.by_symbol[0]['账户权重(%)'] is None
 
 
 def test_closed_today_still_has_formal_pnl_including_sell_fee():

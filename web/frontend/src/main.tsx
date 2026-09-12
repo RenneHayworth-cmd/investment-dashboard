@@ -47,7 +47,15 @@ function SymbolPnl({ data }: { data: Dashboard }) {
  const live = data.strategy_live, estimating = live.mode === 'intraday' || live.mode === 'pending_close'
  const rows = (estimating ? live.by_symbol : data.strategy.daily_by_symbol) || []
  return <section className="panel symbol-pnl" data-testid="symbol-pnl"><div className="section-title"><h2>逐标的{estimating ? '实时' : '正式'}盈亏</h2><span className={`badge ${estimating ? 'preview' : ''}`}>{live.mode === 'pending_close' ? '收盘待确认' : estimating ? '盘中估算' : '正式收盘'}</span></div><p className="muted small">{estimating ? live.quote_time || '等待报价' : live.formal_date || '等待正式数据'} · 元</p>
- {rows.length ? <div className="pnl-list">{rows.map(row=><div className="pnl-row" key={String(row['代码'])}><span className="pnl-code">{String(row['代码'])}</span><span className="pnl-name" title={String(row['基金名称'])}>{String(row['基金名称'])}</span><b className={sign(row['当日盈亏'])}>{row['当日盈亏'] == null ? '缺报价' : signed(row['当日盈亏'])}</b></div>)}</div> : <p className="empty">{estimating && !live.complete ? '实时估值数据不足' : '暂无当日持仓盈亏'}</p>}
+ <p className="section-note">← 左滑查看当日盈亏、仓位 · 盈亏为持仓浮动盈亏 · 仓位按策略总资产计算</p>
+ {rows.length ? <div className="holdings-scroll" tabIndex={0} role="region" aria-label="模拟持仓，左右滑动查看指标"><table className="holdings-table"><colgroup><col className="holding-label"/>{Array.from({length:5},(_,i)=><col key={i}/>)}</colgroup><thead><tr>{['标的／市值','盈亏','持仓','成本／现价','当日盈亏','仓位'].map(k=><th key={k}>{k}</th>)}</tr></thead><tbody>{rows.map(row=><tr key={String(row['代码'])}>
+ <th scope="row"><span className="holding-name" title={String(row['基金名称'])}>{String(row['基金名称'])}</span><small>{String(row['代码'])}{row['持仓数量']===0?' · 已清仓':''}</small><b>{fmt(row['持仓市值'])}</b></th>
+ <td className={sign(row['浮动盈亏'])}><b>{signed(row['浮动盈亏'])}</b><small>{signed(row['浮动收益率(%)'],'%')}</small></td>
+ <td><b>{fmt(row['持仓数量'],0)}</b><small>份</small></td>
+ <td><b>{fmt(row['成本价'],3)}</b><small>{fmt(row['最新价'],3)}</small></td>
+ <td className={`holding-daily ${sign(row['当日盈亏'])}`}><b>{row['当日盈亏']==null?'缺报价':signed(row['当日盈亏'])}</b><small>{signed(row['当日收益率(%)'],'%')}</small></td>
+ <td><b>{row['账户权重(%)']==null?'—':`${fmt(row['账户权重(%)'],1)}%`}</b></td>
+ </tr>)}</tbody></table></div> : <p className="empty">{estimating && !live.complete ? '实时估值数据不足' : '暂无当日持仓盈亏'}</p>}
  </section>
 }
 function TradePreview({ data }: { data: Dashboard }) {

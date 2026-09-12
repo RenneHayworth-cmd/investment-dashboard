@@ -131,7 +131,10 @@ def build_position_timing_intraday_valuation(
         if quantity == 0:
             continue
         detail = {"代码": code, "基金名称": row.get("基金名称") or ETF_DISPLAY_NAMES.get(code, code),
-                  "当日盈亏": None, "数据状态": "缺报价"}
+                  "当日盈亏": None, "数据状态": "缺报价", "持仓数量": quantity,
+                  "成本价": row.get("成本价"), "最新价": None, "持仓市值": None,
+                  "浮动盈亏": None, "浮动收益率(%)": None, "当日收益率(%)": None,
+                  "账户权重(%)": None}
         result.by_symbol.append(detail)
         quote = normalized.get(code, {})
         price = number(quote.get("price"))
@@ -144,6 +147,12 @@ def build_position_timing_intraday_valuation(
             continue
         amounts.append(float(quantity) * (float(price) - float(close)))
         detail.update({"当日盈亏": round(amounts[-1], 2), "数据状态": "实时估算"})
+        cost = number(row.get("成本价"))
+        detail.update({"最新价": price, "持仓市值": round(quantity * price, 2),
+                       "当日收益率(%)": (price / close - 1) * 100})
+        if math.isfinite(cost) and cost > 0:
+            detail.update({"浮动盈亏": round(quantity * (price - cost), 2),
+                           "浮动收益率(%)": (price / cost - 1) * 100})
         times.append(quote_time)
     # Use the oldest included quote as the completeness timestamp.
     result.quote_time = min(times).strftime("%Y-%m-%d %H:%M:%S") if times else ""
@@ -157,6 +166,9 @@ def build_position_timing_intraday_valuation(
     result.available = result.complete = True
     result.daily_pnl = round(math.fsum(amounts), 2)
     result.estimated_assets = round(float(assets) + result.daily_pnl, 2)
+    if result.estimated_assets > 0:
+        for detail in result.by_symbol:
+            detail["账户权重(%)"] = detail["持仓市值"] / result.estimated_assets * 100
     return result
 
 
@@ -902,7 +914,9 @@ def build_position_timing_performance(
         include_closed_today=True,
     )
     positions = position_details.loc[position_details["持仓数量"] > 0].reset_index(drop=True)
-    daily_by_symbol = position_details[["代码", "基金名称", "当日盈亏"]].copy()
+    daily_by_symbol = position_details.copy()
+    costs = daily_by_symbol["成本价"] * daily_by_symbol["持仓数量"]
+    daily_by_symbol["浮动收益率(%)"] = daily_by_symbol["浮动盈亏"] / costs.where(costs > 0) * 100
     if pd.Timestamp(latest["日期"]).normalize() == start:
         daily_by_symbol["当日盈亏"] = 0.0  # Initial setup fees are disclosed separately.
     summary = {
