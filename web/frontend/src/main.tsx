@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { Activity, ArrowDownUp, BarChart3, LayoutDashboard, RefreshCw, Search, Wallet } from 'lucide-react'
 import { Button } from './components/ui/button'
 const LazyChart = lazy(() => import('./Chart').then(module => ({ default: module.Chart })))
-function Chart(props: {rows: Row[]; value?: string; date?: string}) { return <Suspense fallback={<p className="empty">正在加载图表…</p>}><LazyChart {...props}/></Suspense> }
+function Chart(props: {rows: Row[]; value?: string; date?: string; strategy?: boolean}) { return <Suspense fallback={<p className="empty">正在加载图表…</p>}><LazyChart {...props}/></Suspense> }
 import type { Dashboard, Instrument, Row, Value } from './types'
 import './style.css'
 
@@ -28,12 +28,12 @@ function Rows({ rows, empty = '暂无记录', limit = 30, actionCards = false }:
  return rows.length ? <><div className="record-grid">{(all ? rows : rows.slice(0,limit)).map((r,i) => <RecordCard row={r} tradeAction={actionCards} key={i}/>)}</div>{rows.length > limit && <Button variant="outline" onClick={() => setAll(!all)}>{all ? '收起记录' : `查看全部 ${rows.length} 条`}</Button>}</> : <p className="empty">{empty}</p>
 }
 function StrategyCurve({ rows }: { rows: Row[] }) {
- const options = [{label:'净值',key:'净值'},{label:'当日收益率',key:'每日收益率(%)'},{label:'累计收益率',key:'累计收益率(%)'}]
+ const options = [{label:'净值曲线',key:'净值'},{label:'每日盈亏柱状图',key:'每日盈亏'}]
  const [metric,setMetric] = useState('净值')
  const latest = rows.at(-1), selected = options.find(o=>o.key===metric)!
  return <div data-testid="strategy-curve"><div className="curve-switch" role="group" aria-label="曲线指标">{options.map(o=><Button key={o.key} variant={metric===o.key?'default':'outline'} aria-pressed={metric===o.key} onClick={()=>setMetric(o.key)}>{o.label}</Button>)}</div>
- {latest && <p className="section-note">{String(latest['日期']).slice(0,10)} · {selected.label} <b className={metric==='净值'?'':sign(latest[metric])}>{metric==='净值'?fmt(latest[metric],4):signed(latest[metric],'%')}</b></p>}
- {rows.length?<Chart rows={rows} value={metric}/>:<p className="empty">数据不足，暂不生成曲线</p>}</div>
+ {latest && <p className="section-note">{String(latest['日期']).slice(0,10)} · {selected.label} <b className={metric==='净值'?'':sign(latest[metric])}>{metric==='净值'?fmt(latest[metric],4):signed(latest[metric],' 元')}</b></p>}
+ {rows.length?<Chart rows={rows} value={metric} strategy/>:<p className="empty">数据不足，暂不生成曲线</p>}</div>
 }
 function IndexRows({ rows }: { rows: Row[] }) {
  return rows.length ? <div className="record-grid">{rows.map(row=><details className="panel index-reference" key={String(row['代码'])}><summary><span className="index-title"><strong>{String(row['指数名称'])}</strong><span className="code">{String(row['代码'])}</span></span><span>{label(row['择时判断'])}</span></summary><p className="section-note">{fmt(row['数据状态'])}</p><Fields row={row} keys={Object.keys(row).filter(k=>!['指数名称','代码','数据状态'].includes(k))}/></details>)}</div> : <p className="empty">暂无指数参考数据</p>

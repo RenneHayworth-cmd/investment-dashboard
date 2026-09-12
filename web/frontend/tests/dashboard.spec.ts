@@ -180,8 +180,10 @@ test('无鉴权入口被拒绝',async ({ baseURL })=>{
  expect(status).toBe(401)
 })
 
- test('fixture 指数去重折叠与策略三种曲线', async ({page})=>{
+ test('fixture 指数去重折叠与净值提示和盈亏柱状图', async ({page})=>{
  const fixture=fixtureData()
+ // The baseline strategy fixture only loses money; add both signs for bar rendering coverage.
+ fixture.strategy.daily.forEach((row:Record<string,unknown>,i:number)=>{row['每日盈亏']=i%2===0?1000:-1000})
  await page.route('**/api/dashboard',route=>route.fulfill({json:fixture}))
  await page.goto('/')
  await expect(page.getByRole('heading',{name:'ETF盘中实时预判'})).toBeVisible({timeout:30000})
@@ -196,10 +198,28 @@ test('无鉴权入口被拒绝',async ({ baseURL })=>{
  await page.getByRole('button',{name:'策略',exact:true}).click()
  await expect(page.getByText('模拟策略当前仓位',{exact:true})).toHaveCount(0)
  const chart=page.getByTestId('strategy-curve')
- for(const [label,key] of [['净值','净值'],['当日收益率','每日收益率(%)'],['累计收益率','累计收益率(%)']]){
- await chart.getByRole('button',{name:label,exact:true}).click()
- await expect(chart.getByRole('img')).toHaveAttribute('aria-label',`${key}趋势图，共${fixture.strategy.daily.length}个正式交易日`)
- await expect(chart.getByRole('button',{name:label,exact:true})).toHaveAttribute('aria-pressed','true')
- }
+ await expect(chart.getByRole('button',{name:'当日收益率',exact:true})).toHaveCount(0)
+ const plot=chart.getByRole('img')
+ await expect(plot).toHaveAttribute('aria-label',`净值趋势图，共${fixture.strategy.daily.length}个正式交易日`)
+ await plot.click({position:{x:100,y:100}})
+ const tip=chart.locator('.strategy-chart-tooltip')
+ await expect(tip).toBeVisible()
+ for(const field of ['净值','每日收益率(%)','累计收益率(%)']) await expect(tip.locator(`[data-field="${field}"]`)).toBeVisible()
+ const date=(await tip.locator(':scope > div').first().innerText()).trim()
+ const row=fixture.strategy.daily.find((r:Record<string,unknown>)=>String(r['日期']).slice(0,10)===date)
+ await expect(tip.locator('[data-field="净值"]')).toHaveText(row['净值'].toFixed(6))
+ await expect(tip.locator('[data-field="每日收益率(%)"]')).toHaveText(`${row['每日收益率(%)']>0?'+':''}${row['每日收益率(%)'].toFixed(2)}%`)
+ await expect(tip.locator('[data-field="累计收益率(%)"]')).toHaveText(`${row['累计收益率(%)']>0?'+':''}${row['累计收益率(%)'].toFixed(2)}%`)
+ await chart.getByRole('button',{name:'每日盈亏柱状图',exact:true}).click()
+ await expect(plot).toHaveAttribute('aria-label',`每日盈亏柱状图，共${fixture.strategy.daily.length}个正式交易日`)
+ await plot.click({position:{x:100,y:100}})
+ await expect(tip.locator('[data-field="每日盈亏"]')).toBeVisible()
+ const colors=await plot.locator('canvas').first().evaluate((canvas:HTMLCanvasElement)=>{
+ const pixels=canvas.getContext('2d')!.getImageData(0,0,canvas.width,canvas.height).data
+ let red=false,green=false
+ for(let i=0;i<pixels.length;i+=4){if(pixels[i]===202&&pixels[i+1]===58&&pixels[i+2]===68)red=true;if(pixels[i]===24&&pixels[i+1]===131&&pixels[i+2]===102)green=true}
+ return {red,green}
+ })
+ expect(colors).toEqual({red:true,green:true})
  await noOverflow(page)
  })
