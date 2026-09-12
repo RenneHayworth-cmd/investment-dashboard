@@ -35,6 +35,7 @@ class StrategyLive(BaseModel):
     quote_time: str
     missing_codes: list[str]
     daily_pnl: float | None
+    daily_return_pct: float | None = None
     estimated_assets: float | None
     warnings: list[str]
     by_symbol: list[dict[str, Any]] = Field(default_factory=list)

@@ -69,6 +69,7 @@ class PositionTimingIntradayValuation:
     missing_codes: list[str] = field(default_factory=list)
     daily_pnl: float | None = None
     estimated_assets: float | None = None
+    daily_return_pct: float | None = None
     warnings: list[str] = field(default_factory=list)
     by_symbol: list[dict[str, object]] = field(default_factory=list)
 
@@ -166,6 +167,7 @@ def build_position_timing_intraday_valuation(
     result.available = result.complete = True
     result.daily_pnl = round(math.fsum(amounts), 2)
     result.estimated_assets = round(float(assets) + result.daily_pnl, 2)
+    result.daily_return_pct = result.daily_pnl / assets * 100 if assets > 0 else None
     if result.estimated_assets > 0:
         for detail in result.by_symbol:
             detail["账户权重(%)"] = detail["持仓市值"] / result.estimated_assets * 100

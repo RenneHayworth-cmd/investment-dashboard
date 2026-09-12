@@ -53,14 +53,19 @@ test('fixture 完整数据四个视图、图表与窄屏', async ({ page }) => {
  await page.getByRole('button',{name:'ETF',exact:true}).click()
  await page.getByPlaceholder('搜索代码或基金名称').fill('159501')
  await expect(page.getByRole('heading',{name:'纳指ETF嘉实',exact:true})).toBeVisible()
+ await expect(page.locator('.etf-card').getByText('状态转换时间',{exact:true})).not.toBeVisible()
+ await page.locator('.etf-card summary').click()
  await expect(page.locator('.etf-card').getByText('状态转换时间',{exact:true})).toBeVisible()
  await expect(page.locator('.etf-card').getByText('上一区间涨幅(%)',{exact:true})).toBeVisible()
- await expect(page.locator('details')).toHaveCount(0)
+ await expect(page.locator('.etf-card details')).toHaveAttribute('open','')
  await noOverflow(page)
  await page.getByRole('button',{name:'策略',exact:true}).click()
- await expect(page.getByRole('heading',{name:'模拟策略当前仓位'})).toBeVisible()
+ await expect(page.getByRole('heading',{name:'持仓股'})).toBeVisible()
+ await expect(page.getByRole('heading',{name:'净值曲线'})).toBeVisible()
+ await expect(page.getByText('模拟策略当前仓位',{exact:true})).toBeVisible()
+ await expect(page.locator('details').filter({has:page.locator('summary', {hasText:'模拟策略当前仓位'})})).not.toHaveAttribute('open','')
  await expect(page.getByRole('img',{name:/净值趋势图/})).toBeVisible()
- await expect(page.getByText('今日实时盈亏（元）',{exact:true})).toBeVisible()
+ await expect(page.getByText('当日盈亏（百分比）',{exact:true})).toBeVisible()
  await noOverflow(page)
  await page.screenshot({path:`/tmp/position-web-verification/strategy-${test.info().project.name}.png`,fullPage:false})
  await page.getByRole('button',{name:'衍生品',exact:true}).click()
@@ -98,11 +103,13 @@ test('fixture 买卖卡与真实指引字段的背景和文字着色', async ({ 
 
 test('fixture 实时缺失、待确认与正式盈亏切换', async ({ page }) => {
  const fixture=fixtureData()
- fixture.strategy_live={...fixture.strategy_live,mode:'intraday',available:true,complete:true,daily_pnl:234.56,estimated_assets:500234.56}
+ fixture.strategy_live={...fixture.strategy_live,mode:'intraday',available:true,complete:true,daily_pnl:234.56,daily_return_pct:0.046912,estimated_assets:500234.56}
  await page.route('**/api/dashboard', route=>route.fulfill({json:fixture}))
  await page.goto('/')
  await page.getByRole('button',{name:'策略',exact:true}).click()
  await expect(page.getByTestId('strategy-pnl')).toHaveText('+234.56')
+ await expect(page.getByTestId('strategy-pnl-rate')).toHaveText('+0.05%')
+ for (const label of ['总资产','总盈亏','净值','仓位']) await expect(page.locator('.strategy-summary').getByText(label,{exact:true})).toBeVisible()
  await expect(page.getByText('盘中实时 · 不写缓存')).toBeVisible()
  fixture.strategy_live={...fixture.strategy_live,available:false,complete:false,missing_codes:['159501'],daily_pnl:null,estimated_assets:null}
  await expect(page.getByTestId('strategy-pnl')).toHaveText('—',{timeout:10000})
@@ -112,8 +119,8 @@ test('fixture 实时缺失、待确认与正式盈亏切换', async ({ page }) =
  await expect(page.getByTestId('strategy-pnl')).toHaveText('+345.67')
  fixture.strategy_live={...fixture.strategy_live,mode:'formal',available:false,daily_pnl:null,formal_date:fixture.strategy_live.valuation_date}
  fixture.strategy.daily.at(-1)['每日盈亏']=456.78
- await expect(page.getByText('今日正式盈亏（元）')).toBeVisible({timeout:10000})
- await expect(page.getByTestId('strategy-pnl')).toHaveText('+456.78')
+ await expect(page.getByText('当日盈亏（百分比）')).toBeVisible({timeout:10000})
+ await expect(page.getByTestId('strategy-pnl')).toHaveText('+456.78',{timeout:10000})
  await expect(page.getByText('盘中估算策略资产（元）')).toHaveCount(0)
  await noOverflow(page)
 })
@@ -142,7 +149,7 @@ test('fixture 逐标的盈亏手机单行及实时正式切换', async ({ page }
  await page.goto('/')
  await page.getByRole('button',{name:'策略',exact:true}).click()
  const card=page.getByTestId('symbol-pnl')
- await expect(card.getByRole('heading',{name:'逐标的实时盈亏'})).toBeVisible()
+ await expect(card.getByRole('heading',{name:'持仓股'})).toBeVisible()
  await expect(card.locator('.holding-daily b').nth(0)).toHaveCSS('color','rgb(202, 58, 68)')
  await expect(card.locator('.holding-daily b').nth(1)).toHaveCSS('color','rgb(24, 131, 102)')
  await expect(card.locator('.holding-daily b').nth(2)).toHaveText('缺报价')
@@ -162,7 +169,7 @@ test('fixture 逐标的盈亏手机单行及实时正式切换', async ({ page }
  await noOverflow(page)
  fixture.strategy_live.mode='formal'
  fixture.strategy.daily_by_symbol=[{代码:'159501',基金名称:'纳指ETF嘉实',当日盈亏:99.}]
- await expect(card.getByRole('heading',{name:'逐标的正式盈亏'})).toBeVisible({timeout:10000})
+ await expect(card.locator('.badge')).toHaveText('正式收盘',{timeout:10000})
  await expect(card.locator('.holding-daily b')).toHaveText('+99.00')
  await noOverflow(page)
 })

@@ -46,6 +46,7 @@ def test_exact_formal_quantity_and_close_cash_unchanged_no_writes():
     assert result.daily_pnl == -300.  # 100*(11-10) + 200*(18-20)
     assert [row['当日盈亏'] for row in result.by_symbol] == [100., -400.]
     assert result.estimated_assets == 499700.
+    assert result.daily_return_pct == pytest.approx(-0.06)
     first = result.by_symbol[0]
     assert first['持仓市值'] == 1100.
     assert first['浮动盈亏'] == 300.
