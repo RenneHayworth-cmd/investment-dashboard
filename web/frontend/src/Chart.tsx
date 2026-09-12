@@ -16,7 +16,7 @@ export function Chart({ rows, value = '净值', date = '日期', strategy = fals
    const row = rows[point.dataIndex]
    const box = document.createElement('div'); box.className = 'strategy-chart-tooltip'
    const title = document.createElement('div'); title.textContent = String(row[date]).slice(0,10); box.append(title)
-   const fields = bar ? [['每日盈亏','当日盈亏（元）'],['每日收益率(%)','当日收益率'],['累计收益率(%)','累计收益率']] : [['净值','净值'],['每日收益率(%)','当日收益率'],['累计收益率(%)','累计收益率']]
+   const fields = bar ? [['每日盈亏','当日盈亏（元）'],['每日收益率(%)','当日收益率'],['累计盈亏','累计盈亏（元）'],['累计收益率(%)','累计收益率']] : [['净值','净值'],['每日收益率(%)','当日收益率'],['累计收益率(%)','累计收益率']]
    for (const [key,label] of fields) {
     const line = document.createElement('div'), name = document.createElement('span'), amount = document.createElement('b')
     const n = row[key], numeric = typeof n === 'number' && Number.isFinite(n), percent = key.includes('(%)')

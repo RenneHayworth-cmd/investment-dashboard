@@ -61,7 +61,7 @@ test('fixture 完整数据四个视图、图表与窄屏', async ({ page }) => {
  await noOverflow(page)
  await page.getByRole('button',{name:'策略',exact:true}).click()
  await expect(page.getByRole('heading',{name:'持仓股'})).toBeVisible()
- await expect(page.getByRole('heading',{name:'净值曲线'})).toBeVisible()
+ await expect(page.getByRole('heading',{name:'净值曲线'})).toHaveCount(0)
  await expect(page.getByText('模拟策略当前仓位',{exact:true})).toHaveCount(0)
  await expect(page.getByRole('img',{name:/净值趋势图/})).toBeVisible()
  await expect(page.getByText('当日盈亏（百分比）',{exact:true})).toBeVisible()
@@ -210,10 +210,16 @@ test('无鉴权入口被拒绝',async ({ baseURL })=>{
  await expect(tip.locator('[data-field="净值"]')).toHaveText(row['净值'].toFixed(6))
  await expect(tip.locator('[data-field="每日收益率(%)"]')).toHaveText(`${row['每日收益率(%)']>0?'+':''}${row['每日收益率(%)'].toFixed(2)}%`)
  await expect(tip.locator('[data-field="累计收益率(%)"]')).toHaveText(`${row['累计收益率(%)']>0?'+':''}${row['累计收益率(%)'].toFixed(2)}%`)
- await chart.getByRole('button',{name:'每日盈亏柱状图',exact:true}).click()
+ await chart.getByRole('button',{name:'每日盈亏',exact:true}).click()
  await expect(plot).toHaveAttribute('aria-label',`每日盈亏柱状图，共${fixture.strategy.daily.length}个正式交易日`)
  await plot.click({position:{x:100,y:100}})
  await expect(tip.locator('[data-field="每日盈亏"]')).toBeVisible()
+ const selectedDate=(await tip.locator(':scope > div').first().innerText()).trim()
+ const selectedRow=fixture.strategy.daily.find((r:Record<string,unknown>)=>String(r['日期']).slice(0,10)===selectedDate)
+ await expect(tip.locator('[data-field="累计盈亏"]')).toHaveText(`${selectedRow['累计盈亏']>0?'+':''}${selectedRow['累计盈亏'].toFixed(2)}`)
+ expect(await tip.locator('b').evaluateAll(nodes=>nodes.map(n=>n.dataset.field))).toEqual(['每日盈亏','每日收益率(%)','累计盈亏','累计收益率(%)'])
+ await expect(chart.locator(':scope > .section-note')).toHaveCount(0)
+
  const colors=await plot.locator('canvas').first().evaluate((canvas:HTMLCanvasElement)=>{
  const pixels=canvas.getContext('2d')!.getImageData(0,0,canvas.width,canvas.height).data
  let red=false,green=false
