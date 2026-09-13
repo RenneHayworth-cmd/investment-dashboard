@@ -105,3 +105,16 @@ class IndexPreviewTests(unittest.TestCase):
             ).iloc[0]
         self.assertEqual(row["最新收盘"], 100)
         self.assertEqual(row["数据状态"], "正式收盘缓存")
+
+
+def test_csi1000_uses_ma30_two_percent_without_mutating_formal_history():
+    history = pd.DataFrame({'trade_date':pd.bdate_range(end='2026-09-10',periods=40),'close':100.})
+    original = history.copy(deep=True)
+    now = datetime(2026,9,11,10,0,tzinfo=ZoneInfo('Asia/Shanghai'))
+    with patch('services.position_timing._load_position_index_timing_history',return_value=history):
+        table=build_position_index_timing_table(realtime_quotes={'中证1000':{'price':130.,'quote_time':now}},market_now=now)
+    row=table.loc[table['代码']=='000852'].iloc[0]
+    assert row['策略参数']=='MA30 / 2.0%'
+    assert row['对应均线']==101.
+    assert row['择时判断']=='买入'
+    pd.testing.assert_frame_equal(history,original)

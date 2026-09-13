@@ -36,6 +36,7 @@ from services.position_models import (
 POSITION_INDEX_TIMING_STRATEGIES = {
     "微盘股": {"code": "BK1158", "ma_period": 15, "threshold_pct": 2.5},
     "中证500": {"code": "000905", "ma_period": 15, "threshold_pct": 1.0},
+    "中证1000": {"code": "000852", "ma_period": 30, "threshold_pct": 2.0},
 }
 
 # User-approved temporary exception for BK1158 only. Never fabricate rows or

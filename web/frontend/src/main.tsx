@@ -34,7 +34,14 @@ function StrategyCurve({ rows }: { rows: Row[] }) {
  {rows.length?<Chart rows={rows} value={metric} strategy/>:<p className="empty">数据不足，暂不生成曲线</p>}</div>
 }
 function IndexRows({ rows }: { rows: Row[] }) {
- return rows.length ? <div className="record-grid">{rows.map(row=><details className="panel index-reference" key={String(row['代码'])}><summary><span className="index-title"><strong>{String(row['指数名称'])}</strong><span className="code">{String(row['代码'])}</span></span><span>{label(row['择时判断'])}</span></summary><p className="section-note">{fmt(row['数据状态'])}</p><Fields row={row} keys={Object.keys(row).filter(k=>!['指数名称','代码','数据状态'].includes(k))}/></details>)}</div> : <p className="empty">暂无指数参考数据</p>
+ const core=['最新收盘','当日涨跌幅(%)','对应均线','偏离率(%)','择时判断','数据截止日']
+ return rows.length ? <div className="record-grid">{rows.map(row=><article className="panel index-reference" key={String(row['代码'])}><div className="card-heading"><div className="index-title"><strong>{String(row['指数名称'])}</strong><span className="code">{String(row['代码'])}</span></div><span className="param">{fmt(row['策略参数'])}</span></div><Fields row={row} keys={core}/><p className="section-note">{fmt(row['数据状态'])}</p><details><summary>区间表现与详情</summary><Fields row={row} keys={Object.keys(row).filter(k=>![...core,'指数名称','代码','策略参数','数据状态'].includes(k))}/></details></article>)}</div> : <p className="empty">暂无指数参考数据</p>
+}
+function LatestRecords({title,rows,empty}: {title:string;rows:Row[];empty:string}) {
+ const dateOf=(row:Row)=>String(row['日期']||'').slice(0,10)
+ const latest=rows.map(dateOf).sort().at(-1)
+ const current=rows.filter(row=>dateOf(row)===latest), older=rows.filter(row=>dateOf(row)!==latest)
+ return <section className="panel" data-testid={title==='模拟交易记录'?'strategy-trades':'strategy-daily'}><h2>{title}</h2><Rows rows={current} limit={current.length} empty={empty}/>{older.length>0&&<details><summary>历史记录（{older.length}条）</summary><Rows rows={older}/></details>}</section>
 }
 function StrategySummary({ data }: { data: Dashboard }) {
  const s = data.strategy.summary, latest = data.strategy.daily.at(-1), live = data.strategy_live
@@ -47,7 +54,7 @@ function StrategySummary({ data }: { data: Dashboard }) {
  <div className="asset"><span>当日盈亏（百分比）</span><strong className={sign(pnl)} data-testid="strategy-pnl">{signed(pnl)}</strong><span className={sign(pnlRate)} data-testid="strategy-pnl-rate">{signed(pnlRate,'%')}</span></div>
  {estimating && <p className="section-note">持仓基准 {live.formal_date || '待数据'} · 持仓报价时间 {live.quote_time || '暂无'}<br/>按已有持仓估值，未执行今日预判买卖；下列指标截至上方数据日期。</p>}
  {estimating && !complete && <p className="notice">实时估值数据不完整{live.missing_codes.length ? `，缺少持仓报价：${live.missing_codes.join('、')}` : '，等待有效正式持仓及报价'}。</p>}
- <div className="metrics"><div><span>总资产</span><b>{fmt(s['策略资产'])}</b></div><div><span>总盈亏</span><b className={sign(s['累计盈亏'])}>{signed(s['累计盈亏'])}</b></div><div><span>净值</span><b>{fmt(s['当前净值'], 4)}</b></div><div><span>仓位</span><b>{s['当前仓位比例(%)'] == null ? '—' : `${fmt(s['当前仓位比例(%)'])}%`}</b></div></div>
+ <div className="metrics"><div><span>总资产</span><b>{fmt(s['策略资产'])}</b></div><div><span>总盈亏</span><b className={sign(s['累计盈亏'])}>{signed(s['累计盈亏'])}</b></div><div><span>总市值</span><b>{fmt(s['当前持仓市值'])}</b></div><div><span>可用资金</span><b>{fmt(s['当前现金'])}</b></div><div><span>净值</span><b>{fmt(s['当前净值'], 4)}</b></div><div><span>仓位</span><b>{s['当前仓位比例(%)'] == null ? '—' : `${fmt(s['当前仓位比例(%)'])}%`}</b></div></div>
  <Notices messages={[...data.strategy.errors, ...data.strategy.warnings, ...live.warnings]}/>
  </section>
 }
@@ -84,7 +91,7 @@ function EtfCard({ formal, preview, item, data, action }: { formal: Row; preview
  </article>
 }
 function Derivatives({ data }: { data: Dashboard }) {
- return <><p className="section-note">具体合约原始价格 · 盘中报价不写入正式日线</p><div className="card-grid">{[...data.derivatives,...data.spreads].map(item => <article className="panel" key={item.code}><span className="code">{item.category}</span><h3>{item.name}</h3><p className="muted">数据日期 {item.latest_date || '无'} · {item.status}</p><Fields row={item.metrics} keys={Object.keys(item.metrics).slice(0,4)}/><details><summary>指标详情与走势</summary><Fields row={item.metrics} keys={Object.keys(item.metrics).slice(4)}/><History code={item.code}/></details><Notices messages={[item.error]}/><p className="muted small">{item.source}</p></article>)}</div></>
+ return <><p className="section-note">具体合约原始价格 · 盘中报价不写入正式日线</p><div className="card-grid">{[...data.derivatives,...data.spreads].map(item => <article className="panel" key={item.code}><span className="code">{item.category}</span><h3>{item.name}</h3><p className="muted">数据日期 {item.latest_date || '无'} · {item.status}</p><Fields row={item.metrics}/><History code={item.code}/><Notices messages={[item.error]}/><p className="muted small">{item.source}</p></article>)}</div></>
 }
 function History({ code }: { code: string }) {
  const [rows, setRows] = useState<Row[]>([]), [error,setError] = useState(''), [open,setOpen] = useState(false)
@@ -111,9 +118,9 @@ function App() {
  <div className="status-strip"><div><span className="dot"/>{data.session} · 上海时间</div><span>正式缓存更新 {data.formal_updated_at || '暂无'}</span><span>实时报价 {data.quote_time || '暂无当日报价'}</span>{data.refreshing && <span role="status">{data.refresh_stage}</span>}</div>
  <Notices messages={[data.refresh_error, data.missing_quote_codes.length ? `当前刷新时段尚缺有效报价：${data.missing_quote_codes.join('、')}。对应标的保留正式状态。` : '']}/>
  {tab==='策略'&&<><StrategySummary data={data}/><SymbolPnl data={data}/></>}
- {tab==='概览'&&<><TradePreview data={data}/><section className="section" data-testid="guidance"><div className="section-title"><h2>近期操作指引</h2><span className="badge">正式收盘 · 近7天</span></div><p className="section-note">不含盘中预览。正式数据缺失时，不应将“暂无记录”理解为已确认无需操作。</p><Rows rows={data.guidance} actionCards empty="当前正式缓存暂无新的操作记录" limit={4}/></section></>}
+ {tab==='概览'&&<><TradePreview data={data}/><section className="section" data-testid="guidance"><div className="section-title"><h2>近期操作指引</h2><span className="badge">正式收盘 · 近7天</span></div><p className="section-note">不含盘中预览。正式数据缺失时，不应将“暂无记录”理解为已确认无需操作。</p><Rows rows={data.guidance} actionCards empty="当前正式缓存暂无新的操作记录" limit={data.guidance.length}/></section></>}
  {tab==='ETF'&&<><label className="search"><Search size={18}/><input placeholder="搜索代码或基金名称" value={query} onChange={e=>setQuery(e.target.value)}/></label><p className="section-note">按正式均线偏离率排序。正式信号与实时预览分别显示；预览不产生正式操作记录。</p><div className="card-grid">{data.etf_formal.filter(r=>`${r['代码']}${r['ETF名称']}`.includes(query)).map(row=><EtfCard key={String(row['代码'])} formal={row} preview={data.etf_preview.find(p=>p['代码']===row['代码'])} item={data.items.find(i=>i.code===row['代码'])} data={data} action={actionByCode.get(String(row['代码']))}/>)}</div></>}
- {tab==='策略'&&<><section className="panel"><StrategyCurve rows={data.strategy.daily}/><p className="section-note">初始资金 {fmt(data.strategy_parameters['初始资金'])} 元 · {String(data.strategy_parameters['开始日期']).slice(0,10)} 起 · 前复权正式收盘 · 同收盘成交 · {fmt(data.strategy_parameters['整手份数'],0)} 份整手 · 单边费率 {fmt(data.strategy_parameters['单边费率'],5)}。初始持有须先退出再买入，承接仓位按业务规则延迟激活。</p><details><summary>策略摘要与费用</summary><Fields row={data.strategy.summary}/></details></section><TradePreview data={data}/><details className="panel"><summary>模拟交易记录</summary><Rows rows={[...data.strategy.trades].reverse()} empty="暂无模拟成交" limit={15}/></details><details className="panel"><summary>每日收益与盈亏</summary><Rows rows={[...data.strategy.daily].reverse()} limit={10}/></details></>}
+ {tab==='策略'&&<><section className="panel"><StrategyCurve rows={data.strategy.daily}/><p className="section-note">初始资金 {fmt(data.strategy_parameters['初始资金'])} 元 · {String(data.strategy_parameters['开始日期']).slice(0,10)} 起 · 前复权正式收盘 · 同收盘成交 · {fmt(data.strategy_parameters['整手份数'],0)} 份整手 · 单边费率 {fmt(data.strategy_parameters['单边费率'],5)}。初始持有须先退出再买入，承接仓位按业务规则延迟激活。</p><details><summary>策略摘要与费用</summary><Fields row={data.strategy.summary}/></details></section><TradePreview data={data}/><LatestRecords title="模拟交易记录" rows={[...data.strategy.trades].reverse()} empty="暂无模拟成交"/><LatestRecords title="每日收益与盈亏" rows={[...data.strategy.daily].reverse()} empty="暂无每日收益数据"/></>}
  {tab==='衍生品'&&<Derivatives data={data}/>}
  {tab==='ETF'&&<section className="section"><h2>指数择时参考</h2><p className="section-note">独立参考，不计入 ETF 权重或50万元模拟策略。</p><Notices messages={data.missing_index_codes.length ? [`指数正式数据尚缺目标日 ${data.expected_formal_date}：${data.missing_index_codes.join('、')}，请以各行日期为准。`] : []}/><IndexRows rows={data.index_formal}/>{data.index_preview.length>0&&<div><h3>指数实时预判</h3><IndexRows rows={data.index_preview}/></div>}</section>}
  <footer>页面快照 {data.generated_at} · 正式目标日 {data.expected_formal_date}<br/>所有盘中预览仅保留在服务器内存中</footer>

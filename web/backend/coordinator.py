@@ -203,7 +203,7 @@ class Coordinator:
         # Only the two position references. Existing updater checks recent gaps
         # and appends completed dates; it does not update browser quote state.
         if self._due("indexes", target):
-            self.stage = "检查两个指数参考的正式缓存"
+            self.stage = "检查指数参考的正式缓存"
             try:
                 pending = {name for name in timing.POSITION_INDEX_TIMING_STRATEGIES
                            if missing_recent_market_trade_dates(

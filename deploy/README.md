@@ -20,7 +20,7 @@
   修复正式价差更新使用盘中合并函数的问题：正式路径只追加未见日期；
   盘中覆盖只发生在瞬时对象中，不写缓存。
 - 指数参考：`position_timing` 读取 long/history/final/correction overlay；
-  更新经过稳定门面 `services.update_tasks`，只选择微盘股、中证500。
+  更新经过稳定门面 `services.update_tasks`，只选择微盘股、中证500、中证1000（MA30／2%）。
   内部 orchestration 依赖兼容门面注入，不应直接作为外部入口调用。
 - `components/position/realtime.py` 的 session/fragment 编排不被 Web 导入。
   Web 服务替换这部分运行状态管理，策略运算仍然共用。
@@ -154,7 +154,7 @@ NaN/NaT/pd.NA/Infinity转换为null，时间使用`YYYY-MM-DD HH:MM:SS`（上海
 - 所有盘中估值只在内存和 API 快照中，不能写 CSV、SQLite、正式持仓或收益曲线。
   Coordinator 调用现有共享行情，不因该估值增加行情请求。
 
-概览只展示盘中预判、近期操作指引和指数参考；50万元策略摘要只在策略页。
+概览展示盘中预判和全部近期操作指引；指数参考只在ETF页，核心信息常显、区间详情折叠。50万元策略摘要只在策略页。
 预判及 ETF 卡片的红/绿背景严格来自 `trade_preview.actions` 的买入/卖出；
 正式操作指引仅操作文字着色，且不包含盘中预览。记录指标与 ETF 区间数据直接显示，
 走势图仍按需加载。

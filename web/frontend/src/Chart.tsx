@@ -21,7 +21,7 @@ export function Chart({ rows, value = '净值', date = '日期', strategy = fals
     const line = document.createElement('div'), name = document.createElement('span'), amount = document.createElement('b')
     const n = row[key], numeric = typeof n === 'number' && Number.isFinite(n), percent = key.includes('(%)')
     name.textContent = label; amount.dataset.field = key
-    amount.textContent = numeric ? `${key!=='净值'&&n>0?'+':''}${n.toFixed(key==='净值'?6:2)}${percent?'%':''}` : '—'
+    amount.textContent = numeric ? `${key!=='净值'&&n>0?'+':''}${n.toFixed(key==='净值'?4:2)}${percent?'%':''}` : '—'
     if (numeric && key !== '净值') amount.style.color = n>0?'#ca3a44':n<0?'#188366':'#737d8c'
     line.style.cssText='display:flex;justify-content:space-between;gap:18px'; line.append(name,amount); box.append(line)
    }

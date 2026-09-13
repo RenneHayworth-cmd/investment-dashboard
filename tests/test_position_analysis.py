@@ -642,15 +642,16 @@ class PositionAnalysisTests(unittest.TestCase):
             {
                 "微盘股": {"code": "BK1158", "ma_period": 15, "threshold_pct": 2.5},
                 "中证500": {"code": "000905", "ma_period": 15, "threshold_pct": 1.0},
+                "中证1000": {"code": "000852", "ma_period": 30, "threshold_pct": 2.0},
             },
         )
-        self.assertEqual(table.index.tolist(), ["微盘股指数", "中证500"])
+        self.assertEqual(table.index.tolist(), ["微盘股指数", "中证500", "中证1000"])
         self.assertEqual(table.loc["微盘股指数", "代码"], "BK1158")
         self.assertEqual(table.loc["微盘股指数", "策略参数"], "MA15 / 2.5%")
         self.assertEqual(table.loc["微盘股指数", "择时判断"], "买入")
         self.assertEqual(table.loc["中证500", "策略参数"], "MA15 / 1.0%")
         self.assertEqual(table.loc["中证500", "择时判断"], "空仓")
-        self.assertTrue((table["数据状态"] == "正式收盘缓存").all())
+        self.assertTrue((table.loc[["微盘股指数", "中证500"], "数据状态"] == "正式收盘缓存").all())
 
     def test_timing_snapshot_retains_state_inside_band_and_marks_transitions(self):
         dates = pd.date_range("2026-07-01", periods=7, freq="D")
