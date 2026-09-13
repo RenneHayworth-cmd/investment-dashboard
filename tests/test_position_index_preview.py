@@ -116,5 +116,21 @@ def test_csi1000_uses_ma30_two_percent_without_mutating_formal_history():
     row=table.loc[table['代码']=='000852'].iloc[0]
     assert row['策略参数']=='MA30 / 2.0%'
     assert row['对应均线']==101.
+    assert abs(row['策略上轨'] - 103.02) < 1e-8
+    assert abs(row['策略下轨'] - 98.98) < 1e-8
     assert row['择时判断']=='买入'
+    pd.testing.assert_frame_equal(history,original)
+
+
+def test_timing_bands_follow_preview_ma_without_writing_cache():
+    from services.position_timing import calculate_etf_timing_snapshot
+    history=pd.DataFrame({'date':pd.bdate_range('2026-08-03',periods=30),'price':100.})
+    original=history.copy(deep=True)
+    with patch('core.cache.save_dataset',side_effect=AssertionError('no cache writes')):
+        formal=calculate_etf_timing_snapshot(history,ma_period=30,threshold_pct=2.)
+        preview=calculate_etf_timing_snapshot(pd.concat([history,pd.DataFrame({'date':[pd.Timestamp('2026-09-14')],'price':[130.]})]),ma_period=30,threshold_pct=2.)
+    assert formal['策略上轨']==102.
+    assert formal['策略下轨']==98.
+    assert abs(preview['策略上轨']-103.02)<1e-8
+    assert abs(preview['策略下轨']-98.98)<1e-8
     pd.testing.assert_frame_equal(history,original)

@@ -53,6 +53,8 @@ POSITION_INDEX_TIMING_COLUMNS = [
     "当日涨跌幅(%)",
     "策略参数",
     "对应均线",
+    "策略上轨",
+    "策略下轨",
     "偏离率(%)",
     "择时判断",
     "状态转换时间",
@@ -130,6 +132,8 @@ def calculate_etf_timing_snapshot(
     return {
         "策略参数": f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
         "策略均线": latest_ma,
+        "策略上轨": latest_ma * (1 + threshold),
+        "策略下轨": latest_ma * (1 - threshold),
         "策略偏离(%)": deviation_pct,
         "择时判断": latest_action,
         "状态转换时间": transition_date.strftime("%Y-%m-%d") if transition_date is not None else pd.NA,
@@ -333,6 +337,8 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
         row.update(
             {
                 "对应均线": snapshot.get("策略均线", pd.NA),
+                "策略上轨": snapshot.get("策略上轨", pd.NA),
+                "策略下轨": snapshot.get("策略下轨", pd.NA),
                 "偏离率(%)": snapshot.get("策略偏离(%)", pd.NA),
                 "择时判断": snapshot.get("择时判断", pd.NA),
                 "状态转换时间": snapshot.get("状态转换时间", pd.NA),
@@ -801,6 +807,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
         "当日涨跌幅(%)",
         "策略参数",
         "对应均线",
+    "策略上轨",
+    "策略下轨",
         "偏离率(%)",
         "择时判断",
         "状态转换时间",
@@ -863,6 +871,8 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
                         f"MA{int(ma_period)} / {float(threshold_pct):.1f}%",
                     ),
                     "对应均线": item.metrics.get("策略均线", pd.NA),
+                    "策略上轨": item.metrics.get("策略上轨", pd.NA),
+                    "策略下轨": item.metrics.get("策略下轨", pd.NA),
                     "偏离率(%)": item.metrics.get("策略偏离(%)", pd.NA),
                     "择时判断": etf_position_decision(
                         base_code,
