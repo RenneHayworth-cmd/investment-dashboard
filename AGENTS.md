@@ -584,6 +584,16 @@ git diff --stat
 
 Commit only relevant source changes. Do not revert unrelated user changes.
 
+## Numerical Formatting & Display Precision (数值格式化与精度规范)
+
+**核心铁律：所有面向用户展示的数值、UI组件、图表悬浮提示（Tooltip）及导出文件，必须显式做格式化，严禁直接输出原生浮点数（Raw Floats）或未截断的长尾小数。**
+
+1. **后端/数据层强制预格式化**：
+   - 不依赖前端图表库的隐式数字转换；在 Python / 数据组装阶段预先生成格式化字符串，再传入图表或导出结构。
+   - 金额、收益率、回撤、净值、价格和点数按字段语义明确保留精度。
+2. **导出文件**：
+   - 写入 CSV、Excel、JSON 前显式 round 浮点列，避免 IEEE 754 累加长尾误差。
+
 ## Position Web
 
 - `web/backend/` adapts existing `services/position_*` to FastAPI; never duplicate

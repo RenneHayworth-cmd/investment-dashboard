@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 
 from core.cache import load_dataset, save_dataset
+from core.paths import RAW_DIR
 
 
 EASTMONEY_CLIST_URLS = (
@@ -155,6 +156,17 @@ def filter_active_microcap_stocks(df):
         if column in result.columns:
             result[column] = pd.to_numeric(result[column], errors="coerce")
     mask = pd.Series(True, index=result.index)
+    if "快照日期" in result.columns and "代码" in result.columns:
+        # Retrospective snapshot correction only; not a PIT event source.
+        # 卓然股份公告2026-032 confirms suspension from May 6 to July 6,
+        # resuming July 7. Original observed rows/flags remain untouched.
+        # https://static.cninfo.com.cn/finalpage/2026-07-06/1225410291.PDF
+        snapshot_dates = pd.to_datetime(result["快照日期"], errors="coerce").dt.normalize()
+        zhuoran_suspended = (
+            result["代码"].astype(str).str.zfill(6).eq("688121")
+            & snapshot_dates.between("2026-05-06", "2026-07-06")
+        )
+        mask &= ~zhuoran_suspended
     if "最新价" in result.columns:
         mask &= result["最新价"].notna() & (result["最新价"] > 0)
     if "总市值(亿元)" in result.columns:
@@ -313,6 +325,43 @@ def save_microcap_constituent_snapshot(
     return merged, snapshot_date
 
 
+MICROCAP_HISTORY_EXTENSION_FILE = (
+    RAW_DIR / "eastmoney" / "reconstructed" / "microcap_history_extension_20260401_20260618.csv"
+)
+
+
+def load_microcap_index_series() -> pd.DataFrame:
+    """只读 BK1158 日线，在内存中以正式收盘确认行覆盖原始历史。"""
+    # Use the stable compatibility facade.  The focused index modules are
+    # rebound by that facade during the broader test suite, so importing the
+    # owner functions directly here would make this read path depend on test
+    # order and stale patched globals.
+    from services import index_ma20
+
+    history, _ = load_dataset("index_raw_微盘股", "index_history", "index_daily_raw")
+    finalized, _ = load_dataset("index_raw_微盘股", "index_final_history", "index_daily_raw")
+    effective = index_ma20.overlay_finalized_index_rows(history, finalized)
+    effective = index_ma20.filter_completed_market_dates(effective, "A股")
+    if effective is None or effective.empty:
+        return pd.DataFrame(columns=["日期_dt", "微盘股指数"])
+    result = effective[["trade_date", "close"]].rename(
+        columns={"trade_date": "日期_dt", "close": "微盘股指数"}
+    ).copy()
+    result["日期_dt"] = pd.to_datetime(result["日期_dt"]).dt.normalize()
+    return result.drop_duplicates("日期_dt", keep="last").reset_index(drop=True)
+
+
+def load_microcap_history_extension() -> pd.DataFrame:
+    if not MICROCAP_HISTORY_EXTENSION_FILE.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(MICROCAP_HISTORY_EXTENSION_FILE)
+        df["日期"] = pd.to_datetime(df["日期"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_microcap_constituent_snapshots() -> tuple[pd.DataFrame, dict | None]:
     cached_df, meta = load_dataset(
         CONSTITUENT_SNAPSHOT_SYMBOL,
@@ -327,7 +376,10 @@ def build_microcap_snapshot_metrics(
     pool_count: int = 400,
     micro_count: int = 20,
     median_rank: int = 200,
+    include_extension: bool = False,
 ) -> pd.DataFrame:
+    if include_extension:
+        raise ValueError("旧历史估算未经PIT验证，禁止混入BK1158快照指标。")
     snapshots = normalize_microcap_constituent_snapshots(snapshots_df)
     metric_columns = [
         "日期",
@@ -338,6 +390,17 @@ def build_microcap_snapshot_metrics(
         "口径",
     ]
     if snapshots.empty:
+        if include_extension:
+            ext_df = load_microcap_history_extension()
+            if not ext_df.empty:
+                for col in metric_columns:
+                    if col not in ext_df.columns:
+                        ext_df[col] = pd.NA
+                sub_ext = ext_df[metric_columns].copy()
+                for column in (f"第{median_rank}名市值(亿元)", f"微盘{micro_count}均值(亿元)"):
+                    if column in sub_ext.columns:
+                        sub_ext[column] = pd.to_numeric(sub_ext[column], errors="coerce").round(2)
+                return sub_ext.sort_values("日期").reset_index(drop=True)
         return pd.DataFrame(columns=metric_columns)
 
     rows = []
@@ -362,11 +425,27 @@ def build_microcap_snapshot_metrics(
                 f"第{median_rank}名市值(亿元)": median_value,
                 f"第{median_rank}名股票": median_stock,
                 f"微盘{micro_count}均值(亿元)": micro_mean,
-                "口径": "真实成分快照",
+                "口径": "存量快照",
             }
         )
 
     metrics = pd.DataFrame(rows, columns=metric_columns).sort_values("日期").reset_index(drop=True)
     for column in (f"第{median_rank}名市值(亿元)", f"微盘{micro_count}均值(亿元)"):
         metrics[column] = pd.to_numeric(metrics[column], errors="coerce").round(2)
+
+    if include_extension:
+        ext_df = load_microcap_history_extension()
+        if not ext_df.empty:
+            min_snap_date = metrics["日期"].min() if not metrics.empty else pd.Timestamp.max
+            sub_ext = ext_df[ext_df["日期"] < min_snap_date].copy()
+            if not sub_ext.empty:
+                for col in metric_columns:
+                    if col not in sub_ext.columns:
+                        sub_ext[col] = pd.NA
+                sub_ext = sub_ext[metric_columns]
+                for column in (f"第{median_rank}名市值(亿元)", f"微盘{micro_count}均值(亿元)"):
+                    if column in sub_ext.columns:
+                        sub_ext[column] = pd.to_numeric(sub_ext[column], errors="coerce").round(2)
+                metrics = pd.concat([sub_ext, metrics], ignore_index=True).sort_values("日期").reset_index(drop=True)
+
     return metrics

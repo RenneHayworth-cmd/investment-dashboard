@@ -167,6 +167,10 @@ powershell -ExecutionPolicy Bypass -File scripts\install_hermes_gateway_task.ps1
 - 「美股分析」：输入 AAPL、MSFT、COWZ 等美股代码，通过 TickFlow 拉取日线收盘价，复用均线、RSI、滚动年化收益率和回撤分析，并支持本地缓存与增量更新。参数区、顶部摘要、图表 Tab 顺序和回撤分析样式与「A股分析」保持一致。
 - 「微盘股」：从东方财富 BK1158 板块获取成分股，按总市值升序展示微盘股名单；页面默认优先复用本地缓存，只有勾选「联网刷新数据」或暂无缓存时才联网获取。联网刷新时保存 BK1158 真实成分快照，并基于真实快照展示第 200 名市值和微盘 20 均值。均值和第 200 名统计会剔除停牌股，不再提供当前成分历史回溯估算。脚本 scripts/update_microcap_snapshot.py 可用于定时保存当天真实成分快照。
 
+### 微盘历史研究：来源审计阶段
+
+`BK1158_observed`、`microcap_rule_reconstructed` 和固定候选池历史估算保持分离。正式成分快照统计不混入历史估算；页面的历史估算标签仅展示明确标注为“固定候选池历史估算”的研究曲线，不代表真实历史 BK1158，也不代表严格 PIT 回测。旧重建与历史扩展脚本保持 fail-closed，Gate 1A 与 Gate 1B 未通过时不得把存量快照或估算结果当作可信历史 Top20。阶段证据见 [研究 checkpoint](docs/microcap_research_checkpoint.md)。
+
 ## 持仓分析手机版 Web
 
 新增独立 React + FastAPI 手机入口，复用 `services/position_*`，保留原有
