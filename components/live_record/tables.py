@@ -16,6 +16,29 @@ from components.position_table import (
 from services.live_trading import summarize_live_position_performance
 
 
+def _display_price_status(status: object, price_time: object) -> str:
+    """Keep the status compact while exposing the timestamp in the table."""
+    status_text = "-" if status is None or pd.isna(status) else str(status).strip()
+    if status_text != "实时":
+        return status_text or "-"
+    timestamp = pd.to_datetime(price_time, errors="coerce")
+    if pd.isna(timestamp):
+        return status_text
+    return f"实时 {timestamp:%H:%M}"
+
+
+def _cost_price_cell(cost: object, price: object) -> str:
+    cost_text = format_live_number(cost, digits=3)
+    price_text = format_live_number(price, digits=3)
+    return (
+        '<td><div>'
+        f"{html.escape(cost_text)}"
+        "</div><div>"
+        f"{html.escape(price_text)}"
+        "</div></td>"
+    )
+
+
 def render_live_positions_table(
     positions: pd.DataFrame,
     *,
@@ -26,15 +49,14 @@ def render_live_positions_table(
         "标的名称",
         "代码",
         "市值",
-        "现价",
-        "行情状态",
+        "成本/现价",
         "持仓数量",
-        "成本",
         "当日盈亏",
         "累计盈亏",
         "仓位",
         "已实现盈亏",
         "累计手续费",
+        "行情状态",
     ]
 
     total = summarize_positions(positions)
@@ -58,18 +80,20 @@ def render_live_positions_table(
                 position_text_cell(row.name),
                 position_text_cell(row.symbol),
                 position_number_cell(row.market_value),
-                position_number_cell(row.latest_price, digits=3),
-                position_text_cell(
-                    getattr(row, "price_status", "-") or "-",
-                    title=getattr(row, "price_time", "") or "",
-                ),
+                _cost_price_cell(row.average_cost, row.latest_price),
                 position_quantity_cell(row.quantity),
-                position_number_cell(row.average_cost, digits=3),
                 position_pnl_cell(row.daily_pnl, row.daily_return_pct),
                 position_pnl_cell(row.cumulative_pnl, row.cumulative_return_pct),
                 position_number_cell(weight_pct, suffix="%"),
                 position_number_cell(row.realized_pnl),
                 position_number_cell(row.fee_amount),
+                position_text_cell(
+                    _display_price_status(
+                        getattr(row, "price_status", "-"),
+                        getattr(row, "price_time", ""),
+                    ),
+                    title=getattr(row, "price_time", "") or "",
+                ),
             ]
         )
 
@@ -85,13 +109,12 @@ def render_live_positions_table(
         position_number_cell(total["market_value"]),
         position_text_cell("-"),
         position_text_cell("-"),
-        position_text_cell("-"),
-        position_text_cell("-"),
         position_pnl_cell(total["daily_pnl"], total["daily_return_pct"]),
         position_pnl_cell(total["cumulative_pnl"], total["cumulative_return_pct"]),
         position_number_cell(total_weight_pct, suffix="%"),
         position_number_cell(total["realized_pnl"]),
         position_number_cell(total["fee_amount"]),
+        position_text_cell("-"),
     ]
     render_position_table(headers, rows, total_cells=total_cells, min_width=1220)
 

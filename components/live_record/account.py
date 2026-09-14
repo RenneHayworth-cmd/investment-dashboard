@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+
 import pandas as pd
 import streamlit as st
 
@@ -16,6 +18,82 @@ def _value(value: object, *, suffix: str = "", digits: int = 2) -> str:
     return f"{float(value):,.{digits}f}{suffix}"
 
 
+def _pnl_color(value: object) -> str:
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number) or float(number) == 0:
+        return "#1f2937"
+    return "#ef4444" if float(number) > 0 else "#166534"
+
+
+def _render_account_metric_cards(
+    cards: list[tuple[str, str, str | None, str | None]],
+) -> None:
+    card_html = []
+    for label, value, secondary, value_color in cards:
+        color_style = f' style="color:{value_color}"' if value_color else ""
+        inline_secondary = label in {"累计盈亏", "当日盈亏"} and secondary
+        value_html = (
+            f'<div class="live-account-metric-value"{color_style}>'
+            f'{html.escape(value)}'
+            f'<span class="live-account-metric-inline-secondary"{color_style}>'
+            f'{html.escape(secondary)}</span></div>'
+            if inline_secondary
+            else f'<div class="live-account-metric-value"{color_style}>{html.escape(value)}</div>'
+        )
+        card_html.append(
+            '<div class="live-account-metric-card">'
+            f'<div class="live-account-metric-label">{html.escape(label)}</div>'
+            f"{value_html}"
+            "</div>"
+        )
+    st.markdown(
+        """
+        <style>
+        .live-account-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin: 0.75rem 0 0.35rem;
+        }
+        .live-account-metric-card {
+            min-width: 0;
+            min-height: 84px;
+            padding: 0.72rem 0.7rem;
+            border: 1px solid var(--ui-border);
+            border-radius: 8px;
+            background: var(--ui-surface);
+            box-shadow: var(--ui-shadow);
+        }
+        .live-account-metric-label {
+            color: var(--ui-muted);
+            font-size: 0.86rem;
+            line-height: 1.25;
+            margin-bottom: 0.42rem;
+            white-space: nowrap;
+        }
+        .live-account-metric-value {
+            color: var(--ui-text);
+            font-size: 1.28rem;
+            line-height: 1.2;
+            font-weight: 680;
+            white-space: nowrap;
+        }
+        .live-account-metric-inline-secondary {
+            margin-left: 0.8rem;
+            font-size: 0.88rem;
+            font-weight: 560;
+            line-height: 1.2;
+            white-space: nowrap;
+        }
+        </style>
+        <div class="live-account-metric-grid">
+        """
+        + "".join(card_html)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_live_account_summary(snapshot: dict[str, object]) -> None:
     summary = dict(snapshot.get("summary") or {})
     initialized = bool(snapshot.get("initialized"))
@@ -25,42 +103,53 @@ def render_live_account_summary(snapshot: dict[str, object]) -> None:
         st.warning(
             "账户资金待初始化：请在“实盘记录”先录入一笔日期不晚于首笔成交的期初资金。"
         )
-    render_metric_grid(
+    _render_account_metric_cards(
         [
             (
                 "账户总资产",
                 money(summary.get("total_assets")) if initialized else "-",
-                "持仓市值加账户现金；数据源为实盘成交和资金流水",
+                None,
+                None,
             ),
             (
                 "累计盈亏",
                 money(summary.get("account_pnl")) if initialized else "-",
-                "总资产减累计净外部投入",
+                _value(summary.get("cumulative_return_pct"), suffix="%")
+                if initialized
+                else None,
+                _pnl_color(summary.get("account_pnl")) if initialized else None,
             ),
             (
                 "当日盈亏",
                 money(summary.get("daily_pnl")) if initialized else "-",
-                "相对上一完整估值日，已剔除资金转入转出",
+                _value(summary.get("daily_return_pct"), suffix="%")
+                if initialized
+                else None,
+                _pnl_color(summary.get("daily_pnl")) if initialized else None,
             ),
-            ("持仓市值", money(summary.get("market_value")), f"估值日期：{valuation_text}"),
+            ("持仓市值", money(summary.get("market_value")), None, None),
             (
-                "账户现金",
+                "可用资金",
                 money(summary.get("cash")) if initialized else "-",
-                "资金流水与成交收付自动汇总",
+                None,
+                None,
             ),
             (
                 "仓位比例",
                 _value(summary.get("position_ratio_pct"), suffix="%") if initialized else "-",
-                "持仓市值除以账户总资产",
+                None,
+                None,
+            ),
+            (
+                "账户净值",
+                _value(summary.get("nav"), digits=4) if initialized else "-",
+                None,
+                None,
             ),
         ]
     )
     if initialized:
-        st.caption(
-            f"账户累计收益率 {_value(summary.get('cumulative_return_pct'), suffix='%')}｜"
-            f"当日收益率 {_value(summary.get('daily_return_pct'), suffix='%')}｜"
-            f"账户净值 {_value(summary.get('nav'), digits=4)}｜估值日期 {valuation_text}。"
-        )
+        st.caption(f"估值日期：{valuation_text}")
     cash_warning = str(summary.get("cash_warning") or "")
     if cash_warning:
         st.warning(cash_warning)

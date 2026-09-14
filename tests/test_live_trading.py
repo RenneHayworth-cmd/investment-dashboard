@@ -1035,7 +1035,12 @@ class LiveTradingTests(unittest.TestCase):
         self.assertNotIn("继续显示最近一次完整估值", account_source)
 
         self.assertIn('"行情状态",', tables_source)
-        self.assertIn("position_number_cell(row.average_cost, digits=3)", tables_source)
+        self.assertIn('"成本/现价",', tables_source)
+        self.assertIn("_cost_price_cell(row.average_cost, row.latest_price)", tables_source)
+        self.assertGreater(
+            tables_source.index('"行情状态",'),
+            tables_source.index('"累计手续费",'),
+        )
         self.assertIn(
             "position_pnl_cell(row.daily_pnl, row.daily_return_pct)",
             tables_source,

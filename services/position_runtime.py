@@ -320,6 +320,7 @@ def apply_etf_realtime_quote(item: PositionItem, quote: dict[str, object]) -> Po
 
     quote_time = quote.get("quote_time")
     quote_date = pd.to_datetime(quote_time, errors="coerce")
+    metrics["实时报价时间"] = "" if pd.isna(quote_date) else quote_date.strftime("%Y-%m-%d %H:%M:%S")
     return PositionItem(
         category="ETF",
         code=symbol,

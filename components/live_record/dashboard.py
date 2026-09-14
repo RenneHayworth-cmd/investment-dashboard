@@ -174,8 +174,8 @@ def _render_performance_history(
         latest = daily.iloc[-1]
         render_metric_grid(
             [
-                ("账户总资产", money(latest["total_assets"]), "持仓市值加账户现金"),
-                ("账户现金", money(latest["cash"]), "截至该估值日的成交和资金流水"),
+                ("账户总资产", money(latest["total_assets"]), "持仓市值加可用资金"),
+                ("可用资金", money(latest["cash"]), "截至该估值日的成交和资金流水"),
                 ("累计盈亏", money(latest["account_pnl"]), "总资产减累计净外部投入"),
                 ("当日盈亏", money(latest["daily_pnl"]), "已剔除资金转入转出"),
                 ("累计收益率", f"{float(latest['cumulative_return_pct']):.2f}%", "按每日账户收益复合"),
@@ -249,7 +249,7 @@ def _render_performance_history(
             columns={
                 "date": "日期",
                 "market_value": "持仓市值",
-                "cash": "现金",
+                "cash": "可用资金",
                 "total_assets": "账户总资产",
                 "external_flow": "外部资金净流入",
                 "cumulative_external_capital": "累计净投入",

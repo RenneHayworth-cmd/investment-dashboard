@@ -354,7 +354,7 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
                     "策略上一区间涨幅(%)", pd.NA
                 ),
                 "数据状态": (
-                    f"实时预判 {quote_time:%H:%M:%S}" if preview else "正式收盘缓存"
+                    f"实时预判 {quote_time:%H:%M}" if preview else "正式收盘缓存"
                 ) + (f"；暂忽略{len(ignored_dates)}个已知历史缺口，按现有有效数据计算，待补齐" if ignored_dates else ""),
             }
         )
@@ -828,6 +828,10 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
             continue
         base_code = normalize_etf_base_code(item.code)
         is_parking_etf = base_code == "512890"
+        quote_time = pd.to_datetime(item.metrics.get("实时报价时间"), errors="coerce")
+        preview_status = (
+            f"实时预判 {quote_time:%H:%M}" if pd.notna(quote_time) else "实时预判"
+        )
         row = {
             "ETF名称": display_etf_name(base_code, item.name),
             "代码": base_code,
@@ -848,8 +852,7 @@ def build_etf_timing_table(items: list[PositionItem]) -> pd.DataFrame:
             "上一区间涨幅(%)": "-" if is_parking_etf else pd.NA,
             "数据状态": (
                 "正式历史待校验" if not item.formal_history_valid
-                else item.status if item.status in {"实时预判", "早盘预判", "午间预判", "收盘待确认"}
-                else "实时预判" if item.status == "盘中"
+                else preview_status if item.status in {"实时预判", "早盘预判", "午间预判", "收盘待确认", "盘中"}
                 else "无正式缓存" if item.dataframe is None or item.dataframe.empty
                 else "正式收盘缓存"
             ),

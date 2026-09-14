@@ -81,7 +81,7 @@ def render_etf_timing_table(
         .position-etf-summary-table th,
         .position-etf-summary-table td {{
             text-align: center;
-            padding: 0.35rem 0.25rem;
+            padding: 0.35rem 0.10rem;
             border-bottom: 1px solid rgba(49, 51, 63, 0.12);
             white-space: nowrap;
             vertical-align: middle;
