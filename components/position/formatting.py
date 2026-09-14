@@ -26,7 +26,7 @@ def format_etf_table_value(column: str, value: object) -> str:
     if text == "-":
         return text
     try:
-        if column in {"最新价", "对应均线", "触发收盘价"}:
+        if column in {"最新价", "对应均线", "触发收盘价", "策略上轨", "策略下轨"}:
             return format(
                 Decimal(text).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP),
                 ".3f",
@@ -46,8 +46,37 @@ def format_etf_table_value(column: str, value: object) -> str:
     return text
 
 
+def format_index_table_value(column: str, value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text == "-":
+        return text
+    try:
+        if column in {
+            "最新收盘",
+            "最新价",
+            "对应均线",
+            "触发收盘价",
+            "策略上轨",
+            "策略下轨",
+        }:
+            return format(
+                Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                ".2f",
+            )
+        if column in {"当日涨跌幅(%)", "偏离率(%)", "区间涨幅(%)", "上一区间涨幅(%)"}:
+            return format(
+                Decimal(text).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+                ".2f",
+            )
+    except (InvalidOperation, ValueError):
+        return text
+    return text
+
+
 def display_digits(item: position.PositionItem, metric_name: str) -> int:
-    if item.category == "ETF" and metric_name == "最新价":
+    if item.category == "ETF" and metric_name in {"最新价", "策略上轨", "策略下轨"}:
         return 3
     if item.category in {"期货", "期货价差", "期权"}:
         if metric_name in {"最新成交量", "最新持仓量"}:

@@ -13,6 +13,7 @@ from components.position import (
     display_position_code,
     filter_range,
     format_etf_table_value as _format_etf_table_value,
+    format_index_table_value as _format_index_table_value,
     format_metric_for_item,
     format_number,
     format_pct,
@@ -69,6 +70,11 @@ def format_etf_table_value(column: str, value: object) -> str:
     return _format_etf_table_value(column, value)
 
 
+def format_index_table_value(column: str, value: object) -> str:
+    """兼容原页面指数表格格式化入口。"""
+    return _format_index_table_value(column, value)
+
+
 def render_etf_timing_table(df: pd.DataFrame) -> None:
     """兼容原页面 ETF 择时表入口。"""
     _render_etf_timing_table(df, value_formatter=format_etf_table_value)
@@ -110,6 +116,7 @@ def render_etf_timing_section(
         derivative_refresh_request=derivative_refresh_request,
         save_to_cache=save_to_cache,
         value_formatter=format_etf_table_value,
+        index_value_formatter=format_index_table_value,
     )
 
 

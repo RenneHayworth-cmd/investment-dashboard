@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from components.position.formatting import format_etf_table_value
+from components.position.formatting import (
+    format_etf_table_value,
+    format_index_table_value,
+)
 from services import position_analysis as position_facade
 from services import position_models, position_runtime
 
@@ -433,6 +436,10 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(format_etf_table_value("最新价", 1.9), "1.900")
         self.assertEqual(format_etf_table_value("最新收盘", 3760.75), "3760.75")
         self.assertEqual(format_etf_table_value("当日涨跌幅(%)", 1.234), "1.23")
+        self.assertEqual(format_etf_table_value("策略上轨", 1.23456), "1.235")
+        self.assertEqual(format_etf_table_value("策略下轨", 1.2), "1.200")
+        self.assertEqual(format_index_table_value("策略上轨", 4000.126), "4000.13")
+        self.assertEqual(format_index_table_value("策略下轨", 3900.5), "3900.50")
 
     def test_recent_operation_guidance_lists_pure_and_half_position_transitions(self):
         data = pd.DataFrame(

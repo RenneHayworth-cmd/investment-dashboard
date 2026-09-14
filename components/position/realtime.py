@@ -14,7 +14,10 @@ from components.position.cards_tables import (
     render_etf_timing_table,
     render_position_cards,
 )
-from components.position.formatting import position_key
+from components.position.formatting import (
+    format_index_table_value,
+    position_key,
+)
 from components.position.performance import render_position_timing_performance
 from services import position_analysis as position
 from services.index_realtime import fetch_realtime_index_quotes
@@ -37,6 +40,7 @@ def render_etf_timing_section_impl(
     derivative_refresh_request: int,
     save_to_cache: bool,
     value_formatter: Callable[[str, object], str],
+    index_value_formatter: Callable[[str, object], str] | None = None,
 ) -> None:
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     quote_codes = sorted(set(quote_codes or etf_codes))
@@ -573,11 +577,14 @@ def render_etf_timing_section_impl(
         st.session_state["position_index_realtime_preview"] = {
             "date": preview_date, "quotes": index_quotes, "error": index_error,
         }
+    actual_index_value_formatter = (
+        index_value_formatter or format_index_table_value
+    )
     render_etf_timing_table(
         position.build_position_index_timing_table(
             realtime_quotes=index_quotes, market_now=market_now,
         ).rename(columns={"最新收盘": "最新价"}),
-        value_formatter=value_formatter,
+        value_formatter=actual_index_value_formatter,
     )
     if index_error:
         st.warning(f"{index_error}；保留上次有效报价，无报价时显示正式收盘缓存。")

@@ -14,9 +14,12 @@ const label = (v: Value | undefined) => v == null || v === '-' ? '待数据' : S
 const actionClass = (action: Value | undefined) => action === '买入' ? 'action-buy' : action === '卖出' ? 'action-sell' : ''
 const actionTextClass = (action: Value | undefined) => action === '买入' ? 'up' : action === '卖出' ? 'down' : ''
 const recordAction = (row: Row) => row['操作'] ?? row['操作指引']
-const fieldDigits = (key: string) => /数量/.test(key) ? 0 : /价格|参考价|均线|收盘|成交价|上轨|下轨/.test(key) ? 3 : /净值/.test(key) ? 4 : 2
+const fieldDigits = (key: string, isIndex = false) => /数量/.test(key) ? 0 : /价格|参考价|均线|收盘|成交价|上轨|下轨/.test(key) ? (isIndex ? 2 : 3) : /净值/.test(key) ? 4 : 2
 function Notices({ messages }: { messages: string[] }) { return <>{messages.filter(Boolean).map((m, i) => <p key={i} className="notice" role="status">{m}</p>)}</> }
-function Fields({ row, keys }: { row: Row; keys?: string[] }) { return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' || k === '操作指引' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], fieldDigits(k))}</dd></div>)}</dl> }
+function Fields({ row, keys, isIndex }: { row: Row; keys?: string[]; isIndex?: boolean }) {
+ const indexMode = isIndex ?? Boolean(row['指数名称'])
+ return <dl className="fields">{(keys || Object.keys(row)).map(k => <div key={k}><dt>{k}</dt><dd className={k === '操作' || k === '操作指引' ? actionTextClass(row[k]) : /盈亏|收益|涨跌|涨幅|偏离/.test(k) ? sign(row[k]) : ''}>{fmt(row[k], fieldDigits(k, indexMode))}</dd></div>)}</dl>
+}
 function RecordCard({ row, tradeAction = false }: { row: Row; tradeAction?: boolean }) {
  const priority = ['基金名称','ETF名称','标的名称','代码','日期','操作','择时判断','策略参数','最新收盘','持仓数量','持仓市值','账户权重(%)','当日盈亏','每日盈亏','每日收益率(%)','净值','成交价','成交金额']
  const shown = priority.filter(k => k in row)
@@ -37,11 +40,11 @@ function IndexRows({ rows, previews }: { rows: Row[]; previews: Row[] }) {
  return rows.length ? <div className="record-grid">{rows.map(formal=>{
  const preview=previews.find(r=>r['代码']===formal['代码']), active=!!preview&&/实时预判|实时报价/.test(String(preview['数据状态'])), shown=active?preview!:formal
  return <article className="panel index-reference" key={String(formal['代码'])}><div className="card-heading"><div className="index-title"><strong>{String(formal['指数名称'])}</strong><span className="code">{String(formal['代码'])}</span></div><span className="param">{fmt(formal['策略参数'])}</span></div>
- <div className="price"><strong>{fmt(shown['最新收盘'],3)}</strong><span className={sign(shown['当日涨跌幅(%)'])}>{signed(shown['当日涨跌幅(%)'],'%')}</span></div>
+ <div className="price"><strong>{fmt(shown['最新收盘'], 2)}</strong><span className={sign(shown['当日涨跌幅(%)'])}>{signed(shown['当日涨跌幅(%)'],'%')}</span></div>
  <div className="signal"><span>正式状态 <b>{label(formal['择时判断'])}</b></span><span className={active?'preview':'muted'}>{active?`预览 ${label(shown['择时判断'])}`:'无盘中预览'}</span></div>
- <div className="metrics mini"><div><span>{active?'预览均线':'对应均线'}</span><b>{fmt(shown['对应均线'],3)}</b></div><div><span>偏离率</span><b className={sign(shown['偏离率(%)'])}>{signed(shown['偏离率(%)'],'%')}</b></div></div>
+ <div className="metrics mini"><div><span>{active?'预览均线':'对应均线'}</span><b>{fmt(shown['对应均线'], 2)}</b></div><div><span>偏离率</span><b className={sign(shown['偏离率(%)'])}>{signed(shown['偏离率(%)'],'%')}</b></div></div>
  <p className="muted small">正式日期 {fmt(formal['数据截止日'])}</p><p className="section-note">{fmt(shown['数据状态'])}</p>
- <details><summary>区间表现与详情</summary><p className="section-note">{active?'盘中预览轨道 · 不写缓存':'正式收盘轨道'}</p><Fields row={shown} keys={['策略上轨','策略下轨']}/><Fields row={formal} keys={['状态转换时间','区间涨幅(%)','上一状态转换时间','上一区间涨幅(%)']}/></details></article>
+ <details><summary>区间表现与详情</summary><p className="section-note">{active?'盘中预览轨道 · 不写缓存':'正式收盘轨道'}</p><Fields row={shown} keys={['策略上轨','策略下轨']} isIndex/><Fields row={formal} keys={['状态转换时间','区间涨幅(%)','上一状态转换时间','上一区间涨幅(%)']} isIndex/></details></article>
  })}</div> : <p className="empty">暂无指数参考数据</p>
 }
 function LatestRecords({title,rows,empty}: {title:string;rows:Row[];empty:string}) {
