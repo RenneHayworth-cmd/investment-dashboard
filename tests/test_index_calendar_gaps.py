@@ -53,28 +53,27 @@ def test_multi_year_history_excludes_holidays_without_mutation():
     history = history_since_2022()
     original = history.copy(deep=True)
     rows = preview(history)
-    assert rows['择时判断'].tolist() == ['买入','买入']
+    assert (rows['择时判断'] == '买入').all()
     assert all('实时预判' in status for status in rows['数据状态'])
     pd.testing.assert_frame_equal(history, original)
 
 
-def test_real_old_gap_still_blocks_hysteresis_preview():
+def test_old_gap_outside_ma_window_does_not_block_preview():
     history = history_since_2022()
     history = history[history.trade_date != pd.Timestamp('2023-01-10')]
     rows = preview(history)
-    assert rows['择时判断'].isna().all()
-    assert all('2023-01-10起共1个交易日' in status for status in rows['数据状态'])
+    assert (rows['择时判断'] == '买入').all()
+    assert all('实时预判' in status for status in rows['数据状态'])
 
 
-def test_only_microcap_approved_gaps_allow_preview_without_fabricated_rows():
+def test_old_gaps_allow_all_index_previews_without_fabricated_rows():
     history = history_since_2022()
     gaps = pd.to_datetime(['2026-04-03','2026-04-07','2026-05-25','2026-07-01'])
     history = history[~history.trade_date.isin(gaps)]
     original = history.copy(deep=True)
     rows = preview(history).set_index('代码')
     assert rows.loc['BK1158','择时判断'] == '买入'
-    assert '暂忽略4个已知历史缺口' in rows.loc['BK1158','数据状态']
-    assert pd.isna(rows.loc['000905','择时判断'])
+    assert (rows['择时判断'] == '买入').all()
     pd.testing.assert_frame_equal(history, original)
     # An additional genuine missing session remains blocking.
     history = history[history.trade_date != pd.Timestamp('2026-09-10')]
@@ -87,12 +86,43 @@ def test_insufficient_ma_rows_still_do_not_produce_preview_signal():
     assert (rows['数据状态'] == '正式缓存不足').all()
 
 
-def test_unknown_calendar_year_is_not_reported_as_missing_trading_days():
+def test_old_unknown_calendar_year_does_not_block_current_ma():
     history = pd.concat([pd.DataFrame({'trade_date':[pd.Timestamp('2021-12-31')],'close':[100.]}),history_since_2022()])
     rows = preview(history)
-    assert rows['择时判断'].isna().all()
-    assert all('交易日历未覆盖2021年' in status for status in rows['数据状态'])
+    assert (rows['择时判断'] == '买入').all()
+    assert all('实时预判' in status for status in rows['数据状态'])
     assert all('正式历史缺少' not in status for status in rows['数据状态'])
+
+
+@pytest.mark.parametrize('name,period', [('中证500',15), ('中证1000',30)])
+def test_exact_ma_window_with_old_uncovered_history_can_preview(name, period):
+    recent = pd.DataFrame({
+        'trade_date': pd.bdate_range(end='2026-09-10', periods=period - 1),
+        'close': 100.,
+    })
+    old = pd.DataFrame({
+        'trade_date': pd.to_datetime([f'{year}-01-04' for year in range(2005,2022)]),
+        'close': 50.,
+    })
+    history = pd.concat([old, recent], ignore_index=True)
+    original = history.copy(deep=True)
+    with patch('core.cache.save_dataset', side_effect=AssertionError('no cache writes')):
+        row = preview(history).set_index('指数名称').loc[name]
+    # Older data remains available to retain an already established holding.
+    assert row['择时判断'] == '持有'
+    assert row['对应均线'] == pytest.approx((100 * (period - 1) + 110) / period)
+    assert '实时预判' in row['数据状态']
+    pd.testing.assert_frame_equal(history, original)
+
+
+def test_gap_only_in_ma30_window_blocks_csi1000_but_not_csi500():
+    history = pd.DataFrame({
+        'trade_date': pd.bdate_range(end='2026-09-10', periods=40), 'close': 100.,
+    }).drop(index=20)
+    rows = preview(history).set_index('代码')
+    assert rows.loc['000905', '择时判断'] == '买入'
+    assert pd.isna(rows.loc['000852', '择时判断'])
+    assert '暂停择时预判' in rows.loc['000852', '数据状态']
 
 
 def test_old_uncovered_year_also_emits_coverage_warning():

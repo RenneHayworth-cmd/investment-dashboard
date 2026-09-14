@@ -12,7 +12,10 @@ $logFile = Join-Path $logDir "position_timing_trade_alert_task.log"
 $fallbackLogFile = Join-Path $env:TEMP "investment_dashboard_position_timing_trade_alert.log"
 $wsl = Join-Path $env:WINDIR "System32\wsl.exe"
 
-$pythonCommand = "export HERMES_SEND_BIN=/home/renne/.local/bin/hermes; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS=10; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_MAX_RETRIES=0; cd /home/renne/investment_dashboard && exec /usr/bin/timeout --signal=TERM --kill-after=10s 8m .venv/bin/python scripts/monitor_position_timing_trades.py"
+# Scheduled tasks do not reliably pass the interactive Windows environment into
+# the WSL child process. Keep the local production channel policy explicit at
+# the task boundary so alert_delivery.py cannot fail closed by accident.
+$pythonCommand = "export ENABLE_FANGTANG=false; export ENABLE_WECHAT=true; export HERMES_SEND_BIN=/home/renne/.local/bin/hermes; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS=10; export INVESTMENT_DASHBOARD_ALERT_TICKFLOW_MAX_RETRIES=0; cd /home/renne/investment_dashboard && exec /usr/bin/timeout --signal=TERM --kill-after=10s 8m .venv/bin/python scripts/monitor_position_timing_trades.py"
 if ($TestNotification -and $DryRun) {
     throw "DryRun and TestNotification cannot be used together."
 }

@@ -263,10 +263,14 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
         )
         ignored_dates = []
         if preview:
-            # Keep gap protection except the explicitly accepted BK1158 dates.
+            # Only the current MA window gates the transient preview. Older
+            # history still supplies hysteresis/transition context, but calendar
+            # coverage or gaps outside this window must not suppress today's MA.
+            required_history = timing_history.tail(max(ma_period - 1, 1))
+            window_start = required_history["date"].min()
             market = get_market_window("A股")
             previous_session = previous_trading_day(market, now.date())
-            uncovered = uncovered_calendar_years(market, timing_history["date"].min().date(), previous_session)
+            uncovered = uncovered_calendar_years(market, window_start.date(), previous_session)
             if uncovered:
                 row.update({
                     "数据截止日": now.strftime("%Y-%m-%d"),
@@ -274,7 +278,7 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
                     "数据状态": (
                         f"实时报价 {quote_time:%H:%M:%S}；交易日历未覆盖"
                         + "、".join(map(str, uncovered))
-                        + "年，无法核验正式历史完整性；暂停择时预判"
+                        + "年，无法核验均线所需近期数据；暂停择时预判"
                     ),
                 })
                 rows.append(row)
@@ -282,7 +286,7 @@ def build_position_index_timing_table(*, realtime_quotes: dict | None = None, ma
             observed_dates = set(timing_history["date"].dt.date)
             missing_dates = [
                 day.date()
-                for day in pd.bdate_range(timing_history["date"].min(), previous_session)
+                for day in pd.bdate_range(window_start, previous_session)
                 if day.date() not in observed_dates and not is_market_holiday(market, day.date())
             ]
             allowed = POSITION_INDEX_ALLOWED_HISTORY_GAPS.get(str(strategy["code"]), frozenset())

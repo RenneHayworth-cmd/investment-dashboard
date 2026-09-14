@@ -36,14 +36,14 @@ class IndexPreviewTests(unittest.TestCase):
 
     def test_internal_history_gap_blocks_preview_even_when_latest_session_exists(self):
         dates = pd.bdate_range(end="2026-09-07", periods=50)
-        history = pd.DataFrame({"trade_date": dates, "close": 100.0}).drop(index=5)
+        history = pd.DataFrame({"trade_date": dates, "close": 100.0}).drop(index=45)
         now = datetime(2026, 9, 8, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         with patch("services.position_timing._load_position_index_timing_history", return_value=history):
             row = build_position_index_timing_table(
                 realtime_quotes={"微盘股": {"price": 110, "quote_time": now}}, market_now=now,
             ).iloc[0]
         self.assertTrue(pd.isna(row["择时判断"]))
-        self.assertIn(dates[5].strftime("%Y-%m-%d"), row["数据状态"])
+        self.assertIn(dates[45].strftime("%Y-%m-%d"), row["数据状态"])
 
     def test_holiday_gap_does_not_block_preview(self):
         history = pd.DataFrame({
