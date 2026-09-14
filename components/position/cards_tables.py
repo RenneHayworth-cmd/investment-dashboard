@@ -19,6 +19,25 @@ from services import position_analysis as position
 
 TableValueFormatter = Callable[[str, object], str]
 
+_TIMING_TABLE_HEADER_LINEBREAKS: dict[str, str] = {
+    "当日涨跌幅(%)": "当日涨跌<br>幅(%)",
+    "偏离率(%)": "偏离率<br>(%)",
+    "状态转换时间": "状态转换<br>时间",
+    "区间涨幅(%)": "区间涨幅<br>(%)",
+    "上一状态转换时间": "上一状态<br>转换时间",
+    "上一区间涨幅(%)": "上一区间<br>涨幅(%)",
+    "数据截止日": "数据<br>截止日",
+    "组合权重": "组合<br>权重",
+    "组合权重比例": "组合<br>权重",
+}
+
+
+def _format_table_header_html(column: str) -> str:
+    text = str(column)
+    if text in _TIMING_TABLE_HEADER_LINEBREAKS:
+        return _TIMING_TABLE_HEADER_LINEBREAKS[text]
+    return html.escape(text)
+
 
 def render_etf_timing_table(
     df: pd.DataFrame,
@@ -28,7 +47,7 @@ def render_etf_timing_table(
     if df is None or df.empty:
         st.info("当前没有可展示的 ETF 汇总数据。")
         return
-    headers = "".join(f"<th>{html.escape(str(column))}</th>" for column in df.columns)
+    headers = "".join(f"<th>{_format_table_header_html(column)}</th>" for column in df.columns)
     timing_column_index = df.columns.get_loc("择时判断") + 1
     rows = []
     for _, row in df.iterrows():
@@ -52,6 +71,7 @@ def render_etf_timing_table(
             width: 100%;
             border-collapse: collapse;
             font-size: 0.92rem;
+            table-layout: auto;
         }}
         .position-etf-summary-table-scroll {{
             width: 100%;
@@ -61,13 +81,21 @@ def render_etf_timing_table(
         .position-etf-summary-table th,
         .position-etf-summary-table td {{
             text-align: center;
-            padding: 0.45rem 0.6rem;
+            padding: 0.35rem 0.25rem;
             border-bottom: 1px solid rgba(49, 51, 63, 0.12);
             white-space: nowrap;
+            vertical-align: middle;
         }}
         .position-etf-summary-table th {{
             font-weight: 600;
             background: rgba(49, 51, 63, 0.04);
+            line-height: 1.25;
+        }}
+        .position-etf-summary-table td:last-child {{
+            white-space: normal;
+            min-width: 70px;
+            max-width: 110px;
+            line-height: 1.2;
         }}
         .position-etf-summary-table tr.timing-buy td {{
             background: rgba(254, 226, 226, 0.72);

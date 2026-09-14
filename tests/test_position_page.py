@@ -522,6 +522,41 @@ render_position_detail(item)
         )
         load_option.assert_not_called()
 
+    def test_etf_timing_table_renders_multiline_headers(self):
+        source = """
+import pandas as pd
+from components.position.cards_tables import render_etf_timing_table
+
+df = pd.DataFrame([{
+    "ETF名称": "红利低波",
+    "代码": "512890",
+    "组合权重": "35%",
+    "最新价": 1.025,
+    "当日涨跌幅(%)": 0.35,
+    "偏离率(%)": 0.69,
+    "状态转换时间": "2026-09-11",
+    "区间涨幅(%)": 2.35,
+    "上一状态转换时间": "2026-08-15",
+    "上一区间涨幅(%)": 5.12,
+    "数据截止日": "2026-09-11",
+    "择时判断": "持有",
+}])
+render_etf_timing_table(df, value_formatter=lambda col, val: str(val))
+"""
+        app = AppTest.from_string(source, default_timeout=20).run()
+        self.assertEqual(list(app.exception), [])
+        markdown_body = app.markdown[0].value
+        self.assertIn("<th>当日涨跌<br>幅(%)</th>", markdown_body)
+        self.assertIn("<th>偏离率<br>(%)</th>", markdown_body)
+        self.assertIn("<th>状态转换<br>时间</th>", markdown_body)
+        self.assertIn("<th>区间涨幅<br>(%)</th>", markdown_body)
+        self.assertIn("<th>上一状态<br>转换时间</th>", markdown_body)
+        self.assertIn("<th>上一区间<br>涨幅(%)</th>", markdown_body)
+        self.assertIn("<th>数据<br>截止日</th>", markdown_body)
+        self.assertIn("<th>组合<br>权重</th>", markdown_body)
+        self.assertIn("<th>ETF名称</th>", markdown_body)
+
 
 if __name__ == "__main__":
     unittest.main()
+
