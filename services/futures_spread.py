@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -370,14 +371,18 @@ def append_futures_spot_row(
         return result
 
     try:
-        import akshare as ak
-
-        spot_df = ak.futures_zh_spot(
-            symbol=contract.strip().upper(),
-            market=_spot_market_for_contract(contract),
-            adjust="0",
-        )
+        if os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS"):
+            spot_df = _fetch_futures_spot_from_sina_direct(contract)
+        else:
+            import akshare as ak
+            spot_df = ak.futures_zh_spot(
+                symbol=contract.strip().upper(),
+                market=_spot_market_for_contract(contract),
+                adjust="0",
+            )
     except Exception as akshare_exc:
+        if os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS"):
+            return result
         try:
             spot_df = _fetch_futures_spot_from_sina_direct(contract)
         except Exception as direct_exc:
@@ -443,15 +448,18 @@ def normalize_futures_daily(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_futures_daily_from_tickflow(contract: str, api_key: str = "") -> pd.DataFrame:
-    from tickflow import TickFlow
+    from services.fund_analysis import _tickflow_client_from_env
 
     symbol = infer_tickflow_futures_symbol(contract)
-    client = TickFlow(api_key=api_key) if api_key else TickFlow.free()
+    client = _tickflow_client_from_env(api_key)
     df = client.klines.get(symbol, period="1d", count=5000, as_dataframe=True)
     return normalize_futures_daily(df)
 
 
 def fetch_futures_daily_from_akshare(contract: str) -> pd.DataFrame:
+    # Production uses the same Sina source with an explicit HTTP timeout.
+    if os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS"):
+        return _fetch_futures_daily_from_sina_direct(contract)
     import akshare as ak
 
     try:
