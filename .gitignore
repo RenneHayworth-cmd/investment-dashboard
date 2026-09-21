@@ -15,3 +15,6 @@ playwright-report/
 test-results/
 reminder-state/
 *.sqlite3
+
+# Microcap simulation process lock (runtime only)
+cache.microcap_rotation.lock

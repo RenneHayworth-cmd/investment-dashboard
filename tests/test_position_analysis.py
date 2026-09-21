@@ -323,7 +323,7 @@ class PositionAnalysisTests(unittest.TestCase):
     def test_default_spread_groups_include_iron_ore_and_csi_1000(self):
         self.assertEqual(
             DEFAULT_SPREAD_GROUPS,
-            [["I2701", "I2705"], ["IM2609", "IM2703"]],
+            [["I2701", "I2705"], ["IM2610", "IM2703"]],
         )
 
     def test_parse_spread_groups_keeps_each_line_independent(self):

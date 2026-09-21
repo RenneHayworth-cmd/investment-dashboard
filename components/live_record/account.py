@@ -51,7 +51,7 @@ def _render_account_metric_cards(
         <style>
         .live-account-metric-grid {
             display: grid;
-            grid-template-columns: repeat(7, minmax(0, 1fr));
+            grid-template-columns: repeat(6, minmax(0, 1fr));
             gap: 0.65rem;
             margin: 0.75rem 0 0.35rem;
         }
@@ -131,12 +131,6 @@ def render_live_account_summary(snapshot: dict[str, object]) -> None:
             (
                 "可用资金",
                 money(summary.get("cash")) if initialized else "-",
-                None,
-                None,
-            ),
-            (
-                "仓位比例",
-                _value(summary.get("position_ratio_pct"), suffix="%") if initialized else "-",
                 None,
                 None,
             ),

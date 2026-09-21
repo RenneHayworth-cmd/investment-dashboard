@@ -159,7 +159,7 @@ before a larger handoff or commit.
 - The `持仓分析` page tracks a fixed personal holding list across ETF, futures
   contracts, futures spreads, and reusable futures-option data. Its default
   futures contract is `I2701`; its default spreads are `I2701 - I2705` and
-  `IM2609 - IM2703`, calculated independently with the futures-spread service.
+  `IM2610 - IM2703`, calculated independently with the futures-spread service.
   On an A-share trading day, fetch one ETF quote batch every 10 minutes from
   09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
   lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
@@ -621,3 +621,13 @@ Commit only relevant source changes. Do not revert unrelated user changes.
   is sent. Keep current five Shanghai notification slots and market calendar.
 - Deploy units and operations: deploy/REMINDERS.md. During migration the timer
   is dry-run; activating Fangtang requires user confirmation that Windows Fangtang stopped.
+
+## Microcap20 ABCD
+
+- Keep the ABCD facade in services/microcap_rotation.py; UI and CLI share it.
+- New simulation accounts require explicit enablement; browsing is cache-only.
+- Preserve immutable input batches, next-session execution, fixed 10000-yuan stock sizing, and 2-yuan fill fees.
+- Strict v1 inputs remain fail-closed. User-authorized v2 prioritizes execution: missing prices skip only affected trades, carry valuations are marked, and unknown eligibility/events remain explicitly provisional. Never mark evidence complete merely because an event list is empty.
+- v2 launches today from the previous saved close/snapshot; never create intraday fills for a close-only account.
+- Historical union research stays separate from forward simulation and live_trades.
+- Use tests/test_microcap_rotation.py and tests/test_microcap_rotation_ui.py; see docs/microcap_rotation.md.

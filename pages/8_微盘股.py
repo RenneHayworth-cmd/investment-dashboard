@@ -33,6 +33,12 @@ render_page_header(
 )
 
 
+section = st.segmented_control("微盘功能", ["ABCD策略", "成分与历史估算"], default="ABCD策略", key="microcap_section")
+if section == "ABCD策略":
+    from components.microcap_rotation import render_rotation
+    render_rotation()
+    st.stop()
+
 def format_cache_time(value: str | None) -> str:
     if not value:
         return "-"

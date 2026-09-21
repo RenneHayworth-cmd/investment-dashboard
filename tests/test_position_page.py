@@ -424,7 +424,7 @@ render_position_timing_performance([])
         self.assertTrue(any(call.args[0] == "I2701" for call in futures.call_args_list))
         self.assertEqual(
             [call.args[0] for call in spread.call_args_list],
-            [["I2701", "I2705"], ["IM2609", "IM2703"]],
+            [["I2701", "I2705"], ["IM2610", "IM2703"]],
         )
         self.assertTrue(etf.call_args_list)
         realtime_fetch.assert_not_called()

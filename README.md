@@ -177,3 +177,9 @@ powershell -ExecutionPolicy Bypass -File scripts\install_hermes_gateway_task.ps1
 Streamlit 工作台。包含ETF正式择时/盘中预览、衍生品、指数参考、近期指导及
 50万元模拟策略；不迁移真实账户记录。生产使用 Docker Compose + Caddy，
 行情与数据库挂载到仓库之外。详见 [Web部署与维护](deploy/README.md)。
+
+### 微盘20 ABCD
+
+「微盘股 → ABCD策略」提供四策略历史研究与独立22万元每日模拟，默认只读缓存。点击启用后开始积累，资格、行情或权益证据缺失时暂停；不会连接券商。历史研究披露候选池偏差，并与新模拟分开。Windows任务安装器提供工作日15:20及16:20更新。口径、证据接入及恢复说明见 [ABCD运行文档](docs/microcap_rotation.md)。
+
+2026-09-21：按用户要求启用ABCD v2执行优先模拟，首日采用前一交易日已保存名单，在今日收盘执行。TickFlow自动取数、AkShare补价；缺价逐笔跳过，资格及权益事件缺项显式标为待核验，不再要求人工上传证据文件才能运行。
