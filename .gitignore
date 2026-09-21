@@ -18,3 +18,6 @@ reminder-state/
 
 # Microcap simulation process lock (runtime only)
 cache.microcap_rotation.lock
+
+# Codex local working memory
+.workbuddy/memory/
