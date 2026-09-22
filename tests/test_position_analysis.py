@@ -105,7 +105,7 @@ class PositionAnalysisTests(unittest.TestCase):
     @staticmethod
     def _position_performance_items() -> list[PositionItem]:
         buy_codes = {"159501", "518850", "510500", "513310"}
-        hold_codes = {"159201", "159655", "159552", "513880"}
+        hold_codes = {"159201", "159655", "159552", "513880", "161128", "588000", "159915", "513260"}
         empty_codes = {"159545", "159967", "512890"}
         warmup_dates = pd.bdate_range(end="2026-08-04", periods=40)
         valuation_dates = pd.to_datetime(["2026-08-05", "2026-08-06"])
@@ -2748,9 +2748,11 @@ class PositionAnalysisTests(unittest.TestCase):
 
         self.assertEqual(sum(ETF_PORTFOLIO_WEIGHTS_PCT.values()), 100)
         self.assertEqual(table.loc["159201", "组合权重比例"], "5%")
-        self.assertEqual(table.loc["159501", "组合权重比例"], "15%")
-        self.assertEqual(table.loc["513260", "组合权重比例"], "0%")
-        self.assertEqual(table.loc["159915", "组合权重比例"], "0%")
+        self.assertEqual(table.loc["159501", "组合权重比例"], "10%")
+        self.assertEqual(table.loc["161128", "组合权重比例"], "2%")
+        self.assertEqual(table.loc["588000", "组合权重比例"], "1%")
+        self.assertEqual(table.loc["513260", "组合权重比例"], "1%")
+        self.assertEqual(table.loc["159915", "组合权重比例"], "1%")
 
     def test_512890_parking_snapshot_uses_only_aggregate_position_transitions(self):
         dates = pd.date_range("2026-07-01", periods=6, freq="D")
