@@ -105,6 +105,114 @@ def init_db() -> None:
             ON live_cash_flows(flow_date, flow_time, id)
             """
         )
+        # The microcap live ledger is intentionally isolated from the ETF
+        # live_trades/live_cash_flows tables and from all simulated accounts.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microcap_live_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_key TEXT NOT NULL UNIQUE,
+                trade_date TEXT NOT NULL,
+                trade_time TEXT,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('买入', '卖出')),
+                price REAL NOT NULL CHECK (price > 0),
+                quantity INTEGER NOT NULL CHECK (quantity > 0),
+                commission_amount REAL NOT NULL DEFAULT 5.0 CHECK (commission_amount >= 0),
+                stamp_tax_amount REAL NOT NULL DEFAULT 0.0 CHECK (stamp_tax_amount >= 0),
+                strategy TEXT,
+                notes TEXT,
+                source TEXT NOT NULL DEFAULT '手工',
+                import_batch_id INTEGER,
+                source_row INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_microcap_live_trades_date
+            ON microcap_live_trades(trade_date, trade_time, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microcap_live_cash_flows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_key TEXT NOT NULL UNIQUE,
+                flow_date TEXT NOT NULL,
+                flow_time TEXT,
+                entry_type TEXT NOT NULL CHECK (entry_type IN
+                    ('期初资金', '资金转入', '资金转出', '现金分红', '其他收入', '其他支出')),
+                amount REAL NOT NULL CHECK (amount >= 0),
+                symbol TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_microcap_live_cash_flows_date
+            ON microcap_live_cash_flows(flow_date, flow_time, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microcap_live_position_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_key TEXT NOT NULL UNIQUE,
+                event_date TEXT NOT NULL,
+                event_time TEXT,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                adjustment_type TEXT NOT NULL CHECK (adjustment_type IN ('期初持仓', '送转')),
+                quantity_delta INTEGER NOT NULL CHECK (quantity_delta > 0),
+                cost_basis_delta REAL NOT NULL DEFAULT 0 CHECK (cost_basis_delta >= 0),
+                notes TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_microcap_live_adjustments_date
+            ON microcap_live_position_adjustments(event_date, event_time, id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microcap_live_import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL UNIQUE,
+                file_name TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                imported_at TEXT NOT NULL,
+                mapping_json TEXT NOT NULL,
+                row_count INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS microcap_live_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                buy_commission REAL NOT NULL DEFAULT 5.0 CHECK (buy_commission >= 0),
+                sell_commission REAL NOT NULL DEFAULT 5.0 CHECK (sell_commission >= 0),
+                stamp_tax_rate_pct REAL NOT NULL DEFAULT 0.05 CHECK (stamp_tax_rate_pct >= 0),
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO microcap_live_settings
+                (id, buy_commission, sell_commission, stamp_tax_rate_pct, updated_at)
+            VALUES (1, 5.0, 5.0, 0.05, ?)
+            """,
+            (datetime.now().isoformat(timespec="seconds"),),
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS futures_statement_imports (

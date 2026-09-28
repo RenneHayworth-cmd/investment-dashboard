@@ -170,6 +170,34 @@ def apply_global_style() -> None:
             border-radius: 8px;
             box-shadow: none;
         }
+        div[data-testid="stMetricValue"],
+        div[data-testid="stMetricValue"] > div {
+            overflow: visible !important;
+            text-overflow: unset !important;
+            white-space: nowrap !important;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"]:has([data-testid="stMetricDeltaIcon-Up"]) div[data-testid="stMetricValue"] {
+            color: var(--ui-up) !important;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"]:has([data-testid="stMetricDeltaIcon-Down"]) div[data-testid="stMetricValue"] {
+            color: var(--ui-down) !important;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"] > div {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            column-gap: 0.55rem;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+            width: 100%;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+            width: auto;
+        }
+        .st-key-microcap_live_pnl_metrics div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+            display: inline-flex;
+            align-items: center;
+        }
         div[data-testid="stTabs"] button {
             color: var(--ui-muted);
         }

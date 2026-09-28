@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 from threading import Lock
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,8 +17,12 @@ EASTMONEY_CLIST_URLS = (
     "https://push2.eastmoney.com/api/qt/clist/get",
     "https://36.push2.eastmoney.com/api/qt/clist/get",
     "https://48.push2.eastmoney.com/api/qt/clist/get",
+    # Real-time host the quote-center web page uses for anonymous visitors.
+    "https://pushguest.eastmoney.com/api/qt/clist/get",
+    # Delayed quotes; last resort only.
     "https://push2delay.eastmoney.com/api/qt/clist/get",
 )
+EASTMONEY_DELAYED_HOSTS = frozenset({"push2delay.eastmoney.com"})
 EASTMONEY_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://quote.eastmoney.com/",
@@ -47,6 +52,7 @@ def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFram
     last_error: Exception | None = None
     stocks = []
     seen_codes = set()
+    source_hosts: list[str] = []
     total_count = None
     page = 1
 
@@ -74,6 +80,9 @@ def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFram
                         data = response.json()
                         if data.get("data", {}).get("diff"):
                             payload = data
+                            host = urlparse(url).hostname or url
+                            if host not in source_hosts:
+                                source_hosts.append(host)
                             break
                     except Exception as exc:
                         last_error = exc
@@ -110,6 +119,7 @@ def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFram
 
     fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
     rows = []
+    latest_quote_timestamp = None
     for stock in stocks:
         market_cap = _to_float(stock.get("f20"))
         latest_price = _to_float(stock.get("f2"))
@@ -120,6 +130,7 @@ def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFram
         quote_date = fetched_at.strftime("%Y-%m-%d")
         if quote_timestamp and quote_timestamp > 0:
             quote_date = datetime.fromtimestamp(quote_timestamp, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+            latest_quote_timestamp = max(latest_quote_timestamp or 0, quote_timestamp)
         if market_cap is None or market_cap <= 0:
             continue
         rows.append(
@@ -143,6 +154,13 @@ def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFram
     result = pd.DataFrame(rows)
     result = result.sort_values("总市值(亿元)").reset_index(drop=True)
     result.insert(0, "排名", range(1, len(result) + 1))
+    # Provenance lives in attrs so the table's columns (displayed and cached elsewhere) stay unchanged.
+    result.attrs["source_hosts"] = source_hosts
+    result.attrs["delayed"] = any(host in EASTMONEY_DELAYED_HOSTS for host in source_hosts)
+    result.attrs["quote_time"] = (
+        datetime.fromtimestamp(latest_quote_timestamp, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+        if latest_quote_timestamp else None
+    )
     return result
 
 

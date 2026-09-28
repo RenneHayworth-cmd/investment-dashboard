@@ -164,6 +164,10 @@ def render_return_calendar(
         if get_market_holiday_label(market, pd.Timestamp(value).date())
     }
     period_returns = build_live_period_returns(data, period=period, excluded_dates=excluded)
+    if "period_start" in period_returns.columns:
+        period_returns["period_start"] = pd.to_datetime(period_returns["period_start"])
+    if "period_end" in period_returns.columns:
+        period_returns["period_end"] = pd.to_datetime(period_returns["period_end"])
     _calendar_css()
 
     visible = period_returns.copy()

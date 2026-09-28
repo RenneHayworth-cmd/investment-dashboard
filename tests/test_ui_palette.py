@@ -67,7 +67,7 @@ class PaletteConsistencyTests(unittest.TestCase):
         migrated = [
             "components/position/cards_tables.py", "components/position_table.py",
             "components/live_record/tables.py", "components/live_record/account.py",
-            "components/live_record/dashboard.py",
+            "components/live_record/dashboard.py", "components/microcap_live/dashboard.py",
             "components/position/performance.py", "core/return_calendar.py",
         ]
         for name in migrated:
