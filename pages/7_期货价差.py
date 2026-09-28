@@ -7,6 +7,7 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
+from core.ui import apply_global_style
 from services.futures_spread import (
     SPREAD_CALCULATION_VERSION,
     build_cutoff_notes,
@@ -21,6 +22,7 @@ from services.futures_spread import (
 
 st.set_page_config(page_title="期货价差", layout="wide")
 init_db()
+apply_global_style()
 
 st.title("期货价差")
 st.caption("输入多个期货合约，选择基准合约，计算“基准 - 其他”的绝对价差。")
@@ -149,7 +151,7 @@ if cached_df is not None and not force_refresh and cache_matches_contracts(cache
 else:
     if cached_df is not None and not force_refresh:
         st.warning("本地缓存与当前合约组合不匹配，已重新联网获取。")
-    with st.spinner("正在获取期货数据并计算价差..."):
+    with st.spinner("正在获取期货数据并计算价差…"):
         data, errors = fetch_contracts(
             contracts,
             max_workers=int(max_workers),
@@ -216,7 +218,7 @@ with tabs[0]:
     chart_df["价差对"] = chart_df["价差对"].map(label_map)
     fig = px.line(chart_df, x="date", y="价差", color="价差对", title="绝对价差（基准 - 其他）")
     fig.update_layout(hovermode="x unified")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with tabs[1]:
     detail_df = spread_df.drop(

@@ -89,10 +89,10 @@ def _calendar_css() -> None:
         .live-return-detail{margin-top:.25rem;font-size:.7rem;line-height:1.2;opacity:.7;white-space:nowrap}
         .live-return-holiday{background:rgba(148,163,184,.06)}
         .live-return-holiday-name{margin-top:.34rem;color:rgb(217,119,6);font-size:.92rem;font-weight:650;line-height:1.25;white-space:nowrap}
-        .live-return-positive{color:rgb(159,18,57)}.live-return-negative{color:rgb(21,94,55)}
+        .live-return-positive{color:var(--ui-up)}.live-return-negative{color:var(--ui-down)}
         .live-return-zero,.live-return-unavailable{color:rgb(71,85,105)}
         .live-return-summary{margin-top:.65rem;display:flex;flex-wrap:wrap;justify-content:space-between;gap:.55rem 1.5rem;font-size:.92rem}
-        .live-return-summary strong{font-variant-numeric:tabular-nums}.live-return-summary .positive{color:rgb(190,18,60)}.live-return-summary .negative{color:rgb(22,101,52)}
+        .live-return-summary strong{font-variant-numeric:tabular-nums}.live-return-summary .positive{color:var(--ui-up)}.live-return-summary .negative{color:var(--ui-down)}
         </style>
         """,
         unsafe_allow_html=True,
@@ -101,10 +101,10 @@ def _calendar_css() -> None:
 
 def _navigate(key: str, current: int, minimum: int, maximum: int, formatter) -> int:
     previous, title, following = st.columns([1, 5, 1])
-    if previous.button("‹", key=f"{key}_previous", help="上一个期间", disabled=current <= minimum, use_container_width=True):
+    if previous.button("‹", key=f"{key}_previous", help="上一个期间", disabled=current <= minimum, width="stretch"):
         current = max(minimum, current - 1)
         st.session_state[key] = current
-    if following.button("›", key=f"{key}_next", help="下一个期间", disabled=current >= maximum, use_container_width=True):
+    if following.button("›", key=f"{key}_next", help="下一个期间", disabled=current >= maximum, width="stretch"):
         current = min(maximum, current + 1)
         st.session_state[key] = current
     title.markdown(

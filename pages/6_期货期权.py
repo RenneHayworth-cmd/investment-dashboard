@@ -9,6 +9,7 @@ import streamlit as st
 
 from core.cache import load_dataset, save_dataset
 from core.db import init_db
+from core.ui import apply_global_style
 from services.fund_analysis import (
     calculate_current_drawdown_info,
     calculate_yearly_drawdowns,
@@ -32,6 +33,7 @@ from services.futures_options_analysis import (
 
 st.set_page_config(page_title="期货期权", layout="wide")
 init_db()
+apply_global_style()
 
 st.title("期货期权")
 st.caption("输入期货或期权合约，查看日线走势、均线、涨跌幅、波动率和成交持仓摘要。")
@@ -262,7 +264,7 @@ if cached_df is not None and not force_refresh and cache_is_valid(cached_df):
 else:
     if cached_df is not None and not force_refresh:
         st.warning("本地缓存版本较旧，已重新联网获取。")
-    with st.spinner("正在获取行情数据..."):
+    with st.spinner("正在获取行情数据…"):
         try:
             result = fetch_futures_option_data(
                 raw_symbol=raw_symbol,
@@ -298,7 +300,7 @@ st.caption(f"数据来源：{source}")
 
 if is_chain:
     st.info("当前输入是期权月份，展示期权链表格；输入具体期权合约（例如 mo2606C5800）可查看日线走势。")
-    st.dataframe(result_df, use_container_width=True, hide_index=True)
+    st.dataframe(result_df, width="stretch", hide_index=True)
     csv_bytes = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button("下载期权链 CSV", data=csv_bytes, file_name=f"{display_symbol(raw_symbol)}_option_chain.csv", mime="text/csv")
     st.stop()
@@ -391,7 +393,7 @@ with tabs[0]:
     fig.update_yaxes(title_text="价格", row=1, col=1)
     fig.update_yaxes(title_text="涨跌%", row=2, col=1)
     fig.update_yaxes(title_text="成交量", row=3, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
 summary_tab = tabs[2] if show_drawdown else tabs[1]
 detail_tab = tabs[3] if show_drawdown else tabs[2]
@@ -444,19 +446,19 @@ if show_drawdown:
         dd_fig.update_xaxes(hoverformat="%Y-%m-%d")
         dd_fig.update_yaxes(title_text="价格", row=1, col=1)
         dd_fig.update_yaxes(title_text="回撤%", row=2, col=1)
-        st.plotly_chart(dd_fig, use_container_width=True)
+        st.plotly_chart(dd_fig, width="stretch")
 
         st.subheader("回撤波段")
         if drawdown_periods.empty:
             st.info("没有发现独立回撤波段。")
         else:
-            st.dataframe(drawdown_periods, use_container_width=True, hide_index=True)
+            st.dataframe(drawdown_periods, width="stretch", hide_index=True)
 
         st.subheader("年度最大回撤")
         if yearly_drawdowns.empty:
             st.info("没有年度回撤数据。")
         else:
-            st.dataframe(yearly_drawdowns, use_container_width=True, hide_index=True)
+            st.dataframe(yearly_drawdowns, width="stretch", hide_index=True)
 
 with summary_tab:
     summary_df = build_info_summary_df(
@@ -468,12 +470,12 @@ with summary_tab:
         summary=summary,
         df=result_df,
     )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
 with detail_tab:
     detail_df = result_df.drop(columns=[col for col in result_df.columns if col.startswith("_")], errors="ignore")
     detail_df = detail_df.sort_values("date", ascending=False)
-    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+    st.dataframe(detail_df, width="stretch", hide_index=True)
     export_df = result_df.drop(columns=[col for col in result_df.columns if col.startswith("_")], errors="ignore")
     csv_bytes = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button("下载行情数据 CSV", data=csv_bytes, file_name=f"{display_symbol(raw_symbol)}_market.csv", mime="text/csv")

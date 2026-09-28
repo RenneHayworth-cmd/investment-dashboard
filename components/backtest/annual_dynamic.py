@@ -164,7 +164,7 @@ def render_annual_dynamic_mode(namespace) -> None:
         disabled=not confirm_network,
         key="annual_network_fill",
     ):
-        with st.spinner("正在分批补齐未复权正式日线和分红；失败不会覆盖原缓存..."):
+        with st.spinner("正在分批补齐未复权正式日线和分红；失败不会覆盖原缓存…"):
             network_rows, remaining = namespace["_network_fill"](
                 records,
                 completed_date,

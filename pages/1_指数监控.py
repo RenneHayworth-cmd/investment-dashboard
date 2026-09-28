@@ -295,7 +295,7 @@ def render_detail_summary(
         ("区间样本", str(len(view_df))),
     ]
     summary_df = pd.DataFrame(summary_items, columns=["指标", "数值"])
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
 
 
 def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
@@ -304,7 +304,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     title_col.markdown(f"### {display_index_name(index_name)}")
     action_col.button("返回全部", key="clear_index_detail", on_click=clear_index_detail)
 
-    with st.spinner(f"正在读取 {index_name} 的本地长历史数据..."):
+    with st.spinner(f"正在读取 {index_name} 的本地长历史数据…"):
         try:
             detail_df = load_index_detail(index_name, INDEX_CONFIG[index_name])
         except Exception as exc:
@@ -380,7 +380,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
             )
         apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
         fig.update_layout(yaxis={"type": price_axis, "title": "价格"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with drawdown_tab:
         fig = go.Figure()
@@ -411,7 +411,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
         )
         apply_plotly_layout(fig, height=420, showlegend=False)
         fig.update_layout(yaxis_title="回撤(%)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with summary_tab:
         render_detail_summary(index_name, detail, view_df, range_label, current_drawdown, max_drawdown)
@@ -421,7 +421,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
             ["日期", "收盘价", "MA5", "MA20", "MA60", "MA120", "MA250", "偏离率(%)", "日涨跌幅(%)", "RSI(14)", "回撤(%)"]
         ].copy()
         display_df["日期"] = display_df["日期"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, width="stretch", hide_index=True)
 
 
 def centered_table(df: pd.DataFrame) -> None:
@@ -499,8 +499,8 @@ def render_index_card(row: pd.Series) -> None:
         ".index-card-code{min-height:1.65rem;margin-top:.22rem;color:rgba(49,51,63,.58);font-size:1rem;line-height:1.25;overflow-wrap:anywhere;}"
         ".index-card-value{margin-top:1.05rem;color:rgb(31,41,55);font-size:1.85rem;font-weight:650;line-height:1.08;font-variant-numeric:tabular-nums;white-space:normal;overflow-wrap:anywhere;}"
         ".index-card-delta{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;margin-top:1.05rem;border-radius:999px;padding:.35rem .85rem;font-size:1.05rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}"
-        ".index-card-delta.positive{color:rgb(190,18,60);background:rgba(254,226,226,.9);}"
-        ".index-card-delta.negative{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
+        ".index-card-delta.positive{color:var(--ui-up);background:var(--ui-up-bg);}"
+        ".index-card-delta.negative{color:var(--ui-down);background:var(--ui-down-bg);}"
         "</style>"
         f'<div class="index-card-single {realtime_class}">'
         f'<div class="index-card-title"><a href="{detail_href}">{html.escape(display_name)}</a></div>'
@@ -619,11 +619,11 @@ def render_update_timings() -> None:
         return
     timing_df = timing_df.sort_values("耗时(秒)", ascending=False).reset_index(drop=True)
     with st.expander("上次指数更新耗时", expanded=False):
-        st.dataframe(timing_df, use_container_width=True, hide_index=True)
+        st.dataframe(timing_df, width="stretch", hide_index=True)
 
 
 def run_single_index_update(index_name: str, api_key: str) -> None:
-    with st.spinner(f"正在更新 {index_name}..."):
+    with st.spinner(f"正在更新 {index_name}…"):
         result = run_index_ma20_update(
             api_key=api_key,
             days=INDEX_REPORT_DISPLAY_DAYS,
@@ -653,7 +653,7 @@ def render_single_index_update(stale_indexes: list[str], api_key: str) -> None:
         key="single_index_update_target",
         label_visibility="collapsed",
     )
-    if button_col.button("只更新选中指数", use_container_width=True):
+    if button_col.button("只更新选中指数", width="stretch"):
         run_single_index_update(selected_index, api_key)
 
 
@@ -813,7 +813,7 @@ if report_df is not None:
         centered_table(display_summary_df)
 
     with st.expander("查看完整分列数据", expanded=False):
-        st.dataframe(report_df, use_container_width=True, hide_index=True)
+        st.dataframe(report_df, width="stretch", hide_index=True)
 else:
     st.info("还没有缓存数据。可以先点击左侧按钮联网更新，或上传已有 CSV。")
 

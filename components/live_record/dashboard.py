@@ -16,6 +16,8 @@ from components.live_record.tables import render_live_positions_table
 from core.return_calendar import render_return_calendar
 from core.ui import (
     DEFAULT_CHART_HEIGHT,
+    DOWN_COLOR,
+    UP_COLOR,
     apply_plotly_layout,
     build_sparse_trading_date_ticks,
     filter_by_time_range,
@@ -196,7 +198,7 @@ def _render_performance_history(
             "%Y-%m-%d"
         )
         pnl_colors = [
-            "#ef4444" if float(val) >= 0 else "#22c55e"
+            UP_COLOR if float(val) >= 0 else DOWN_COLOR
             for val in chart_view_daily["daily_pnl"].fillna(0.0)
         ]
         figure = make_subplots(specs=[[{"secondary_y": True}]])
@@ -306,7 +308,7 @@ def _render_performance_history(
         chart_view_daily = filter_by_time_range(daily, date_column="date", period=period or "全部")
         chart_dates = pd.to_datetime(chart_view_daily["date"], errors="coerce").dt.strftime("%Y-%m-%d")
         holding_pnl_colors = [
-            "#ef4444" if float(val) >= 0 else "#22c55e"
+            UP_COLOR if float(val) >= 0 else DOWN_COLOR
             for val in chart_view_daily["daily_pnl"]
         ]
         figure = make_subplots(specs=[[{"secondary_y": True}]])

@@ -78,7 +78,7 @@ def render_drawdown_chart(drawdown_df: pd.DataFrame) -> None:
         xaxis_title="日期",
         yaxis_title="回撤(%)",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 __all__ = [

@@ -35,7 +35,7 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         update_clicked = st.button(
             "加载持仓信息",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
         force_refresh = st.checkbox(
             "强制重新检查已是最新的ETF缓存",
@@ -178,7 +178,7 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     ):
         del st.session_state.position_etf_realtime_quotes
 
-    with st.spinner("正在整理持仓数据..."):
+    with st.spinner("正在整理持仓数据…"):
         for code in etf_codes:
             if intraday_quote_mode:
                 card_item = position.load_or_fetch_etf(

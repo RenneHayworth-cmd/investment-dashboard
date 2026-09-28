@@ -162,7 +162,7 @@ def render_etf_detail(item: position.PositionItem) -> None:
         fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
         fig.update_yaxes(title_text="涨幅%", row=3, col=1)
         fig.update_yaxes(title_text="年化%", row=4, col=1)
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+        st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
     with drawdown_tab:
         if "drawdown_pct" not in df.columns:
@@ -295,7 +295,7 @@ def render_etf_detail(item: position.PositionItem) -> None:
                 col=1,
             )
             dd_fig.update_yaxes(title_text="回撤%", row=2, col=1)
-            st.plotly_chart(dd_fig, use_container_width=True)
+            st.plotly_chart(dd_fig, width="stretch")
 
             drawdown_periods = fund.extract_drawdown_periods(df)
             yearly_drawdowns = fund.calculate_yearly_drawdowns(df)
@@ -303,13 +303,13 @@ def render_etf_detail(item: position.PositionItem) -> None:
             if drawdown_periods.empty:
                 st.info("没有发现独立回撤波段。")
             else:
-                st.dataframe(drawdown_periods, use_container_width=True, hide_index=True)
+                st.dataframe(drawdown_periods, width="stretch", hide_index=True)
 
             st.subheader("年度最大回撤")
             if yearly_drawdowns.empty:
                 st.info("没有年度回撤数据。")
             else:
-                st.dataframe(yearly_drawdowns, use_container_width=True, hide_index=True)
+                st.dataframe(yearly_drawdowns, width="stretch", hide_index=True)
 
     with summary_tab:
         summary_rows = [
@@ -357,7 +357,7 @@ def render_etf_detail(item: position.PositionItem) -> None:
             display_cols.insert(4, rsi_col)
         table_df = view_df[display_cols].sort_values("date", ascending=False).copy()
         table_df["date"] = table_df["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.dataframe(table_df, width="stretch", hide_index=True)
 
 
 def render_spread_detail(item: position.PositionItem) -> None:
@@ -410,7 +410,7 @@ def render_spread_detail(item: position.PositionItem) -> None:
         )
         apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
         fig.update_layout(yaxis_title="价差")
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+        st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
     with price_tab:
         close_cols = [col for col in view_df.columns if col.endswith("_close")]
@@ -427,7 +427,7 @@ def render_spread_detail(item: position.PositionItem) -> None:
             )
         apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
         fig.update_layout(yaxis_title="收盘价")
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+        st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
     with summary_tab:
         summary_rows = [
@@ -453,7 +453,7 @@ def render_spread_detail(item: position.PositionItem) -> None:
         ).sort_values("date", ascending=False)
         table_df = round_numeric_columns(table_df, digits=1)
         table_df["date"] = table_df["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.dataframe(table_df, width="stretch", hide_index=True)
 
 
 def render_option_detail(
@@ -520,7 +520,7 @@ def render_option_detail(
                 )
         apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
         fig.update_layout(yaxis_title=f"{instrument_label}价格")
-        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+        st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
     with activity_tab:
         fig = go.Figure()
@@ -553,7 +553,7 @@ def render_option_detail(
         if has_activity:
             apply_plotly_layout(fig, height=420)
             fig.update_layout(yaxis_title="成交量")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info(f"当前{instrument_label}数据源未提供成交量和持仓量。")
 
@@ -585,7 +585,7 @@ def render_option_detail(
             integer_columns=("volume", "open_interest"),
         )
         table_df["date"] = table_df["date"].dt.strftime("%Y-%m-%d")
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.dataframe(table_df, width="stretch", hide_index=True)
 
 
 def render_position_detail(item: position.PositionItem) -> None:

@@ -6,12 +6,16 @@ from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from components.futures_live.formatting import decode_warnings
 from core.return_calendar import render_return_calendar
 from core.ui import (
     DEFAULT_CHART_HEIGHT,
+    DOWN_COLOR,
+    PRIMARY_COLOR,
+    UP_COLOR,
     apply_plotly_layout,
     build_sparse_trading_date_ticks,
     filter_by_time_range,
@@ -35,13 +39,12 @@ def render_account_trend(
     if daily_pnl.empty:
         st.info(f"当前没有可展示的{pnl_mode}收益数据。")
         return
-    cumulative_daily_pnl = daily_pnl[
-        daily_pnl["status"].isin(["完整", "手工估算"])
-        & pd.to_numeric(daily_pnl["net_pnl"], errors="coerce").notna()
-    ].copy()
-    amount_daily_pnl = daily_pnl[
+    # Same layout as the ETF / microcap live curves: NAV line (left axis) plus red/green
+    # daily P&L bars (right axis). NAV compounds the same daily returns as the calendar below.
+    valued = daily_pnl[
         daily_pnl["status"].isin(["完整", "手工估算"])
         & pd.to_numeric(daily_pnl["daily_pnl"], errors="coerce").notna()
+        & pd.to_numeric(daily_pnl["net_pnl"], errors="coerce").notna()
     ].copy()
     period = st.segmented_control(
         "时间范围",
@@ -50,44 +53,70 @@ def render_account_trend(
         key="futures_live_period",
         label_visibility="collapsed",
     )
-    view_cumulative = filter_by_time_range(cumulative_daily_pnl, date_column="date", period=period or "全部")
-    view_amount = filter_by_time_range(amount_daily_pnl, date_column="date", period=period or "全部")
-    chart_dates = pd.to_datetime(view_cumulative["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if valued.empty:
+        st.info(f"暂无已完成估值的{pnl_mode}收益，补齐价格后显示曲线。")
+    else:
+        for column in ("daily_pnl", "net_pnl", "economic_equity", "daily_return_pct"):
+            valued[column] = pd.to_numeric(valued.get(column), errors="coerce")
+        valued["daily_return_pct"] = valued["daily_return_pct"].fillna(0.0)
+        valued["nav"] = (1.0 + valued["daily_return_pct"] / 100.0).cumprod()
+        valued["cumulative_return_pct"] = (valued["nav"] - 1.0) * 100.0
+        view = filter_by_time_range(valued, date_column="date", period=period or "全部")
+        chart_dates = pd.to_datetime(view["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        pnl_colors = [UP_COLOR if float(value) >= 0 else DOWN_COLOR for value in view["daily_pnl"]]
 
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=chart_dates,
-            y=view_cumulative["net_pnl"],
-            mode="lines+markers",
-            name=f"累计{pnl_mode}净盈亏",
-            line={"color": "#b91c1c", "width": 2.2},
-            hovertemplate=f"累计{pnl_mode}净盈亏: %{{y:.2f}}<extra></extra>",
+        figure = make_subplots(specs=[[{"secondary_y": True}]])
+        figure.add_trace(
+            go.Scatter(
+                x=chart_dates,
+                y=view["nav"],
+                mode="lines+markers",
+                name="账户净值",
+                line={"color": PRIMARY_COLOR, "width": 2.4},
+                marker={"size": 5},
+                customdata=view[["daily_return_pct", "cumulative_return_pct", "net_pnl"]],
+                hovertemplate=(
+                    "净值：%{y:.4f}<br>当日收益率：%{customdata[0]:.2f}%"
+                    "<br>累计收益率：%{customdata[1]:.2f}%"
+                    f"<br>累计{pnl_mode}净盈亏：%{{customdata[2]:,.2f}} 元<extra></extra>"
+                ),
+            ),
+            secondary_y=False,
         )
-    )
-    figure.add_trace(
-        go.Bar(
-            x=pd.to_datetime(view_amount["date"], errors="coerce").dt.strftime("%Y-%m-%d"),
-            y=view_amount["daily_pnl"],
-            name=f"当日{pnl_mode}盈亏",
-            marker_color="#64748b",
-            opacity=0.42,
-            hovertemplate=f"当日{pnl_mode}盈亏: %{{y:.2f}}<extra></extra>",
+        figure.add_trace(
+            go.Bar(
+                x=chart_dates,
+                y=view["daily_pnl"],
+                name="每日盈亏",
+                marker={"color": pnl_colors},
+                opacity=0.75,
+                customdata=view[["net_pnl", "economic_equity", "daily_return_pct", "nav"]],
+                hovertemplate=(
+                    "当日盈亏：%{y:,.2f} 元<br>当日收益率：%{customdata[2]:.2f}%"
+                    f"<br>累计{pnl_mode}净盈亏：%{{customdata[0]:,.2f}} 元"
+                    "<br>经济权益：%{customdata[1]:,.2f} 元<br>净值：%{customdata[3]:.4f}<extra></extra>"
+                ),
+            ),
+            secondary_y=True,
         )
-    )
-    apply_plotly_layout(figure, height=DEFAULT_CHART_HEIGHT)
-    tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
-    figure.update_xaxes(
-        title_text="交易日",
-        type="category",
-        categoryorder="array",
-        categoryarray=chart_dates.tolist(),
-        tickmode="array",
-        tickvals=tickvals,
-        ticktext=ticktext,
-    )
-    figure.update_yaxes(title="盈亏（元）", hoverformat=".2f", tickformat=".2f")
-    st.plotly_chart(figure, width="stretch")
+        apply_plotly_layout(figure, height=DEFAULT_CHART_HEIGHT)
+        tickvals, ticktext = build_sparse_trading_date_ticks(chart_dates.tolist(), max_ticks=7)
+        figure.update_xaxes(
+            title_text="交易日",
+            type="category",
+            categoryorder="array",
+            categoryarray=chart_dates.tolist(),
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+        )
+        figure.update_yaxes(title_text="账户净值", tickformat=".4f", secondary_y=False)
+        figure.update_yaxes(title_text="每日盈亏（元）", secondary_y=True)
+        st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
+        st.caption(
+            "横坐标仅排列已完成估值的交易日，周末和节假日已自动跳过；"
+            "净值按下方收益日历的每日收益率复合，与累计净盈亏金额口径不同。"
+        )
     incomplete = daily_pnl[daily_pnl["status"].eq("数据不完整")]
     if not incomplete.empty:
         latest_gap = incomplete.iloc[-1]

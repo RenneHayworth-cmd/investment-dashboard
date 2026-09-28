@@ -133,7 +133,7 @@ def render_portfolio_timing_nav_chart(nav_df: pd.DataFrame) -> None:
         xaxis_title="日期",
         yaxis_title="账户净值",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def parse_portfolio_allocations(
@@ -252,7 +252,7 @@ def render_portfolio_timing_mode() -> None:
             DEFAULT_PORTFOLIO_CONFIG,
             num_rows="dynamic",
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "ETF代码": st.column_config.TextColumn("ETF代码", help="现金行可留空"),
                 "标的名称": st.column_config.TextColumn("标的名称"),
@@ -321,7 +321,7 @@ def render_portfolio_timing_mode() -> None:
             if force_refresh or cached_df is None:
                 try:
                     with st.spinner(
-                        f"正在获取 {allocation.symbol} 的{adjust_option}日线..."
+                        f"正在获取 {allocation.symbol} 的{adjust_option}日线…"
                     ):
                         raw_df = fetch_tickflow_fund_close(
                             symbol=allocation.symbol,
@@ -403,7 +403,7 @@ def render_portfolio_timing_mode() -> None:
         lot_size=int(portfolio_lot_size),
     )
     st.subheader("分期回测结果")
-    st.dataframe(period_df, use_container_width=True, hide_index=True)
+    st.dataframe(period_df, width="stretch", hide_index=True)
 
     component_df = result.component_results.copy()
     component_df["策略类型"] = (
@@ -420,21 +420,21 @@ def render_portfolio_timing_mode() -> None:
         render_drawdown_chart(result.drawdown)
         if not result.yearly_stats.empty:
             st.subheader("年度收益与回撤")
-            st.dataframe(result.yearly_stats, use_container_width=True, hide_index=True)
+            st.dataframe(result.yearly_stats, width="stretch", hide_index=True)
     with tab_trades:
         if result.trades.empty:
             st.info("回测区间内没有择时交易。")
         else:
-            st.dataframe(result.trades, use_container_width=True, hide_index=True)
+            st.dataframe(result.trades, width="stretch", hide_index=True)
     with tab_positions:
-        st.dataframe(component_df, use_container_width=True, hide_index=True)
+        st.dataframe(component_df, width="stretch", hide_index=True)
     with tab_daily:
-        st.dataframe(result.nav_data, use_container_width=True, hide_index=True)
+        st.dataframe(result.nav_data, width="stretch", hide_index=True)
     with tab_summary:
         summary_df = pd.DataFrame(
             [{"指标": key, "数值": str(value)} for key, value in summary.items()]
         )
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
 
     st.download_button(
         "下载组合回测结果 CSV",

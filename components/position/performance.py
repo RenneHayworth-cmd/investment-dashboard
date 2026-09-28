@@ -21,6 +21,7 @@ from core.ui import (
     apply_plotly_layout,
     build_sparse_trading_date_ticks,
     filter_by_time_range,
+    pnl_color,
     render_metric_grid,
 )
 from services import position_analysis as position
@@ -255,7 +256,7 @@ def render_position_timing_performance(
     daily = filter_by_time_range(result.daily.copy(), date_column="日期", period=period or "全部")
     chart_dates = pd.to_datetime(daily["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
     bar_colors = [
-        "#dc2626" if value > 0 else "#16a34a" if value < 0 else "#9ca3af"
+        pnl_color(value)
         for value in daily["每日盈亏"]
     ]
     figure = make_subplots(specs=[[{"secondary_y": True}]])

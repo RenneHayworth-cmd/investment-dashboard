@@ -193,11 +193,11 @@ def render_live_symbol_history_table(history: pd.DataFrame) -> None:
             font-weight: 600;
         }}
         .live-symbol-history-table .live-history-positive {{
-            color: rgb(190, 18, 60);
+            color: var(--ui-up);
             font-weight: 600;
         }}
         .live-symbol-history-table .live-history-negative {{
-            color: rgb(22, 101, 52);
+            color: var(--ui-down);
             font-weight: 600;
         }}
         </style>

@@ -106,7 +106,7 @@ def render_timing_nav_chart(result_df: pd.DataFrame) -> None:
         xaxis_title="日期",
         yaxis_title="账户净值",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_timing_signal_chart(
@@ -184,7 +184,7 @@ def render_timing_signal_chart(
         xaxis_title="日期",
         yaxis_title="价格",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_ma20_timing_mode() -> None:
@@ -256,7 +256,7 @@ def render_ma20_timing_mode() -> None:
         cache_symbol = build_fund_cache_symbol("fund_rotation", symbol, adjust_value)
         cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
         try:
-            with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."):
+            with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线…"):
                 raw_df = fetch_tickflow_fund_close(
                     symbol=symbol,
                     api_key=api_key,
@@ -325,7 +325,7 @@ def render_ma20_timing_mode() -> None:
         lot_size=int(timing_lot_size),
     )
     st.subheader("分期回测结果")
-    st.dataframe(period_df, use_container_width=True, hide_index=True)
+    st.dataframe(period_df, width="stretch", hide_index=True)
     st.download_button(
         "下载分期回测结果 CSV",
         data=to_csv_bytes(period_df),
@@ -350,12 +350,12 @@ def render_ma20_timing_mode() -> None:
         render_drawdown_chart(result.drawdown)
         if not result.yearly_stats.empty:
             st.subheader("年度收益与回撤")
-            st.dataframe(result.yearly_stats, use_container_width=True, hide_index=True)
+            st.dataframe(result.yearly_stats, width="stretch", hide_index=True)
     with tab_trades:
         if result.trades.empty:
             st.info("回测区间内没有触发交易。")
         else:
-            st.dataframe(result.trades, use_container_width=True, hide_index=True)
+            st.dataframe(result.trades, width="stretch", hide_index=True)
             st.download_button(
                 "下载交易明细 CSV",
                 data=to_csv_bytes(result.trades),
@@ -363,12 +363,12 @@ def render_ma20_timing_mode() -> None:
                 mime="text/csv",
             )
     with tab_daily:
-        st.dataframe(result.data, use_container_width=True, hide_index=True)
+        st.dataframe(result.data, width="stretch", hide_index=True)
     with tab_summary:
         summary_df = pd.DataFrame(
             [{"指标": key, "数值": str(value)} for key, value in summary.items()]
         )
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
 
 
 __all__ = [

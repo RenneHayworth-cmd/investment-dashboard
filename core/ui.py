@@ -13,6 +13,26 @@ DEFAULT_CHART_HEIGHT = 520
 LARGE_CHART_HEIGHT = 900
 SECONDARY_CHART_HEIGHT = 720
 
+# Rise/fall palette (A-share convention: red = up/profit, green = down/loss).
+# Red and green are reserved for this meaning; UI accents use PRIMARY_COLOR.
+# Charts (Plotly) cannot read CSS variables, so they use these constants directly;
+# HTML/CSS uses the matching --ui-up / --ui-down variables from apply_global_style().
+PRIMARY_COLOR = "#2563eb"
+UP_COLOR = "#dc2626"          # bars, markers, lines
+DOWN_COLOR = "#16a34a"
+FLAT_COLOR = "#9ca3af"
+UP_TEXT_COLOR = "rgb(190, 18, 60)"   # text on light backgrounds (higher contrast)
+DOWN_TEXT_COLOR = "rgb(22, 101, 52)"
+NEUTRAL_TEXT_COLOR = "#1f2937"
+
+
+def pnl_color(value: object, *, up: str = UP_COLOR, down: str = DOWN_COLOR, flat: str = FLAT_COLOR) -> str:
+    """Colour for a signed number: up for > 0, down for < 0, flat for 0 or missing."""
+    number = pd.to_numeric(value, errors="coerce")
+    if pd.isna(number) or float(number) == 0:
+        return flat
+    return up if float(number) > 0 else down
+
 
 def apply_global_style() -> None:
     st.markdown(
@@ -26,13 +46,22 @@ def apply_global_style() -> None:
             --ui-border-muted: #e5e7eb;
             --ui-text: #1f2937;
             --ui-muted: #6b7280;
-            --ui-primary: #ef4444;
-            --ui-focus: rgba(239, 68, 68, 0.12);
+            --ui-primary: #2563eb;
+            --ui-primary-border: rgba(37, 99, 235, 0.38);
+            --ui-focus: rgba(37, 99, 235, 0.14);
             --ui-shadow: 0 4px 14px rgba(15, 23, 42, 0.026);
+            /* Rise/fall palette: red = up/profit, green = down/loss. Keep in sync with the Python UP/DOWN constants. */
+            --ui-up: rgb(190, 18, 60);
+            --ui-down: rgb(22, 101, 52);
+            --ui-up-bg: rgba(254, 226, 226, 0.9);
+            --ui-down-bg: rgba(220, 252, 231, 0.9);
         }
         .stApp {
             background: var(--ui-bg);
             color: var(--ui-text);
+            /* Equal-width digits so figures line up in metrics, cards and HTML tables.
+               st.dataframe draws on canvas and is not affected. */
+            font-variant-numeric: tabular-nums;
         }
         .main .block-container {
             padding-top: 1.75rem;
@@ -118,7 +147,7 @@ def apply_global_style() -> None:
         div[data-testid="stTextArea"] textarea:focus,
         div[data-baseweb="select"] > div:focus-within,
         div[data-baseweb="input"] input:focus {
-            border-color: rgba(239, 68, 68, 0.38) !important;
+            border-color: var(--ui-primary-border) !important;
             box-shadow: 0 0 0 3px var(--ui-focus) !important;
         }
         div[data-baseweb="popover"],

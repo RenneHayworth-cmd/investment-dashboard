@@ -84,7 +84,7 @@ def render_etf_timing_section_impl(
         and stale_codes
         and (retry_ready or retry_clicked)
     ):
-        with st.spinner(f"正在自动更新 {target_date:%Y-%m-%d} ETF收盘数据..."):
+        with st.spinner(f"正在自动更新 {target_date:%Y-%m-%d} ETF收盘数据…"):
             refreshed_by_code = {
                 code: fetch_audited_close(
                     code,

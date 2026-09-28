@@ -55,7 +55,7 @@ def render_data_update() -> FuturesLiveRefreshState:
 
     api_key = os.environ.get("TICKFLOW_API_KEY", "")
     if force_close_refresh:
-        with st.spinner("正在补齐全部成交合约历史行情及当前持仓结算价..."):
+        with st.spinner("正在补齐全部成交合约历史行情及当前持仓结算价…"):
             history_refresh = futures_live.update_traded_contract_daily_closes(
                 api_key=api_key,
                 force=True,
@@ -157,7 +157,7 @@ def run_session_auto_refresh(
         and not refresh_state.force_close_refresh
     ):
         st.session_state[history_auto_key] = history_auto_value
-        with st.spinner("正在补齐全部历史成交合约的正式收盘价和结算价..."):
+        with st.spinner("正在补齐全部历史成交合约的正式收盘价和结算价…"):
             history_auto_result = futures_live.update_traded_contract_daily_closes(
                 api_key=refresh_state.api_key
             )
@@ -188,7 +188,7 @@ def run_session_auto_refresh(
         and not refresh_state.force_close_refresh
     ):
         st.session_state[auto_key] = target_date
-        with st.spinner(f"正在补齐截至 {target_date} 的正式收盘价和结算价..."):
+        with st.spinner(f"正在补齐截至 {target_date} 的正式收盘价和结算价…"):
             auto_result = futures_live.update_position_daily_closes(
                 api_key=refresh_state.api_key
             )

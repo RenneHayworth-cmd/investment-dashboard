@@ -98,19 +98,19 @@ def render_etf_timing_table(
             line-height: 1.2;
         }}
         .position-etf-summary-table tr.timing-buy td {{
-            background: rgba(254, 226, 226, 0.72);
+            background: var(--ui-up-bg);
         }}
         .position-etf-summary-table tr.timing-sell td {{
-            background: rgba(220, 252, 231, 0.78);
+            background: var(--ui-down-bg);
         }}
         .position-etf-summary-table tr.timing-buy td:first-child,
         .position-etf-summary-table tr.timing-buy td:nth-child({timing_column_index}) {{
-            color: rgb(190, 18, 60);
+            color: var(--ui-up);
             font-weight: 700;
         }}
         .position-etf-summary-table tr.timing-sell td:first-child,
         .position-etf-summary-table tr.timing-sell td:nth-child({timing_column_index}) {{
-            color: rgb(22, 101, 52);
+            color: var(--ui-down);
             font-weight: 700;
         }}
         </style>
@@ -171,17 +171,17 @@ def render_etf_operation_guidance(
             background: rgba(49, 51, 63, 0.04);
         }}
         .position-operation-guidance-table tr.timing-buy td {{
-            background: rgba(254, 226, 226, 0.72);
+            background: var(--ui-up-bg);
         }}
         .position-operation-guidance-table tr.timing-sell td {{
-            background: rgba(220, 252, 231, 0.78);
+            background: var(--ui-down-bg);
         }}
         .position-operation-guidance-table tr.timing-buy td:nth-child(5) {{
-            color: rgb(190, 18, 60);
+            color: var(--ui-up);
             font-weight: 700;
         }}
         .position-operation-guidance-table tr.timing-sell td:nth-child(5) {{
-            color: rgb(22, 101, 52);
+            color: var(--ui-down);
             font-weight: 700;
         }}
         </style>
@@ -253,8 +253,8 @@ def render_position_card(item: position.PositionItem) -> None:
         ".position-card-value{margin-top:1rem;color:rgb(31,41,55);font-size:1.7rem;font-weight:650;line-height:1.08;font-variant-numeric:tabular-nums;white-space:normal;overflow-wrap:anywhere;}"
         ".position-card-foot{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-top:1rem;}"
         ".position-card-delta{display:inline-flex;align-items:center;justify-content:center;gap:.28rem;border-radius:999px;padding:.32rem .75rem;font-size:.98rem;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}"
-        ".position-card-delta.positive{color:rgb(190,18,60);background:rgba(254,226,226,.9);}"
-        ".position-card-delta.negative{color:rgb(22,101,52);background:rgba(220,252,231,.9);}"
+        ".position-card-delta.positive{color:var(--ui-up);background:var(--ui-up-bg);}"
+        ".position-card-delta.negative{color:var(--ui-down);background:var(--ui-down-bg);}"
         ".position-card-delta.neutral{color:rgb(75,85,99);background:rgba(243,244,246,.95);}"
         ".position-card-date{min-width:0;color:rgba(49,51,63,.58);font-size:.84rem;line-height:1.25;text-align:right;overflow-wrap:anywhere;}"
         "</style>"
@@ -284,4 +284,4 @@ def render_summary_table(rows: list[tuple[str, object]]) -> None:
     summary_df["数值"] = summary_df["数值"].map(
         lambda value: "-" if value is None or pd.isna(value) else str(value)
     )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)

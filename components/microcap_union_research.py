@@ -31,7 +31,7 @@ def render_union_research():
         'close':'未复权收盘价','share_anchor_date':'股本锚点日期','effective_date':'最早使用日期',
         '名称':'快照名称'})
     st.dataframe(view[['过滤后排名','候选池原始排名','代码','快照名称','未复权收盘价',
-        '估算总市值(亿元)','股本锚点日期','最早使用日期']], hide_index=True, use_container_width=True)
+        '估算总市值(亿元)','股本锚点日期','最早使用日期']], hide_index=True, width="stretch")
     st.caption('快照名称可能与历史当日名称不同；ST过滤使用当日日线标记。无日线可能是未上市、停牌或来源缺失，均不补价格。名单不包含次日开盘前资格复核，也不代表能以显示价格成交。')
     for name, label in [('daily_top200.csv','下载全部日期前200名估算名单'),
                         ('chart_metrics.csv','下载微盘20与第200名估算曲线'),
@@ -40,5 +40,5 @@ def render_union_research():
                         ('all_candidate_days.csv','下载全部候选日线与过滤原因')]:
         st.download_button(label, (directory/name).read_bytes(), file_name=name, mime='text/csv', key='union_'+name)
     with st.expander('每日覆盖及估算说明'):
-        st.dataframe(summary, hide_index=True, use_container_width=True)
+        st.dataframe(summary, hide_index=True, width="stretch")
         st.json(report)

@@ -5,6 +5,7 @@ import streamlit as st
 
 from core.cache import list_datasets, load_dataset, save_dataset
 from core.db import init_db
+from core.ui import apply_global_style
 from services.correlation_analysis import (
     calculate_price_correlation,
     delete_correlation_results,
@@ -28,6 +29,7 @@ from services.us_stock_analysis import fetch_tickflow_us_daily, infer_us_symbol,
 
 st.set_page_config(page_title="相关性分析", layout="wide")
 init_db()
+apply_global_style()
 
 st.title("相关性分析")
 st.caption("按共同交易日期对齐不同标的收盘价，计算 Pearson 相关系数 r。支持上传文件、A 股 ETF、美股和期货主连。")
@@ -116,8 +118,12 @@ def render_saved_results(df: pd.DataFrame) -> None:
         detail_cols[2].caption(f"计算方式：{group['method_summary']}")
         detail_cols[3].caption(f"已合并标的数：{len(group['assets'])}")
 
-        st.dataframe(build_saved_matrix(group["data"]), use_container_width=True)
-        if st.button("删除这个矩阵", key=f"delete_correlation_group_{group['key']}"):
+        st.dataframe(build_saved_matrix(group["data"]), width="stretch")
+        confirm_cols = st.columns([1, 4])
+        confirmed = confirm_cols[0].checkbox("确认删除", key=f"confirm_delete_correlation_group_{group['key']}")
+        if confirm_cols[1].button(
+            "删除这个矩阵", key=f"delete_correlation_group_{group['key']}", disabled=not confirmed,
+        ):
             delete_correlation_results(group["ids"])
             st.rerun()
 
@@ -475,7 +481,7 @@ try:
                     f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
                 )
             else:
-                with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 日线..."):
+                with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 日线…"):
                     raw_df = fetch_tickflow_fund_close(
                         symbol=symbol,
                         api_key=api_key,
@@ -513,7 +519,7 @@ try:
                     f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
                 )
             else:
-                with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 日线..."):
+                with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 日线…"):
                     raw_df = fetch_tickflow_us_daily(
                         symbol=symbol,
                         api_key=api_key,
@@ -550,7 +556,7 @@ try:
                     f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
                 )
             else:
-                with st.spinner(f"正在获取 {code} 期货主连日线..."):
+                with st.spinner(f"正在获取 {code} 期货主连日线…"):
                     result = fetch_futures_option_data(
                         raw_symbol=code,
                         data_type=DATA_TYPE_FUTURES,
@@ -608,7 +614,7 @@ with metric_cols[3]:
 render_results_panel()
 
 with st.expander("本次计算明细", expanded=False):
-    st.dataframe(result.pair_table, use_container_width=True, hide_index=True)
+    st.dataframe(result.pair_table, width="stretch", hide_index=True)
 
 download_cols = st.columns(2)
 with download_cols[0]:

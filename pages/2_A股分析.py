@@ -214,7 +214,7 @@ if input_mode == "场外基金":
             st.info(f"已使用本地缓存，缓存时间：{_format_datetime_text(cache_meta['last_update_time'])}")
         else:
             if cached_df is not None:
-                with st.spinner(f"正在增量更新 {fund_code} 的最新净值..."):
+                with st.spinner(f"正在增量更新 {fund_code} 的最新净值…"):
                     latest_df = fetch_eastmoney_fund_nav(
                         fund_code=fund_code,
                         full_history=False,
@@ -225,7 +225,7 @@ if input_mode == "场外基金":
                     f"已基于本地缓存增量更新：{len(cached_df)} 条 → {len(source_df)} 条"
                 )
             else:
-                with st.spinner(f"正在全量拉取 {fund_code} 的净值数据..."):
+                with st.spinner(f"正在全量拉取 {fund_code} 的净值数据…"):
                     source_df = fetch_eastmoney_fund_nav(
                         fund_code=fund_code,
                         full_history=full_history,
@@ -302,7 +302,7 @@ elif input_mode == "场内基金/股票":
         else:
             if cached_df is not None and adjust_value == FUND_ADJUST_NONE:
                 incremental_count = min(max(120, int(count) // 20), int(count))
-                with st.spinner(f"正在增量更新 {symbol} 最近 {incremental_count} 条日线..."):
+                with st.spinner(f"正在增量更新 {symbol} 最近 {incremental_count} 条日线…"):
                     latest_df = fetch_tickflow_fund_close(
                         symbol=symbol,
                         api_key=api_key,
@@ -319,7 +319,7 @@ elif input_mode == "场内基金/股票":
                 )
             else:
                 action_text = "重建" if cached_df is not None else "拉取"
-                with st.spinner(f"正在通过 TickFlow 全量{action_text} {symbol} 的日线收盘价..."):
+                with st.spinner(f"正在通过 TickFlow 全量{action_text} {symbol} 的日线收盘价…"):
                     source_df = fetch_tickflow_fund_close(
                         symbol=symbol,
                         api_key=api_key,
@@ -490,7 +490,7 @@ with tabs[0]:
     fig.update_yaxes(title_text="年化%", row=4, col=1)
     st.plotly_chart(
         fig,
-        use_container_width=True,
+        width="stretch",
         config=_chart_export_config(
             f"{download_name}_走势分析",
             height=LARGE_CHART_HEIGHT,
@@ -598,7 +598,7 @@ with tabs[1]:
     dd_fig.update_yaxes(title_text="回撤%", row=2, col=1)
     st.plotly_chart(
         dd_fig,
-        use_container_width=True,
+        width="stretch",
         config=_chart_export_config(
             f"{download_name}_回撤分析",
             height=SECONDARY_CHART_HEIGHT,
@@ -610,7 +610,7 @@ with tabs[1]:
     if result.drawdown_periods.empty:
         st.info("没有发现独立回撤波段。")
     else:
-        st.dataframe(result.drawdown_periods, use_container_width=True, hide_index=True)
+        st.dataframe(result.drawdown_periods, width="stretch", hide_index=True)
         _download_dataframe(
             result.drawdown_periods,
             label="下载回撤波段 CSV",
@@ -621,7 +621,7 @@ with tabs[1]:
     if result.yearly_drawdowns.empty:
         st.info("没有年度回撤数据。")
     else:
-        st.dataframe(result.yearly_drawdowns, use_container_width=True, hide_index=True)
+        st.dataframe(result.yearly_drawdowns, width="stretch", hide_index=True)
         _download_dataframe(
             result.yearly_drawdowns,
             label="下载年度最大回撤 CSV",
@@ -632,7 +632,7 @@ with tabs[2]:
     summary_df = pd.DataFrame(
         [{"指标": key, "数值": _format_metric(value)} for key, value in summary.items()]
     )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
     _download_dataframe(
         summary_df,
         label="下载摘要 CSV",
@@ -660,7 +660,7 @@ with tabs[3]:
         display_cols.extend([f"ma_{period}", f"ma_{period}_deviation_pct"])
     display_cols = [col for col in display_cols if col in result.dataframe.columns]
     indicator_df = result.dataframe[display_cols].sort_values("date", ascending=False)
-    st.dataframe(indicator_df, use_container_width=True, hide_index=True)
+    st.dataframe(indicator_df, width="stretch", hide_index=True)
     _download_dataframe(
         indicator_df,
         label="下载指标数据 CSV",
@@ -668,7 +668,7 @@ with tabs[3]:
     )
 
 with tabs[4]:
-    st.dataframe(source_df, use_container_width=True)
+    st.dataframe(source_df, width="stretch")
     _download_dataframe(
         source_df,
         label="下载原始数据 CSV",

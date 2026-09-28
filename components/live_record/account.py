@@ -9,7 +9,7 @@ import streamlit as st
 
 from components.live_record.formatting import format_live_number, money
 from components.live_record.trades import render_live_trade_details
-from core.ui import render_metric_grid
+from core.ui import DOWN_TEXT_COLOR, NEUTRAL_TEXT_COLOR, UP_TEXT_COLOR, pnl_color, render_metric_grid
 
 
 def _value(value: object, *, suffix: str = "", digits: int = 2) -> str:
@@ -19,10 +19,7 @@ def _value(value: object, *, suffix: str = "", digits: int = 2) -> str:
 
 
 def _pnl_color(value: object) -> str:
-    number = pd.to_numeric(value, errors="coerce")
-    if pd.isna(number) or float(number) == 0:
-        return "#1f2937"
-    return "#ef4444" if float(number) > 0 else "#166534"
+    return pnl_color(value, up=UP_TEXT_COLOR, down=DOWN_TEXT_COLOR, flat=NEUTRAL_TEXT_COLOR)
 
 
 def _render_account_metric_cards(

@@ -117,7 +117,7 @@ def render_nav_chart(
         xaxis_title="日期",
         yaxis_title="账户净值",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_fund_rotation_mode() -> None:
@@ -278,7 +278,7 @@ def render_fund_rotation_mode() -> None:
                     try:
                         if not code.isdigit() or len(code) != 6:
                             raise ValueError("场外基金代码需要 6 位数字。")
-                        with st.spinner(f"正在通过东方财富拉取 {code} 的累计净值..."):
+                        with st.spinner(f"正在通过东方财富拉取 {code} 的累计净值…"):
                             raw_df = fetch_eastmoney_fund_nav(
                                 fund_code=code,
                                 full_history=True,
@@ -322,7 +322,7 @@ def render_fund_rotation_mode() -> None:
                             )
                         else:
                             with st.spinner(
-                                f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线..."
+                                f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线…"
                             ):
                                 raw_df = fetch_tickflow_fund_close(
                                     symbol=symbol,
@@ -407,7 +407,7 @@ def render_fund_rotation_mode() -> None:
         execution_mode=execution_mode,
     )
     st.subheader("分期回测结果")
-    st.dataframe(period_df, use_container_width=True, hide_index=True)
+    st.dataframe(period_df, width="stretch", hide_index=True)
     st.download_button(
         "下载分期回测结果 CSV",
         data=to_csv_bytes(period_df),
@@ -432,7 +432,7 @@ def render_fund_rotation_mode() -> None:
         render_drawdown_chart(result.drawdown)
         if not result.yearly_stats.empty:
             st.subheader("年度收益与回撤")
-            st.dataframe(result.yearly_stats, use_container_width=True, hide_index=True)
+            st.dataframe(result.yearly_stats, width="stretch", hide_index=True)
             st.download_button(
                 "下载年度统计 CSV",
                 data=to_csv_bytes(result.yearly_stats),
@@ -441,7 +441,7 @@ def render_fund_rotation_mode() -> None:
             )
 
     with tab_trades:
-        st.dataframe(result.trades, use_container_width=True, hide_index=True)
+        st.dataframe(result.trades, width="stretch", hide_index=True)
         st.download_button(
             "下载交易明细 CSV",
             data=to_csv_bytes(result.trades),
@@ -450,7 +450,7 @@ def render_fund_rotation_mode() -> None:
         )
 
     with tab_daily:
-        st.dataframe(result.nav_data, use_container_width=True, hide_index=True)
+        st.dataframe(result.nav_data, width="stretch", hide_index=True)
         st.download_button(
             "下载每日持仓 CSV",
             data=to_csv_bytes(result.nav_data),
@@ -463,11 +463,11 @@ def render_fund_rotation_mode() -> None:
             [{"指标": key, "数值": str(value)} for key, value in summary.items()]
         )
         st.subheader("策略摘要")
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width="stretch", hide_index=True)
         if not result.individual_results.empty:
             st.subheader("一直持有对比")
             st.dataframe(
-                result.individual_results, use_container_width=True, hide_index=True
+                result.individual_results, width="stretch", hide_index=True
             )
 
 

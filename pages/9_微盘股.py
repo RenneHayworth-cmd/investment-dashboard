@@ -72,7 +72,7 @@ should_fetch_online = fetch_clicked and (refresh_online or cached_df is None or 
 
 if should_fetch_online:
     try:
-        with st.spinner("正在从东方财富获取 BK1158 成分股..."):
+        with st.spinner("正在从东方财富获取 BK1158 成分股…"):
             source_df = fetch_microcap_stocks(page_size=int(page_size))
         if save_to_cache:
             save_dataset(
@@ -142,7 +142,7 @@ tabs = st.tabs(["微盘股列表", "存量成分快照", "原始数据", "历史
 with tabs[0]:
     st.dataframe(
         display_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.2f"),
@@ -282,7 +282,7 @@ with tabs[1]:
             display_snapshot_metrics = display_snapshot_metrics.drop(columns=["日期显示"])
         st.dataframe(
             display_snapshot_metrics,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "第200名市值(亿元)": st.column_config.NumberColumn(format="%.2f"),
@@ -300,7 +300,7 @@ with tabs[1]:
 with tabs[2]:
     st.dataframe(
         source_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "最新价": st.column_config.NumberColumn(format="%.2f"),

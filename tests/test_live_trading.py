@@ -1057,8 +1057,8 @@ class LiveTradingTests(unittest.TestCase):
         )
         self.assertIn("live-symbol-history-total", tables_source)
         self.assertIn("text-align: center", shared_table_source)
-        self.assertIn("color: rgb(190, 18, 60)", shared_table_source)
-        self.assertIn("color: rgb(22, 101, 52)", shared_table_source)
+        self.assertIn("color: var(--ui-up)", shared_table_source)
+        self.assertIn("color: var(--ui-down)", shared_table_source)
         self.assertNotIn("¥", tables_source + shared_table_source)
 
         self.assertIn('st.subheader("历史盈亏")', history_source)

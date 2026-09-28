@@ -126,11 +126,11 @@ def render_position_table(
             opacity: 0.82;
         }}
         .position-data-table .position-pnl-positive {{
-            color: rgb(190, 18, 60);
+            color: var(--ui-up);
             font-weight: 600;
         }}
         .position-data-table .position-pnl-negative {{
-            color: rgb(22, 101, 52);
+            color: var(--ui-down);
             font-weight: 600;
         }}
         </style>

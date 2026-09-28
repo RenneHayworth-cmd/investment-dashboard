@@ -34,11 +34,13 @@ from components.backtest.portfolio_timing import (
     render_portfolio_timing_nav_chart,
 )
 from core.db import init_db
+from core.ui import apply_global_style
 from services.fund_analysis import FUND_ADJUSTMENT_OPTIONS
 
 
 st.set_page_config(page_title="策略回测", layout="wide")
 init_db()
+apply_global_style()
 
 st.title("策略回测")
 st.caption("支持单标的均线择时、多ETF配置择时、历史年度ETF动态组合，以及按动量排名执行多基金轮动。")

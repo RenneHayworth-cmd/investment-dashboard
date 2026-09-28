@@ -59,7 +59,7 @@ if st.button("更新缺失的正式指数数据", type="primary"):
 preview = st.session_state.get(preview_state_key)
 if isinstance(preview, pd.DataFrame) and not preview.empty:
     st.info(f"本次预计更新 {len(preview)} 个指数。以下仅为本地缓存检查结果，尚未联网或写入数据。")
-    st.dataframe(preview, use_container_width=True, hide_index=True)
+    st.dataframe(preview, width="stretch", hide_index=True)
     confirm_column, cancel_column, _ = st.columns([1, 1, 4])
     confirm_update = confirm_column.button("确认更新并复核", type="primary")
     cancel_update = cancel_column.button("取消", key="cancel_formal_index_update")
@@ -118,7 +118,7 @@ verification = st.session_state.get(verification_state_key)
 if isinstance(verification, pd.DataFrame) and not verification.empty:
     st.markdown("#### 最近一次更新复核")
     st.caption("偏差按两个来源同一交易日的收盘价计算；0.20%以内标记为一致。复核结果仅供检查，不会覆盖正式缓存。")
-    st.dataframe(verification, use_container_width=True, hide_index=True)
+    st.dataframe(verification, width="stretch", hide_index=True)
 
 st.subheader("数据集")
 datasets = _format_times(list_datasets(), ("last_update_time",))
@@ -136,7 +136,7 @@ datasets = datasets.rename(
         "file_path": "文件路径",
     }
 )
-st.dataframe(datasets, use_container_width=True, hide_index=True)
+st.dataframe(datasets, width="stretch", hide_index=True)
 
 st.subheader("任务记录")
 jobs = _format_times(list_jobs(), ("started_at", "finished_at"))
@@ -150,4 +150,4 @@ jobs = jobs.rename(
         "message": "说明",
     }
 )
-st.dataframe(jobs, use_container_width=True, hide_index=True)
+st.dataframe(jobs, width="stretch", hide_index=True)
