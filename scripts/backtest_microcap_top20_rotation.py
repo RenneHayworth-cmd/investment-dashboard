@@ -51,6 +51,7 @@ VERSION_B_DEFER = "B2_严格无未来函数"
 
 CONFIG_SPEC = "spec_含ST全池"
 CONFIG_STRICT = "strict_剔除ST与停牌"
+CONFIG_ST_ONLY = "strict_st_仅剔除ST"
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +91,9 @@ class Panel:
             .fillna(False)
             .astype(bool)
         )
+        self.isst = (
+            df.pivot(index="date", columns="code", values="isst").reindex(index=idx, columns=cols).fillna(False).astype(bool)
+        )
         self.name = df.drop_duplicates("code").set_index("code")["name"].to_dict()
         self.date_pos = {d: i for i, d in enumerate(self.dates)}
 
@@ -97,6 +101,9 @@ class Panel:
         caps = self.cap.loc[date]
         if config == CONFIG_STRICT:
             caps = caps.where(self.eligible.loc[date])
+        elif config == CONFIG_ST_ONLY:
+            # 仅剔除 ST/*ST，停牌股保留在名单内（买入时拦截，不替补下一名）
+            caps = caps.where(~self.isst.loc[date])
         caps = caps.replace([np.inf, -np.inf], np.nan).dropna()
         caps = caps[caps > 0]
         return caps.sort_values(kind="mergesort")
@@ -130,6 +137,7 @@ def load_panel(est_dir: Path) -> Panel:
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df["eligible"] = df["strategy_eligible"].astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
     df["halted"] = pd.to_numeric(df["tradestatus"], errors="coerce").fillna(0).astype(int).eq(0)
+    df["isst"] = pd.to_numeric(df["isST"], errors="coerce").fillna(0).astype(int).eq(1)
     df["cap"] = pd.to_numeric(df["cap"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return Panel(df)
@@ -540,6 +548,7 @@ def main() -> int:
     for config, version in spec_runs:
         results[(config, version)] = run_backtest(panel, config, version, initial_cash)
     results[(CONFIG_STRICT, VERSION_B)] = run_backtest(panel, CONFIG_STRICT, VERSION_B, initial_cash)
+    results[(CONFIG_ST_ONLY, VERSION_B)] = run_backtest(panel, CONFIG_ST_ONLY, VERSION_B, initial_cash)
 
     primary: OrderedDict[str, dict] = OrderedDict(
         (v, results[(CONFIG_SPEC, v)]) for v in (VERSION_A, VERSION_B, VERSION_B_DEFER)
@@ -664,10 +673,21 @@ def main() -> int:
     strict_strategy = compute_metrics(strict_series, strict_res["first_invested"], strict_res["trades"], strict_res["rebalances"])
 
     sens_rows = []
+    st_only_res = results[(CONFIG_ST_ONLY, VERSION_B)]
+    st_only_metrics = compute_metrics(st_only_res["nav"], initial_cash, st_only_res["trades"], st_only_res["rebalances"])
+    st_only_series = []
+    for r in st_only_res["nav"]:
+        item = dict(r)
+        item["总资产"] = r["总资产"] - (initial_cash - st_only_res["first_invested"])
+        st_only_series.append(item)
+    st_only_strategy = compute_metrics(
+        st_only_series, st_only_res["first_invested"], st_only_res["trades"], st_only_res["rebalances"]
+    )
     for label, met, met_s in [
         (f"{CONFIG_SPEC} · {VERSION_A}", detailed[VERSION_A]["account"], detailed[VERSION_A]["strategy"]),
         (f"{CONFIG_SPEC} · {VERSION_B}", detailed[VERSION_B]["account"], detailed[VERSION_B]["strategy"]),
         (f"{CONFIG_SPEC} · {VERSION_B_DEFER}", detailed[VERSION_B_DEFER]["account"], detailed[VERSION_B_DEFER]["strategy"]),
+        (f"{CONFIG_ST_ONLY} · {VERSION_B}", st_only_metrics, st_only_strategy),
         (f"{CONFIG_STRICT} · {VERSION_B}", strict_metrics, strict_strategy),
     ]:
         sens_rows.append(
@@ -950,6 +970,23 @@ def main() -> int:
     )
     pd.DataFrame(audit_rows).to_csv(out_dir / "audit_checks.csv", index=False, encoding="utf-8-sig")
 
+    # ---------------- 与外部成果对齐用：仅剔除ST 口径的逐笔明细 ----------------
+    align_dir = out_dir / "align_st_only"
+    align_dir.mkdir(parents=True, exist_ok=True)
+    st_only_res_for_dump = results[(CONFIG_ST_ONLY, VERSION_B)]
+    pd.DataFrame(st_only_res_for_dump["trades"]).to_csv(align_dir / "trade_log_st_only.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(st_only_res_for_dump["holdings"]).to_csv(align_dir / "weekly_holdings_st_only.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(st_only_res_for_dump["rebalances"]).to_csv(align_dir / "weekly_rebalance_st_only.csv", index=False, encoding="utf-8-sig")
+    align_nav = []
+    invested = float(st_only_res_for_dump["first_invested"])
+    reserve = initial_cash - invested
+    for r in st_only_res_for_dump["nav"]:
+        item = dict(r)
+        item["账户净值"] = item["总资产"] / initial_cash
+        item["策略净值"] = (item["总资产"] - reserve) / invested
+        align_nav.append(item)
+    pd.DataFrame(align_nav).to_csv(align_dir / "daily_nav_st_only.csv", index=False, encoding="utf-8-sig")
+
     # ---------------- run_metadata.json ----------------
     meta = {
         "数据源": str(est_dir / "all_candidate_days.csv"),
@@ -971,6 +1008,7 @@ def main() -> int:
         },
         "配置说明": {
             CONFIG_SPEC: "题述字面口径：548 只候选全部参与排名（含 ST 与停牌股）",
+            CONFIG_ST_ONLY: "仅剔除 ST/*ST，停牌股仍参与排名但在成交环节拦截（与外部成果口径对齐用）",
             CONFIG_STRICT: "稳健口径：剔除 ST/*ST 与停牌（等同数据集 strategy_eligible）",
         },
         "首轮建仓日": {v: (r["first_build_date"].strftime("%Y-%m-%d") if r["first_build_date"] is not None else None) for v, r in primary.items()},

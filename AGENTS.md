@@ -624,6 +624,9 @@ Commit only relevant source changes. Do not revert unrelated user changes.
 
 ## Microcap20 ABCD
 
+- Exclude confirmed signal-day suspensions before taking the smallest 20. Freeze the entire candidate order with each rebalance plan. On execution-day suspension, substitute using that frozen order, never execution-day capitalization. Held suspended stocks still occupy the 20-position cap; limit-up cancellations do not get replacements.
+- Offline research replay lives in services/microcap_rotation_replay.py and must reconcile fills, inventories, cash, fees and all 72 display values before replacing the active research archive. User authorized replacing the old research display.
+
 - Keep the ABCD facade in services/microcap_rotation.py; UI and CLI share it.
 - New simulation accounts require explicit enablement; browsing is cache-only.
 - Preserve immutable input batches, next-session execution, fixed 10000-yuan stock sizing, and 2-yuan fill fees.

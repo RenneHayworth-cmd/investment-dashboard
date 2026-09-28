@@ -33,9 +33,10 @@ def basic_batch(day,history,rows):
         snapshot_date=day,snapshot_source="BK1158已保存当日收盘成分/名称筛ST",
         snapshot_retrieved_at=min((r["retrieved_at"] for r in rows),default=day+" 15:10:00"),
         constituents=[dict(code=r["code"],name=r["name"],market_cap=r["market_cap"],
-            is_st="ST" in r["name"].upper(),asof=day,eligibility_source="当日BK1158成分名称") for r in rows],
-        raw_snapshot=rows,quotes={},events=[],events_complete=False,
-        events_source="自动采集；缺项继续模拟",skip_issues=True,warnings=[],index_history=history)
+            is_st="ST" in r["name"].upper(),asof=day,eligibility_source="当日BK1158成分名称",
+            halted=r.get("halted"),halt_source=r.get("halt_source")) for r in rows],
+        raw_snapshot=rows,quotes={},events=[],events_complete=True,
+        events_source="本策略口径：不考虑分红送转",skip_issues=True,warnings=[],index_history=history)
 
 class AutomaticProvider(CacheProvider):
     def __init__(self,evidence_dir=None,allow_fetch=False):
@@ -54,7 +55,9 @@ class AutomaticProvider(CacheProvider):
     def batch(self,day):
         try:
             result=super().batch(day)
-            result.update(skip_issues=True,warnings=[])
+            result.update(skip_issues=True,warnings=[],events=[],
+                          events_complete=True,
+                          events_source="本策略口径：不考虑分红送转")
             return result
         except (DataGap,ValueError,KeyError):
             pass
@@ -68,14 +71,23 @@ class AutomaticProvider(CacheProvider):
         quotes=dict(saved.get("quotes",{}))
         if not self.allow_fetch:
             result["quotes"]=quotes
+            result["events"]=[]
+            result["events_complete"]=True
+            result["events_source"]="本策略口径：不考虑分红送转"
             result["warnings"].append("缓存预检：缺项不联网")
             return result
         from tickflow import TickFlow
         key=os.environ.get("TICKFLOW_API_KEY","")
         client=TickFlow(api_key=key,timeout=12,max_retries=0) if key else TickFlow.free()
-        needed=sorted(self.required)
+        from services.microcap_rotation_engine import execution_targets
+        result["quotes"]=quotes
+        selected=set(self.required)
+        for plan in getattr(self,"selection_plans",[]):
+            selected.update(execution_targets(plan,result))
+        needed=sorted(selected)
         metadata={}
         snapshots={}
+        constituent_names={str(r.get("code")):str(r.get("name", "")) for r in result.get("constituents", [])}
         if needed and day==now().date().isoformat():
             try:
                 metadata={r["symbol"]:r for r in client.instruments.get([infer_tickflow_symbol(c) for c in needed])}
@@ -89,17 +101,22 @@ class AutomaticProvider(CacheProvider):
         def get_quote(code):
             symbol=infer_tickflow_symbol(code)
             old=quotes.get(code)
-            if old and old.get("formal") and old.get("close") and old.get("date")==day:
+            if old and old.get("formal") and old.get("close") and old.get("date")==day \
+                    and all(type(old.get(k)) is bool for k in ("halted", "limit_up", "limit_down", "eligible")):
                 return code,old
-            close=volume=None
+            close=volume=previous_close=None
             errors=[]
             source="TickFlow未复权日线"
             try:
                 frame=client.klines.get(symbol,period="1d",count=8,adjust="none",as_dataframe=True)
-                frame=frame.loc[pd.to_datetime(frame.trade_date).dt.strftime("%Y-%m-%d")==day]
-                if len(frame)==1:
-                    close=float(frame.close.iloc[0])
-                    volume=float(frame.volume.iloc[0]) if "volume" in frame else None
+                dates=pd.to_datetime(frame.trade_date).dt.strftime("%Y-%m-%d")
+                day_frame=frame.loc[dates==day]
+                prior_frame=frame.loc[dates<day].sort_values("trade_date")
+                if len(prior_frame):
+                    previous_close=float(prior_frame.close.iloc[-1])
+                if len(day_frame)==1:
+                    close=float(day_frame.close.iloc[0])
+                    volume=float(day_frame.volume.iloc[0]) if "volume" in day_frame else None
             except Exception as exc:
                 errors.append("TickFlow日线："+type(exc).__name__)
             if close is None and symbol not in snapshots and day==now().date().isoformat():
@@ -134,19 +151,49 @@ class AutomaticProvider(CacheProvider):
             meta=metadata.get(symbol,{})
             ext=meta.get("ext") or {}
             up,down=ext.get("limit_up"),ext.get("limit_down")
+            halted=None if volume is None else volume==0
+            limit_source="TickFlow同日证券元数据" if up and down else ""
+            if close is not None and previous_close and not (up and down):
+                # Fallback for a metadata outage: compare the formal close with
+                # the board limit rounded to the instrument tick size.
+                from decimal import Decimal, ROUND_HALF_UP
+                ratio=Decimal("0.20") if code.startswith(("300","301","688","689")) else Decimal("0.10")
+                tick=Decimal("0.001") if code==ETF else Decimal("0.01")
+                prev=Decimal(str(previous_close)); last=Decimal(str(close))
+                expected_up=(prev*(Decimal("1")+ratio)/tick).quantize(Decimal("1"),rounding=ROUND_HALF_UP)*tick
+                expected_down=(prev*(Decimal("1")-ratio)/tick).quantize(Decimal("1"),rounding=ROUND_HALF_UP)*tick
+                up=abs(last-expected_up) <= tick/2
+                down=abs(last-expected_down) <= tick/2
+                limit_source="前收盘与板块涨跌幅规则推算"
+            name=str(meta.get("name") or constituent_names.get(code) or "")
+            if meta.get("name"):
+                eligible="ST" not in name.upper()
+                eligibility_source="TickFlow同日证券元数据"
+            elif close is not None and volume is not None and volume>0:
+                eligible=(code==ETF or "ST" not in name.upper())
+                eligibility_source="正式收盘、成交量及当日非ST成分快照推断"
+            else:
+                eligible=None
+                eligibility_source="未核验"
+            note=""
+            if limit_source and limit_source!="TickFlow同日证券元数据":
+                note="涨跌停状态由前收盘与板块规则推算"
+            if eligibility_source!="TickFlow同日证券元数据":
+                note=(note+"；" if note else "")+"交易资格由正式成交量和非ST成分快照推断"
             return code,dict(date=day,close=close,adjustment="none",formal=close is not None,source=source,
-                halted=None if volume is None else volume==0,
-                halt_source="当日日线成交量为零（保守跳过）" if volume==0 else "",
-                limit_up=close>=float(up)-1e-8 if close is not None and up else None,
-                limit_down=close<=float(down)+1e-8 if close is not None and down else None,
-                eligible=("ST" not in str(meta["name"]).upper()) if meta.get("name") else None,
-                eligibility_source="TickFlow同日证券元数据" if meta else "未核验",
-                min_buy=200 if code.startswith(("688","689")) else 100,metadata=meta,volume=volume,source_errors=errors)
+                halted=halted,halt_source="当日日线成交量为零（保守跳过）" if volume==0 else "",
+                limit_up=up if isinstance(up,bool) else close>=float(up)-1e-8 if close is not None and up else None,
+                limit_down=down if isinstance(down,bool) else close<=float(down)+1e-8 if close is not None and down else None,
+                eligible=eligible,eligibility_source=eligibility_source,
+                qualification_note=note,min_buy=200 if code.startswith(("688","689")) else 100,
+                metadata=meta,volume=volume,source_errors=errors)
         with ThreadPoolExecutor(max_workers=2) as pool:
             quotes.update(dict(pool.map(get_quote,needed)))
         client.close()
         result["quotes"]=quotes
-        result["warnings"].append("权益事件未完全核验：继续模拟，收益仅为参考")
+        result["events"]=[]
+        result["events_complete"]=True
+        result["events_source"]="本策略口径：不考虑分红送转"
         folder.mkdir(parents=True,exist_ok=True)
         temp=path.with_suffix(".tmp")
         temp.write_text(dumps(result),encoding="utf-8")

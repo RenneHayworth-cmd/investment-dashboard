@@ -32,6 +32,16 @@ def snapshot_records(frame):
         rows.append(dict(code=str(r["代码"]).zfill(6),name=str(r["名称"]),
                          market_cap=float(r["总市值(亿元)"]),snapshot_date=str(r["快照日期"]),
                          retrieved_at=str(r["快照时间"])))
+        flags=[]
+        flag=r.get("是否停牌")
+        if pd.notna(flag):
+            flags.append(str(flag).lower() in {"true","1","是","停牌","yes"})
+        for key in ("成交量","成交额"):
+            value=pd.to_numeric(r.get(key),errors="coerce")
+            if pd.notna(value):
+                flags.append(value <= 0)
+        if flags:
+            rows[-1].update(halted=any(flags),halt_source="当日成分快照停牌标记/成交量/成交额")
     return rows
 
 def evidence_template(day):
@@ -106,7 +116,8 @@ class CacheProvider:
             code=r["code"]
             proof=eligibility.get(code,{})
             rows.append(dict(code=code,name=r["name"],market_cap=r["market_cap"],
-                             is_st=proof.get("is_st"),eligibility_source=proof.get("source"),asof=proof.get("asof")))
+                             is_st=proof.get("is_st"),eligibility_source=proof.get("source"),asof=proof.get("asof"),
+                             halted=r.get("halted"),halt_source=r.get("halt_source")))
         history=self.history(day)
         return dict(date=day,index_code="BK1158",index_close=history[-1]["close"],formal=True,
                     source="工作台正式BK1158收盘",retrieved_at=now().isoformat(timespec="seconds"),

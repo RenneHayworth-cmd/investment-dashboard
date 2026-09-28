@@ -2,7 +2,7 @@
 from copy import deepcopy
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 import math
-from services.microcap_rotation_policy import (DataGap, INITIAL, FEE, ETF, money,
+from services.microcap_rotation_policy import (DataGap, INITIAL, ETF, money,
                                                ETF_FEE_RATE, transaction_fee,
                                                next_day, weekly_turn, sessions)
 
@@ -68,9 +68,25 @@ def validate_batch(batch, day, enabled_day):
         value = event.get("cash_per_share") if event["kind"]=="cash" else event.get("new_shares_per_share")
         positive(value, "权益事件数额")
 
-def ranking(batch):
-    return [r["code"] for r in sorted((r for r in batch["constituents"] if not r["is_st"]),
-                                     key=lambda r:(float(r["market_cap"]),r["code"]))[:20]]
+def ranking(batch, limit=20):
+    def suspended(row):
+        if row.get("halted") is True and row.get("asof") == batch["date"]:
+            return True
+        q = batch.get("quotes", {}).get(row["code"], {})
+        return q.get("date") == batch["date"] and q.get("halted") is True
+    return [r["code"] for r in sorted((r for r in batch["constituents"] if not r["is_st"] and not suspended(r)),
+                                     key=lambda r:(float(r["market_cap"]),r["code"]))[:limit]]
+
+def execution_targets(plan, batch):
+    """Use frozen prior-day order, removing only confirmed execution-day halts."""
+    candidates=plan.get("candidates")
+    if not candidates or plan["mode"]!="stock":
+        return list(plan.get("targets",[]))
+    halted={r["code"] for r in batch["constituents"]
+            if r.get("asof")==batch["date"] and r.get("halted") is True}
+    halted.update(c for c,q in batch.get("quotes",{}).items()
+                  if q.get("date")==batch["date"] and q.get("halted") is True)
+    return [c for c in candidates if c not in halted][:20]
 
 def regime(history, previous=None):
     if len(history) < 121:
@@ -127,6 +143,7 @@ def make_plan(strategy, state, batch, risk, previous=None, initial=False):
     buys = [c for c in target if c not in held] if trigger else []
     sells = [c for c in held if c not in (target if mode=="stock" else [ETF] if mode=="etf" else [])]
     return dict(signal_date=day, execution_date=following, risk=risk, mode=mode, targets=target,
+                candidates=ranking(batch,limit=None) if mode=="stock" and trigger else [],
                 buys=buys, sells=sells, buy_etf=mode=="etf" and (trigger or bool(sells)),
                 reason="首次配置" if initial else "状态变化" if mode!=old_mode else "周度轮动" if trigger else "持有/待卖复核")
 
@@ -159,10 +176,20 @@ def execute(strategy, previous, batch, history, entitlements=None):
     state = deepcopy(previous)
     state.pop("strategy", None)
     state.pop("completed_at", None)
+    state.pop("selection_adjustment", None)
     state.update(date=day, fills=[], failures=[], events=[], warnings=list(batch.get("warnings",[])), provisional=bool(batch.get("skip_issues") and not batch.get("events_complete")))
     cash = money(state["cash"])
     positions = state["positions"]
     oldplan = state["plan"]
+    if oldplan and oldplan.get("candidates") and oldplan["mode"]=="stock":
+        original=list(oldplan["targets"])
+        oldplan["targets"]=execution_targets(oldplan,batch)
+        oldplan["buys"]=[c for c in oldplan["targets"] if c not in positions]
+        oldplan["sells"]=[c for c in positions if c not in oldplan["targets"]]
+        state["selection_adjustment"]=dict(signal_date=oldplan["signal_date"],
+            excluded=[c for c in original if c not in oldplan["targets"]],
+            replacements=[c for c in oldplan["targets"] if c not in original],
+            targets=list(oldplan["targets"]))
     if strategy=="A":
         eq = money(INITIAL*Decimal(str(batch["index_close"]))/Decimal(state["index_base"]))
     else:
@@ -210,14 +237,14 @@ def execute(strategy, previous, batch, history, entitlements=None):
         def fill(code, side, qty, price):
             nonlocal cash
             amount = money(price*qty)
-            fee = transaction_fee(code, amount)
+            fee = transaction_fee(code, amount, side)
             cash += amount-fee if side=="sell" else -amount-fee
             if side=="sell":
                 del positions[code]
             else:
                 positions[code] = dict(quantity=qty,price=str(price),name=next((r.get("name",code) for r in batch["constituents"] if r["code"]==code),"红利低波ETF" if code==ETF else code))
             state["fills"].append(dict(date=day,code=code,side=side,quantity=qty,price=str(price),
-                                       amount=str(amount),fee=str(fee),cash_after=str(cash),qualification_note=prices[code][0].get("assumptions","已核对可用行情与资格")))
+                                       amount=str(amount),fee=str(fee),cash_after=str(cash),qualification_note=prices[code][0].get("qualification_note") or prices[code][0].get("assumptions","已核对可用行情与资格")))
         # Reconcile old intentions against the frozen final target.
         allowed = set(oldplan["targets"]) if oldplan["mode"]=="stock" else {ETF} if oldplan["mode"]=="etf" else set()
         for code in sorted(set(positions)-allowed):
@@ -244,7 +271,7 @@ def execute(strategy, previous, batch, history, entitlements=None):
                       "交易资格不符" if not q["eligible"] else
                       "最低申报数量不符" if qty < q["min_buy"] else
                       "20只名额已占满" if len(set(positions)-{ETF}) >= 20 else
-                      "现金不足" if money(p*qty)+transaction_fee(code, p*qty) > cash else "")
+                      "现金不足" if money(p*qty)+transaction_fee(code, p*qty, "buy") > cash else "")
             if reason:
                 fail(code,"buy",reason+"；本次取消")
             else:

@@ -52,8 +52,8 @@ class EngineTests(unittest.TestCase):
         day="2026-09-08"
         r=execute("B",s,batch(day),history(day))
         self.assertEqual(len(r["fills"]),20)
-        self.assertEqual(r["cash"],"19960.00")
-        self.assertEqual(r["equity"],"219960.00")
+        self.assertEqual(r["cash"],"19900.00")  # 20 buys x 5 yuan (v3 stock buy fee)
+        self.assertEqual(r["equity"],"219900.00")
         self.assertEqual(r["plan"]["buys"],[])
         self.assertAlmostEqual(r["cash_ratio"]+r["stock_ratio"],1.)
     def test_holidays_and_weekly(self):
@@ -74,7 +74,9 @@ class EngineTests(unittest.TestCase):
         b=batch("2026-09-08")
         b["quotes"]["600000"].update(halted=True,halt_source="公告",close=None)
         r=execute("B",self.initial(),b,history(b["date"]))
-        self.assertEqual(len(r["positions"]),19)
+        self.assertEqual(len(r["positions"]),20)
+        self.assertNotIn("600000",r["positions"])
+        self.assertIn("600020",r["positions"])
     def test_unknown_missing_price_blocks(self):
         b=batch("2026-09-08"); del b["quotes"]["600000"]
         with self.assertRaises(DataGap):
@@ -102,9 +104,9 @@ class EngineTests(unittest.TestCase):
                      dict(id="split1",kind="shares",code="600000",date=b["date"],record_date="2026-09-08",source="test",new_shares_per_share=.5)]
         validate_batch(b,b["date"],START)
         r=execute("B",s,b,history(b["date"]),{"cash1":1000,"split1":1000})
-        self.assertEqual(r["cash"],"20060.00")
+        self.assertEqual(r["cash"],"20000.00")  # 19900 after v3 buy fees + 100 dividend
         self.assertEqual(r["positions"]["600000"]["quantity"],1500)
-        self.assertEqual(r["equity"],"225060.00")
+        self.assertEqual(r["equity"],"225000.00")
     def test_cash_insufficient_and_minimum_lot(self):
         s=self.initial(); s["cash"]="500.00"
         r=execute("B",s,batch("2026-09-08"),history("2026-09-08"))

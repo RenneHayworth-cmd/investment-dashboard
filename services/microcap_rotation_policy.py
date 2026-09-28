@@ -5,13 +5,16 @@ from zoneinfo import ZoneInfo
 from services.market_calendar import (get_market_window, is_market_trading_day,
                                       latest_settled_trade_date, uncovered_calendar_years)
 
-VERSION = "microcap20-abcd-v2"
+VERSION = "microcap20-abcd-v3"
 INITIAL = Decimal("220000.00")
-FEE = Decimal("2.00")
+STOCK_BUY_FEE = Decimal("5.00")
+STOCK_SELL_FEE = Decimal("5.00")
+STOCK_STAMP_DUTY_RATE = Decimal("0.0005")
 ETF = "512890"
 ETF_FEE_RATE = Decimal("0.00006")  # 512890 commission: 0.6 per ten-thousand
-POLICY = dict(version=VERSION, initial=220000, stock_target=10000, fee=2,
-              etf_fee_rate="0.00006",
+POLICY = dict(version=VERSION, initial=220000, stock_target=10000,
+              stock_buy_fee=5, stock_sell_fee=5,
+              stock_stamp_duty_rate="0.0005", etf_fee_rate="0.00006",
               universe="BK1158", count=20, ma=15, band=0.025,
               execution="next_session_unadjusted_close", reinvest=False,
               missing_data="skip_or_mark_provisional", launch="today_close_from_previous_snapshot")
@@ -24,16 +27,21 @@ class DataGap(ValueError):
 def money(value):
     return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-def transaction_fee(code, amount):
-    """Return the simulated commission for a filled order.
+def transaction_fee(code, amount, side="buy"):
+    """Return the simulated fee and tax for a filled order.
 
-    Stocks keep the fixed 2 yuan fee.  512890 is charged at 0.6 per
-    ten-thousand of turnover, rounded to cents for ledger accounting.
+    Stocks pay 5 yuan on buys and 5 yuan plus 0.05% stamp duty on sells.
+    512890 keeps its separate 0.6 per ten-thousand fee on both sides.
+    All charges are rounded to cents for ledger accounting.
     """
     amount = money(amount)
     if code == ETF:
         return money(amount * ETF_FEE_RATE)
-    return FEE
+    if side == "buy":
+        return STOCK_BUY_FEE
+    if side == "sell":
+        return money(STOCK_SELL_FEE + amount * STOCK_STAMP_DUTY_RATE)
+    raise ValueError("交易方向必须为buy或sell")
 
 def now():
     return datetime.now(ZoneInfo("Asia/Shanghai"))

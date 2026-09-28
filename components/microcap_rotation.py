@@ -57,7 +57,7 @@ def daily(view):
     accounts=view["accounts"]
     if not accounts:
         st.info("每日模拟尚未启用。启用后从第一个输入完整的收盘日开始，四账户各22万元。")
-        st.caption("BK1158非ST最小20只；每只新仓约1万元；股票每笔2元，512890按成交金额万分之0.6；MA15±2.5%；不承接旧账户。")
+        st.caption("策略新版本从各22万元起步；BK1158非ST最小20只，每只新仓约1万元；股票买入5元、卖出5元加万5印花税，512890仍按成交金额万0.6；MA15±2.5%。")
         if st.button("启用每日模拟",type="primary"):
             service.initialize_simulation()
             st.success("四账户已启用，等待首个完整收盘日。")
@@ -82,7 +82,7 @@ def daily(view):
                        (["512890"] if launch["states"][s]["plan"]["buy_etf"] else [])])
         return
     if any(r.get("provisional") for r in latest.values()):
-        st.warning("执行优先模拟：含未完全核验数据，收益仅供参考；缺价交易已跳过，前值估值会单独标记。")
+        st.warning("执行优先模拟：仍有行情或交易资格字段待补齐，收益仅供参考；缺价交易已跳过，前值估值会单独标记。")
         with st.expander("本次数据问题"):
             st.write(list(dict.fromkeys(w for r in latest.values() for w in r.get("warnings",[]))))
     a=latest["A"]
@@ -99,6 +99,9 @@ def daily(view):
         st.subheader(selected+" · "+service.NAMES[selected])
         table([{"date":r["date"],"equity":r["equity"],"cash":r["cash"],"pnl":r["pnl"]}])
         tabs=st.tabs(["当前持仓","计划交易","模拟成交","未成交原因","每日盈亏","权益事件"])
+        if r.get("selection_adjustment",{}).get("excluded"):
+            with st.expander("停牌剔除与顺延记录"):
+                table([r["selection_adjustment"]])
         with tabs[0]:
             table([dict(code=c,**p) for c,p in r["positions"].items()])
             if selected=="A":
@@ -126,7 +129,7 @@ def daily(view):
             r=latest[s]
             with st.container(border=True):
                 st.markdown(f"**{s} · {service.NAMES[s]}**")
-                st.metric("总资产",f"{float(r['equity']):,.2f} 元",f"{r['return_pct']:+.2f}%")
+                st.metric("总资产", f"{float(r['equity']):,.2f} 元", f"{r['return_pct']:+.2f}%", delta_color="inverse")
                 maxdd=min(row["drawdown_pct"] for row in view["daily"] if row["strategy"]==s)
                 st.caption(f"最大回撤 {maxdd:.2f}% ｜ 现金 {r['cash_ratio']:.2%}")
                 st.caption("理论指数" if s=="A" else f"股票 {r['stock_ratio']:.2%} / ETF {r['etf_ratio']:.2%}")
@@ -144,6 +147,10 @@ def research(view):
         st.info("尚未导入历史研究，请在「数据与运行」中选择交接包目录。")
         return
     st.caption("计算版本："+report["calculation_version"]+"；原始字段及输入哈希保留在导出中。")
+    if report.get("calculation_version") != "abcd-research-suspension-3":
+        st.warning("当前档案不是v3统一执行引擎的费率复算；原交接包费用口径可能未包含股票卖出万5印花税。")
+    if report.get("selection_audit"):
+        st.caption("本次重算：停牌先剔除、前日候补顺延；股票买入5元、卖出5元加万5印花税，512890万0.6，不考虑分红送转。")
     tabs=st.tabs(["统一复算","净值对比","成交与持仓","避险分段","审计说明"])
     with tabs[0]:
         table(report["comparison"])
@@ -155,8 +162,11 @@ def research(view):
     with tabs[2]:
         strategy=st.selectbox("研究策略",["B","C","D"])
         table(report["trades"][strategy])
-        with st.expander("原始周度持仓"):
+        with st.expander("每日持仓" if report.get("selection_audit") else "原始周度持仓"):
             table(report["holdings"][strategy])
+        if report.get("selection_adjustments"):
+            with st.expander("停牌剔除与候补顺延"):
+                table([r for r in report["selection_adjustments"] if r["strategy"]==strategy])
     with tabs[3]:
         table(report["periods"])
     with tabs[4]:
@@ -198,7 +208,7 @@ def operations(view):
         snapshots,_=load_microcap_constituent_snapshots()
         if snapshots is not None and not snapshots.empty:
             st.caption("缓存快照最新日期："+str(snapshots["快照日期"].max()))
-        st.caption("执行优先版本会保留数据问题明细；缺价持仓沿用前值参考估值，未核验权益事件可能影响收益。")
+        st.caption("执行优先版本保留数据问题明细；缺价持仓沿用前值参考估值。本模拟不考虑分红送转。")
     from core.db import list_jobs
     jobs=list_jobs(100)
     if not jobs.empty:
@@ -210,7 +220,7 @@ def operations(view):
 
 def render_rotation():
     st.subheader("微盘20 · ABCD策略")
-    st.caption("执行优先版本：缺项跳过或标记待核验，不要求手工上传证据。A为无摩擦指数基准；B/C/D每笔实际模拟成交收取2元，未计税费和滑点。所有成交均为模拟。")
+    st.caption("停牌先剔除并按前日候补顺延20只；A为无摩擦指数基准。股票买入5元、卖出5元加万5印花税；512890仍按万0.6计佣。不考虑分红送转，未计其他税费和滑点。所有成交均为模拟。")
     try:
         view=service.read_strategy_view()
         mode=st.segmented_control("策略视图",["每日模拟","历史研究","数据与运行"],default="每日模拟",key="rotation_view")

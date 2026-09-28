@@ -85,6 +85,8 @@ def _run(store,provider,target,preflight,refresh):
                     required.add(ETF)
             if hasattr(provider,"required"):
                 provider.required=set(required)
+                provider.selection_plans=[r["plan"] for r in latest.values()
+                    if r.get("plan") and r["plan"].get("candidates")]
             if refresh and not preflight:
                 provider.refresh(day,required)
             batch=provider.batch(day)
@@ -149,14 +151,15 @@ def repair_latest_missing_prices(store,provider):
     if not batch.get("skip_issues"):
         return None
     missing=[]
+    events_changed=not batch.get("events_complete") or bool(batch.get("events"))
     for code,q in batch.get("quotes",{}).items():
         try:
             positive(q.get("close"),"收盘")
-            if q.get("formal") is not True:
+            if q.get("formal") is not True or any(type(q.get(k)) is not bool for k in ("halted", "limit_up", "limit_down", "eligible")):
                 missing.append(code)
         except DataGap:
             missing.append(code)
-    if not missing:
+    if not missing and not events_changed:
         return None
     provider.required=set(missing)
     provider.refresh(day,missing)
@@ -171,6 +174,8 @@ def repair_latest_missing_prices(store,provider):
             continue
         if q.get("formal") is not True or q.get("date")!=day or q.get("adjustment")!="none":
             continue
+        if any(type(q.get(k)) is not bool for k in ("halted", "limit_up", "limit_down", "eligible")):
+            continue
         q=deepcopy(q)
         original=batch["quotes"].get(code,{})
         if not q.get("metadata") and original.get("metadata"):
@@ -184,8 +189,14 @@ def repair_latest_missing_prices(store,provider):
                     q[field]=comparison(float(q["close"]),float(ext[field]))
         updated["quotes"][code]=q
         improved.append(code)
-    if not improved:
+    if not improved and not events_changed:
         return None
+    if events_changed:
+        updated["events"]=[]
+        updated["events_complete"]=True
+        updated["events_source"]="本策略口径：不考虑分红送转"
+        updated.setdefault("warnings",[])
+        updated["warnings"]=[w for w in updated["warnings"] if "权益事件未完全核验" not in str(w)]
     older=[r for r in rows if r["date"]<day]
     launch=store.launch()
     if older:
@@ -202,8 +213,13 @@ def repair_latest_missing_prices(store,provider):
             matched=[r for r in older if r["strategy"]==strategy and r["date"]==event["record_date"]]
             entitlements[event["id"]]=matched[0]["positions"].get(event["code"],{}).get("quantity",0) if matched else 0
         states[strategy]=execute(strategy,previous[strategy],updated,updated["index_history"],entitlements)
+    reason_parts=[]
+    if improved:
+        reason_parts.append("补齐当日行情/资格字段")
+    if events_changed:
+        reason_parts.append("按不考虑分红送转口径清理权益事件字段")
     updated["price_revision"]=dict(at=now().isoformat(timespec="seconds"),codes=sorted(improved),
-                                   reason="补齐当日正式收盘价后重放原计划，非次日追单")
+                                   reason="；".join(reason_parts)+"后重放原计划，非次日追单")
     store.commit_day(updated,states,revision_reason=updated["price_revision"]["reason"])
     return dict(date=day,codes=sorted(improved))
 
@@ -230,7 +246,8 @@ def update_simulation(target=None,db_path=None,provider=None,preflight=False,ref
             if repaired:
                 result["price_repair"]=repaired
                 result["status"]="已补价重算"
-                result["message"]=f"{repaired['date']}补齐{len(repaired['codes'])}只价格并重算，原日结已归档；"+result["message"]
+                detail=(f"补齐{len(repaired['codes'])}只行情/资格字段" if repaired["codes"] else "按当前模拟口径重算权益事件字段")
+                result["message"]=f"{repaired['date']}{detail}，原日结已归档；"+result["message"]
             if job is not None:
                 from core.db import finish_job
                 finish_job(job,"failed" if result["gaps"] else "success",result["message"])
