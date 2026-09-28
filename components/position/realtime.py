@@ -556,11 +556,36 @@ def render_etf_timing_section_impl(
     index_state = st.session_state.get("position_index_realtime_preview", {})
     index_quotes = index_state.get("quotes", {}) if index_state.get("date") == preview_date else {}
     index_error = index_state.get("error", "") if index_state.get("date") == preview_date else ""
-    if updates_enabled and derivative_refresh_due and position.etf_intraday_quote_ready(market_now):
-        names = set(position.POSITION_INDEX_TIMING_STRATEGIES)
+    index_names = set(position.POSITION_INDEX_TIMING_STRATEGIES)
+    stored_missing_names = index_state.get("missing_names")
+    if index_state.get("date") == preview_date and isinstance(
+        stored_missing_names, (list, tuple, set)
+    ):
+        index_missing_names = set(stored_missing_names) & index_names
+    elif index_error:
+        index_missing_names = set(index_names)
+    else:
+        index_missing_names = set()
+    index_last_attempt = pd.to_datetime(index_state.get("fetched_at"), errors="coerce")
+    index_retry_due = bool(
+        updates_enabled and index_error and index_missing_names
+        and position.etf_intraday_quote_ready(market_now)
+        and (
+            pd.isna(index_last_attempt)
+            or (market_now_naive - index_last_attempt).total_seconds()
+            >= position.ETF_REALTIME_TIMING_REFRESH_SECONDS
+        )
+    )
+    if (
+        updates_enabled
+        and (derivative_refresh_due or index_retry_due)
+        and position.etf_intraday_quote_ready(market_now)
+    ):
+        request_names = index_names if derivative_refresh_due else index_missing_names
+        index_missing_names = set(request_names)
         try:
             fetched = fetch_realtime_index_quotes(
-                now=market_now, max_workers=2, force_index_names=names,
+                now=market_now, max_workers=2, force_index_names=request_names,
             )
             valid = {
                 name: quote for name, quote in fetched.items()
@@ -570,12 +595,20 @@ def render_etf_timing_section_impl(
                 and price > 0
             }
             index_quotes = {**index_quotes, **valid}
-            missing = names - valid.keys()
+            missing = request_names - valid.keys()
+            if derivative_refresh_due:
+                missing = index_names - valid.keys()
+            index_missing_names = set(missing)
             index_error = "、".join(sorted(missing)) + "：未取得当日有效报价" if missing else ""
         except Exception as exc:
             index_error = f"指数实时报价失败：{exc}"
+            index_missing_names = set(request_names)
         st.session_state["position_index_realtime_preview"] = {
-            "date": preview_date, "quotes": index_quotes, "error": index_error,
+            "date": preview_date,
+            "quotes": index_quotes,
+            "error": index_error,
+            "missing_names": sorted(index_missing_names),
+            "fetched_at": market_now_naive.isoformat(),
         }
     actual_index_value_formatter = (
         index_value_formatter or format_index_table_value

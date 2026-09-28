@@ -2750,9 +2750,10 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(table.loc["159201", "组合权重比例"], "5%")
         self.assertEqual(table.loc["159501", "组合权重比例"], "10%")
         self.assertEqual(table.loc["161128", "组合权重比例"], "2%")
-        self.assertEqual(table.loc["588000", "组合权重比例"], "1%")
+        self.assertEqual(table.loc["588000", "组合权重比例"], "2%")
         self.assertEqual(table.loc["513260", "组合权重比例"], "1%")
-        self.assertEqual(table.loc["159915", "组合权重比例"], "1%")
+        self.assertEqual(table.loc["159915", "组合权重比例"], "2%")
+        self.assertEqual(table.loc["159967", "组合权重比例"], "8%")
 
     def test_512890_parking_snapshot_uses_only_aggregate_position_transitions(self):
         dates = pd.date_range("2026-07-01", periods=6, freq="D")
