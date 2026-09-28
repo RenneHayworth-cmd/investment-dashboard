@@ -8,7 +8,7 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 
-PAGE = Path(__file__).parents[1] / "pages" / "7_期货实盘.py"
+PAGE = Path(__file__).parents[1] / "pages" / "12_期货实盘.py"
 TARGET_DATE = "2026-08-21"
 ACCOUNT = pd.Series(
     {

@@ -1,4 +1,4 @@
-"""实盘记录页面入口与兼容门面。"""
+"""ETF实盘页面入口与兼容门面。"""
 
 import os
 from datetime import datetime
@@ -45,12 +45,12 @@ from services.live_trading import (
 from services.position_analysis import latest_final_etf_trade_date, load_or_fetch_etf
 
 
-st.set_page_config(page_title="实盘记录", layout="wide")
+st.set_page_config(page_title="ETF实盘", layout="wide")
 init_db()
 apply_global_style()
 
 render_page_header(
-    "实盘记录",
+    "ETF实盘",
     "记录实际成交、手续费和持仓成本，与策略回测结果分开核算。",
     eyebrow="Live Trading",
 )

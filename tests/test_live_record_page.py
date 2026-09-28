@@ -44,7 +44,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertEqual(result["510500"]["price"], 6.1)
 
     def test_default_empty_render_is_cache_first_and_never_fetches(self):
-        page_path = Path(__file__).parents[1] / "pages" / "6_实盘记录.py"
+        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
         with (
             patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
@@ -78,7 +78,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertNotIn("实时行情", [item.label for item in app.expander])
 
     def test_cached_holding_render_keeps_both_price_reads_network_disabled(self):
-        page_path = Path(__file__).parents[1] / "pages" / "6_实盘记录.py"
+        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
         trades = pd.DataFrame(
             [
                 {
@@ -140,7 +140,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertEqual(realtime_mock.call_args.args[0], ["159501"])
 
     def test_initialized_account_renders_summary_chart_and_detail_tabs(self):
-        page_path = Path(__file__).parents[1] / "pages" / "6_实盘记录.py"
+        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
         trades = pd.DataFrame(
             [
                 {

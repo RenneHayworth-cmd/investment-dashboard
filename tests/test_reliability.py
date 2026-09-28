@@ -310,7 +310,7 @@ class PageReliabilityTests(unittest.TestCase):
             "2_A股分析.py",
             "3_策略回测.py",
             "4_相关性分析.py",
-            "7_美股分析.py",
+            "8_美股分析.py",
         ):
             source = (root / "pages" / page_name).read_text(encoding="utf-8")
             self.assertIn("FUND_ADJUSTMENT_OPTIONS", source)
@@ -318,7 +318,7 @@ class PageReliabilityTests(unittest.TestCase):
             root / "components" / "position" / "coordinator.py"
         ).read_text(encoding="utf-8")
         self.assertIn("FUND_ADJUSTMENT_OPTIONS", position_source)
-        live_source = (root / "pages" / "6_实盘记录.py").read_text(encoding="utf-8")
+        live_source = (root / "pages" / "10_ETF实盘.py").read_text(encoding="utf-8")
         self.assertIn("adjustment=FUND_ADJUST_NONE", live_source)
     def test_position_page_imports_realtime_timing_end_constant(self):
         source = (
@@ -336,7 +336,7 @@ class PageReliabilityTests(unittest.TestCase):
     def test_analysis_pages_keep_last_source_in_session_state(self):
         root = Path(__file__).parents[1]
         a_share = (root / "pages" / "2_A股分析.py").read_text(encoding="utf-8")
-        us_stock = (root / "pages" / "7_美股分析.py").read_text(encoding="utf-8")
+        us_stock = (root / "pages" / "8_美股分析.py").read_text(encoding="utf-8")
 
         self.assertIn('analysis_state_key = "a_share_analysis_source"', a_share)
         self.assertIn('analysis_state_key = "us_stock_analysis_source"', us_stock)
@@ -359,7 +359,7 @@ class PageReliabilityTests(unittest.TestCase):
             self.assertIn(label, source)
 
     def test_task_page_has_manual_formal_update_and_chinese_columns(self):
-        source = (Path(__file__).parents[1] / "pages" / "9_任务与数据.py").read_text(encoding="utf-8")
+        source = (Path(__file__).parents[1] / "pages" / "13_任务与数据.py").read_text(encoding="utf-8")
 
         self.assertIn("更新缺失的正式指数数据", source)
         self.assertIn("确认更新并复核", source)
