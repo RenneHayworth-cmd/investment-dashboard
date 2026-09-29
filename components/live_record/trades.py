@@ -40,7 +40,7 @@ def render_live_trade_form(
 ) -> None:
     st.subheader("新增成交")
     with st.form("live_trade_form", clear_on_submit=True):
-        row1 = st.columns([1.1, 1.2, 1, 1.6, 1])
+        row1 = st.columns([1.2, 1, 1.6, 1])
         with row1[0]:
             trade_date = st.date_input(
                 "成交日期",
@@ -51,17 +51,10 @@ def render_live_trade_form(
                 ),
             )
         with row1[1]:
-            record_trade_time = st.checkbox("记录成交时间", value=False)
-            trade_time = st.time_input(
-                "成交时间",
-                value=datetime.now(ZoneInfo("Asia/Shanghai")).time().replace(microsecond=0),
-                disabled=not record_trade_time,
-            )
-        with row1[2]:
             side = st.selectbox("成交方向", ["买入", "卖出"])
-        with row1[3]:
+        with row1[2]:
             symbol = st.text_input("代码", placeholder="例如：159501")
-        with row1[4]:
+        with row1[3]:
             quantity = st.number_input("数量", min_value=0, value=0, step=100)
 
         row2 = st.columns([1.4, 1, 1, 2])
@@ -92,7 +85,7 @@ def render_live_trade_form(
         try:
             add_trade(
                 trade_date=trade_date,
-                trade_time=trade_time if record_trade_time else None,
+                trade_time=None,
                 symbol=symbol,
                 name=name,
                 side=side,
@@ -146,7 +139,6 @@ def render_live_trade_details(
         [
             "记录ID",
             "成交日期",
-            "成交时间",
             "代码",
             "标的名称",
             "方向",
