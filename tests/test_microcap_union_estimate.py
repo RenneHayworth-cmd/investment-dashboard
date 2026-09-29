@@ -6,14 +6,14 @@ from scripts.build_microcap_union_estimate import candidates, rank_estimates
 
 
 class UnionEstimateTests(unittest.TestCase):
-    def test_union_window_and_missing_anchor_not_dropped(self):
+    def test_union_lower_bound_and_missing_anchor_not_dropped(self):
         snapshots = pd.DataFrame({
             '代码': ['000001', '000001', '000002', '000003'],
             '名称': ['甲', '甲', '乙', '丙'],
             '快照日期': ['2026-06-22', '2026-09-08', '2026-06-23', '2026-09-09'],
             '最新价': [10, 20, None, 1], '总市值(亿元)': [1, 5, None, 1]})
         result = candidates(snapshots).set_index('代码')
-        self.assertEqual(set(result.index), {'000001', '000002'})
+        self.assertEqual(set(result.index), {'000001', '000002', '000003'})
         self.assertEqual(result.loc['000001', 'estimated_shares'], 1e7)
         self.assertTrue(pd.isna(result.loc['000002', 'estimated_shares']))
 
@@ -23,7 +23,8 @@ class UnionEstimateTests(unittest.TestCase):
             'share_anchor_date':['2026-06-22']*3})
         bars = pd.DataFrame({'date':['2026-01-05']*3 + ['2026-01-06'],
             'code':['sz.000001','sz.000002','sz.000003','sz.000001'],
-            'close':[1,2,3,1], 'volume':[100,0,100,100], 'amount':[100]*4,
+            'open':[1,2,3,1], 'close':[1,2,3,1], 'preclose':[1,2,3,1], 'pctChg':[0]*4,
+            'volume':[100,0,100,100], 'amount':[100]*4,
             'adjustflag':[3]*4, 'tradestatus':[1,0,1,1], 'isST':[1,0,0,0]})
         rows, top, summary = rank_estimates(bars, anchors,
             ['2026-01-05','2026-01-06','2026-01-07'])
@@ -51,7 +52,8 @@ class UnionEstimateTests(unittest.TestCase):
         anchors = add_supplemental_candidates(anchors)
         anchors['estimated_shares'] = 100
         bars = pd.DataFrame({'date': ['2026-04-27', '2026-04-29'],
-            'code': ['sz.002719'] * 2, 'close': [1, 1], 'volume': [100, 100],
+            'code': ['sz.002719'] * 2, 'open': [1, 1], 'close': [1, 1],
+            'preclose': [1, 1], 'pctChg': [0, 0], 'volume': [100, 100],
             'amount': [100, 100], 'adjustflag': [3, 3], 'tradestatus': [1, 1], 'isST': [0, 1]})
         rows, top, _ = rank_estimates(bars, anchors, ['2026-04-27', '2026-04-29', '2026-04-30'])
         self.assertEqual(top['date'].tolist(), ['2026-04-27'])

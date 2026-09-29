@@ -130,6 +130,7 @@ INDEX_SOURCE_LABELS = {
     "akshare_global": "AkShare 全球指数日线",
     "akshare_futures_main": "AkShare 期货主连日线",
     "eastmoney_kline": "东方财富日线",
+    "taoxi_microcap": "自编指数（BK1158快照＋正式个股日线）",
     "cboe_vix": "CBOE 官方日线",
 }
 _RUNTIME_QUOTE_CACHE: dict[str, dict[str, object]] = {}
@@ -137,7 +138,7 @@ _RUNTIME_QUOTE_CACHE_LOCK = Lock()
 
 
 def _supported_realtime_index_names() -> set[str]:
-    return set(EASTMONEY_QUOTE_SECIDS) | set(YAHOO_QUOTE_SYMBOLS) | set(FUTURES_QUOTE_SYMBOLS)
+    return set(EASTMONEY_QUOTE_SECIDS) | set(YAHOO_QUOTE_SYMBOLS) | set(FUTURES_QUOTE_SYMBOLS) | {"桃囍微盘"}
 
 
 def remember_runtime_realtime_quotes(quotes: dict[str, dict[str, object]]) -> None:
@@ -492,7 +493,9 @@ def index_update_source_labels(index_name: str, *, tickflow_enabled: bool = True
         str(config.get("source") or ""),
         str(config.get("source") or "未知来源"),
     )
-    if uses_tickflow:
+    if index_name == "桃囍微盘":
+        verifier = "逐股正式日线交叉验证（无官方指数点位）"
+    elif uses_tickflow:
         verifier = INDEX_SOURCE_LABELS.get(str(config.get("source") or ""), "独立公开日线")
     elif config.get("yahoo_symbol"):
         verifier = "Yahoo Finance 日线"
@@ -903,6 +906,10 @@ def fetch_realtime_index_quotes(
     for index_name, symbol in FUTURES_QUOTE_SYMBOLS.items():
         if index_name in forced or (not force_only and _futures_market_is_open(symbol, now=now)):
             tasks.append((index_name, _fetch_futures_quote, (index_name, symbol)))
+    if "桃囍微盘" in forced or (not force_only and _market_is_open("A股", now=now)):
+        from services.taoxi_microcap_index import fetch_taoxi_intraday_quote
+
+        tasks.append(("桃囍微盘", fetch_taoxi_intraday_quote, (now,)))
 
     if not tasks:
         return {}

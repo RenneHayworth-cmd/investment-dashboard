@@ -32,6 +32,12 @@ def fetch_index_from_source(index_name: str, index_config: dict, days: int = 30)
     source = index_config.get("source")
     code = index_config.get("code")
 
+    if source == "taoxi_microcap":
+        from services.taoxi_microcap_index import rebuild_taoxi_index
+
+        history, _, _, _ = rebuild_taoxi_index()
+        return build_export_df(history[["trade_date", "close"]], index_name, days=days)
+
     if source == "akshare_cn":
         return get_index_data_from_akshare_cn(
             code,

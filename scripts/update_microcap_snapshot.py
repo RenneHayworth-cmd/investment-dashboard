@@ -14,7 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.cache import save_dataset
 from core.db import finish_job, init_db, start_job
-from services.microcap import fetch_microcap_stocks, save_microcap_constituent_snapshot
+from services.microcap import (
+    fetch_microcap_stocks,
+    load_microcap_constituent_snapshots,
+    save_microcap_constituent_snapshot,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pool-count", type=int, default=400, help="保存成分快照数量，默认 400。")
     parser.add_argument("--retries", type=int, default=3, help="东方财富请求重试次数，默认 3。")
     parser.add_argument("--require-today", action="store_true", help="仅当行情日期为今天时保存快照。")
+    parser.add_argument("--only-if-missing", action="store_true", help="本地已有今天400只快照时不联网。")
     return parser.parse_args()
 
 
@@ -34,8 +39,16 @@ def main() -> int:
 
     try:
         job_id = start_job("微盘股真实成分快照")
-        stocks_df = fetch_microcap_stocks(page_size=args.page_size, retries=args.retries)
         today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+        if args.only_if_missing:
+            cached, _ = load_microcap_constituent_snapshots()
+            today_rows = cached[cached["快照日期"].eq(today)] if not cached.empty else cached
+            if len(today_rows) == args.pool_count and today_rows["代码"].nunique() == args.pool_count:
+                message = f"开始时间：{started_at}；本地已有{today}完整400只快照，无需联网。"
+                finish_job(job_id, "success", message)
+                print(f"微盘股真实成分快照跳过。{message}")
+                return 0
+        stocks_df = fetch_microcap_stocks(page_size=args.page_size, retries=args.retries)
         if args.require_today and "日期" in stocks_df.columns:
             market_dates = pd.to_datetime(stocks_df["日期"], errors="coerce").dropna()
             latest_market_date = market_dates.max().strftime("%Y-%m-%d") if not market_dates.empty else ""

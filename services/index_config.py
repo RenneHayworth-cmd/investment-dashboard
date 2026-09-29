@@ -62,6 +62,16 @@ INDEX_CONFIG = {
         "akshare_board_symbol": "BK1158",
         "require_current_quote": True,
     },
+    "桃囍微盘": {
+        "source": "taoxi_microcap",
+        "code": "TXWP20",
+        "display_symbol": "TXWP20",
+        "market_group": "A股",
+        "raw_cache_symbol": "taoxi_microcap_v1",
+        "ma20_start_date": "2026-06-23",
+        "require_current_quote": True,
+        "custom_index": True,
+    },
     "科创50": {
         "source": "akshare_cn",
         "code": "000688",

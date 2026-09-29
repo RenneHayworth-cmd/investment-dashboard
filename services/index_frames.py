@@ -145,18 +145,24 @@ def build_export_df(
     if result.empty:
         return None
 
-    result["MA20"] = result["close"].rolling(window=20).mean()
-    result["偏离率"] = (result["close"] - result["MA20"]) / result["MA20"] * 100
+    ma_start = pd.to_datetime(INDEX_CONFIG.get(index_name, {}).get("ma20_start_date"), errors="coerce")
+    signal_rows = result.copy() if pd.isna(ma_start) else result[result["trade_date"] >= ma_start].copy()
+    signal_rows["MA20"] = signal_rows["close"].rolling(window=20).mean()
+    signal_rows["偏离率"] = (signal_rows["close"] - signal_rows["MA20"]) / signal_rows["MA20"] * 100
     transition_history = calculate_ma20_transition_history(
-        result,
+        signal_rows,
         "close",
         "MA20",
         date_col="trade_date",
     )
-    result["状态转变时间"] = transition_history["状态转变时间"]
-    result["区间涨幅"] = transition_history["区间涨幅"]
-    result["上一状态转换时间"] = transition_history["上一状态转换时间"]
-    result["上一区间涨幅"] = transition_history["上一区间涨幅"]
+    for column in ("MA20", "偏离率", "状态转变时间", "区间涨幅", "上一状态转换时间", "上一区间涨幅"):
+        result[column] = pd.NA
+    result.loc[signal_rows.index, "MA20"] = signal_rows["MA20"]
+    result.loc[signal_rows.index, "偏离率"] = signal_rows["偏离率"]
+    result.loc[signal_rows.index, "状态转变时间"] = transition_history["状态转变时间"]
+    result.loc[signal_rows.index, "区间涨幅"] = transition_history["区间涨幅"]
+    result.loc[signal_rows.index, "上一状态转换时间"] = transition_history["上一状态转换时间"]
+    result.loc[signal_rows.index, "上一区间涨幅"] = transition_history["上一区间涨幅"]
 
     start_date = pd.Timestamp(datetime.now()).normalize() - pd.Timedelta(days=days)
     recent_data = result[result["trade_date"] >= start_date].copy()
@@ -177,8 +183,8 @@ def build_export_df(
     ].copy()
     export_df["trade_date"] = export_df["trade_date"].dt.strftime("%Y-%m-%d")
     export_df["close"] = export_df["close"].round(2)
-    export_df["MA20"] = export_df["MA20"].round(2)
-    export_df["偏离率"] = export_df["偏离率"].round(2)
+    export_df["MA20"] = pd.to_numeric(export_df["MA20"], errors="coerce").round(2)
+    export_df["偏离率"] = pd.to_numeric(export_df["偏离率"], errors="coerce").round(2)
     export_df["区间涨幅"] = pd.to_numeric(export_df["区间涨幅"], errors="coerce").round(2)
     export_df["上一区间涨幅"] = pd.to_numeric(
         export_df["上一区间涨幅"], errors="coerce"
@@ -284,6 +290,8 @@ def merge_raw_index_data(old_df: pd.DataFrame | None, new_df: pd.DataFrame) -> p
     return merged.sort_values("trade_date").drop_duplicates("trade_date", keep="last").reset_index(drop=True)
 
 def raw_cache_symbol(index_name: str, index_config) -> str:
+    if isinstance(index_config, dict) and index_config.get("raw_cache_symbol"):
+        return str(index_config["raw_cache_symbol"])
     if isinstance(index_config, dict) and index_config.get("tickflow_symbol"):
         return f"index_raw_{index_config['tickflow_symbol']}"
     return f"index_raw_{index_name}"

@@ -61,7 +61,7 @@ if ($DryRun) {
 }
 
 try {
-    $arguments = "-d Ubuntu -- /home/renne/investment_dashboard/.venv/bin/python /home/renne/investment_dashboard/scripts/update_microcap_snapshot.py --require-today"
+    $arguments = "-d Ubuntu -- /home/renne/investment_dashboard/.venv/bin/python /home/renne/investment_dashboard/scripts/update_microcap_snapshot.py --require-today --only-if-missing"
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $wsl
     $processInfo.Arguments = $arguments

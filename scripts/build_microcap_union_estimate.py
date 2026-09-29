@@ -17,8 +17,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-DATASET = "microcap_fixed_union_estimate"
-FIELDS = "date,code,open,close,volume,amount,adjustflag,tradestatus,isST"
+DATASET = "microcap_fixed_union_estimate_v3"
+FIELDS = "date,code,open,close,preclose,pctChg,volume,amount,adjustflag,tradestatus,isST"
 
 
 SUPPLEMENTAL_ST = {
@@ -40,7 +40,7 @@ def add_supplemental_candidates(anchors):
 
 def candidates(snapshots):
     frame = snapshots.copy()
-    frame = frame[frame['快照日期'].between('2026-06-22', '2026-09-08')]
+    frame = frame[frame['快照日期'].ge('2026-06-22')]
     frame['代码'] = frame['代码'].astype(str).str.zfill(6)
     for col in ['最新价', '总市值(亿元)']:
         frame[col] = pd.to_numeric(frame[col], errors='coerce')
@@ -56,14 +56,18 @@ def candidates(snapshots):
 def rank_estimates(bars, anchors, sessions):
     frame = bars.copy()
     frame['代码'] = frame['code'].str.split('.').str[-1]
-    for col in ['close', 'volume', 'amount', 'tradestatus', 'isST', 'adjustflag']:
+    for col in ['open', 'close', 'preclose', 'pctChg', 'volume', 'amount', 'tradestatus', 'isST', 'adjustflag']:
         frame[col] = pd.to_numeric(frame[col], errors='coerce')
     if frame.duplicated(['date', '代码']).any():
         raise ValueError('重复证券日期')
     frame = frame.merge(anchors, on='代码', how='left', validate='many_to_one')
     frame['estimated_market_cap_yuan'] = frame['close'] * frame['estimated_shares']
     frame['raw_market_cap_rank'] = pd.Series(pd.NA, index=frame.index, dtype='Int64')
-    price_ok = frame['close'].gt(0) & frame['adjustflag'].eq(3) & frame['estimated_shares'].gt(0)
+    price_ok = (
+        frame['open'].gt(0) & frame['close'].gt(0) & frame['preclose'].gt(0)
+        & frame['pctChg'].notna() & frame['adjustflag'].eq(3)
+        & frame['estimated_shares'].gt(0)
+    )
     ordered = frame[price_ok].sort_values(['date', 'estimated_market_cap_yuan', '代码'])
     frame.loc[ordered.index, 'raw_market_cap_rank'] = ordered.groupby('date').cumcount().add(1).values
     frame['exclusion_reason'] = ''
@@ -113,7 +117,7 @@ def main():
     anchors = add_supplemental_candidates(candidates(pd.read_csv(source, dtype={'代码': str})))
     request = {'dataset': DATASET, 'start': args.start, 'end': args.end,
                'snapshot_sha256': digest, 'fields': FIELDS, 'adjustflag': '3',
-               'supplemental_st': SUPPLEMENTAL_ST, 'schema_version': 2}
+               'supplemental_st': SUPPLEMENTAL_ST, 'schema_version': 3}
     out = args.output.resolve()
     if not out.is_relative_to(ROOT/'output'):
         raise ValueError('研究产物必须位于output独立目录')
@@ -163,7 +167,8 @@ def main():
             anchors.loc[idx, 'estimated_shares'] = shares
             anchors.loc[idx, 'share_anchor_date'] = share_row['statDate']
             anchors.loc[idx, 'share_publication_date'] = share_row['pubDate']
-        calendar = bs.query_trade_dates(start_date=args.start, end_date='2026-09-15')
+        calendar_end = (pd.Timestamp(args.end) + pd.Timedelta(days=14)).strftime('%Y-%m-%d')
+        calendar = bs.query_trade_dates(start_date=args.start, end_date=calendar_end)
         if calendar.error_code != '0':
             raise RuntimeError(calendar.error_msg)
         cal = calendar.get_data()
@@ -218,18 +223,32 @@ def main():
     build_estimate_metrics(all_rows).to_csv(out/'chart_metrics.csv', index=False, encoding='utf-8-sig')
     all_rows[all_rows['strategy_rank'].le(200).fillna(False)].sort_values(['date', 'strategy_rank']).to_csv(
         out/'daily_top200.csv', index=False, encoding='utf-8-sig')
+    historical_summary = summary[pd.to_datetime(summary['日期']).le('2026-06-19')]
+    complete = (
+        not failures
+        and not historical_summary.empty
+        and historical_summary['Top20数量'].eq(20).all()
+        and not anchors['estimated_shares'].isna().any()
+        and {'preclose', 'pctChg'}.issubset(bars.columns)
+    )
     report = {**request, 'retrieved_at': datetime.now(timezone.utc).isoformat(),
         'candidate_count': len(anchors), 'bar_rows': len(bars), 'days': len(summary),
+        'historical_gate_end': '2026-06-19',
+        'historical_days': len(historical_summary),
+        'historical_days_with_20': int(historical_summary['Top20数量'].eq(20).sum()),
         'days_with_20': int(summary['Top20数量'].eq(20).sum()), 'failures': failures,
         'missing_share_anchors': anchors.loc[anchors['estimated_shares'].isna(), '代码'].tolist(),
         'share_method': '快照并集使用快照隐含固定股本；补充ST股票使用2025三季报固定股本估算',
         'biases': ['后期成员并集存在前视与幸存者偏差', '固定股本忽略送转、增发、回购等变化',
                    '历史ST及停牌使用BaoStock逐日标记，未逐一公告验收',
                    '缺失日线不视为已证实停牌，不补价格', '历史信息公开时刻未知'],
+        'publication_gate': '通过' if complete else '未通过',
         'strict_gate_1a': 'Unknown', 'strict_gate_1b': 'Unknown',
         'observed_unchanged': hashlib.sha256(source.read_bytes()).hexdigest()==digest}
     (out/'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    if not complete:
+        raise RuntimeError('v3产物未通过完整性门禁，不得用于桃囍微盘正式序列')
 
 
 if __name__ == '__main__':

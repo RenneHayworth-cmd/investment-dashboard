@@ -33,6 +33,7 @@ from services.index_realtime import (
     save_futures_main_contract_names,
 )
 from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, latest_completed_trade_date
+from services.taoxi_microcap_index import load_taoxi_constituents, load_taoxi_history, load_taoxi_quality
 from services.update_tasks import (
     enrich_index_report_indicators,
     run_index_ma20_update,
@@ -304,6 +305,10 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     title_col.markdown(f"### {display_index_name(index_name)}")
     action_col.button("返回全部", key="clear_index_detail", on_click=clear_index_detail)
 
+    if index_name == "桃囍微盘":
+        render_taoxi_detail()
+        return
+
     with st.spinner(f"正在读取 {index_name} 的本地长历史数据…"):
         try:
             detail_df = load_index_detail(index_name, INDEX_CONFIG[index_name])
@@ -418,10 +423,178 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
 
     with table_tab:
         display_df = view_df[
-            ["日期", "收盘价", "MA5", "MA20", "MA60", "MA120", "MA250", "偏离率(%)", "日涨跌幅(%)", "RSI(14)", "回撤(%)"]
+            ["日期", "收盘价", "日涨跌幅(%)", "MA5", "MA20", "MA60", "MA120", "MA250", "偏离率(%)", "RSI(14)", "回撤(%)"]
         ].copy()
         display_df["日期"] = display_df["日期"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display_df, width="stretch", hide_index=True)
+        numeric_columns = ["收盘价", "日涨跌幅(%)", "MA5", "MA20", "MA60", "MA120", "MA250", "偏离率(%)", "RSI(14)", "回撤(%)"]
+        display_df[numeric_columns] = display_df[numeric_columns].round(2)
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True,
+            column_config={column: st.column_config.NumberColumn(format="%.2f") for column in numeric_columns},
+        )
+
+
+def render_taoxi_detail() -> None:
+    history, history_meta = load_taoxi_history()
+    constituents, _ = load_taoxi_constituents()
+    quality, _ = load_taoxi_quality()
+    if history is None or history.empty:
+        st.info("桃囍微盘正式缓存尚未建立；v3历史估算通过门禁后才能发布。")
+        return
+    source_data = history.copy()
+    source_data["trade_date"] = pd.to_datetime(source_data["trade_date"], errors="coerce")
+    for column in ("open", "close"):
+        source_data[column] = pd.to_numeric(source_data[column], errors="coerce")
+    source_data = source_data.dropna(subset=["trade_date", "open", "close"]).sort_values("trade_date")
+    raw_detail = source_data[["trade_date", "close"]].rename(
+        columns={"trade_date": "日期", "close": "桃囍微盘_收盘价"}
+    )
+    detail = build_detail_dataframe(raw_detail, "桃囍微盘")
+    custom_columns = source_data[["trade_date", "open", "source_stage", "quality_status", "input_hash"]].rename(
+        columns={"trade_date": "日期", "open": "开盘点位", "source_stage": "阶段", "quality_status": "质量状态", "input_hash": "输入哈希"}
+    )
+    detail = detail.merge(custom_columns, on="日期", how="left", validate="one_to_one")
+    for period in (5, 10, 15, 20, 30, 60, 120, 250):
+        detail[f"MA{period}"] = detail["收盘价"].rolling(window=period).mean()
+    signal_mask = detail["日期"].ge(pd.Timestamp("2026-06-23"))
+    detail["MA20"] = pd.NA
+    detail.loc[signal_mask, "MA20"] = detail.loc[signal_mask, "收盘价"].rolling(window=20).mean()
+    detail["MA20"] = pd.to_numeric(detail["MA20"], errors="coerce")
+    detail["偏离率(%)"] = (detail["收盘价"] - detail["MA20"]) / detail["MA20"] * 100
+
+    latest = detail.iloc[-1]
+    first = detail.iloc[0]
+    max_drawdown = detail["回撤(%)"].min()
+    current_drawdown = latest["回撤(%)"]
+    latest_quality = str(latest.get("质量状态", "-"))
+    if quality is not None and not quality.empty:
+        latest_quality = str(quality.iloc[-1].get("quality_status", latest_quality))
+
+    st.caption(f"数据范围：{first['日期']:%Y-%m-%d} 至 {latest['日期']:%Y-%m-%d}，共 {len(detail)} 条")
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("最新价格", format_number(latest["收盘价"]))
+    metric_cols[1].metric("20日涨幅", format_pct(period_return(detail, 20)))
+    metric_cols[2].metric("60日涨幅", format_pct(period_return(detail, 60)))
+    metric_cols[3].metric("RSI(14)", format_number(latest["RSI(14)"]))
+    metric_cols[4].metric("当前回撤", f"{current_drawdown:.2f}%")
+    metric_cols[5].metric("最大回撤", f"{max_drawdown:.2f}%")
+    st.caption(
+        f"最新正式开盘 {latest['开盘点位']:.2f}；质量状态：{latest_quality}。"
+        "2026-01-01=1000，首个交易日2026-01-05记1000；MA20仅从2026-06-23起计算。"
+        f" 正式缓存更新时间：{format_update_time((history_meta or {}).get('last_update_time'))}"
+    )
+    if latest_quality != "通过":
+        st.warning(f"当前正式序列已停止继续发布：{latest_quality}")
+
+    range_label = st.segmented_control(
+        "走势区间",
+        options=["近一年", "今年来", "近3年", "近5年", "近10年", "成立来"],
+        default="近一年",
+        key="index_detail_range_桃囍微盘",
+    )
+    view_df = filter_detail_range(detail, range_label)
+    if view_df.empty:
+        view_df = detail
+    view_max_drawdown = view_df["回撤(%)"].min()
+    view_max_drawdown_date = view_df.loc[view_df["回撤(%)"].idxmin(), "日期"]
+
+    trend_tab, drawdown_tab, summary_tab, table_tab, members_tab = st.tabs(["走势", "回撤", "摘要", "数据", "成分"])
+    with trend_tab:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=view_df["日期"], y=view_df["收盘价"], mode="lines", name="收盘点位",
+            line={"width": 2},
+        ))
+        ma_colors = {
+            5: "rgb(37,99,235)",
+            10: "rgb(8,145,178)",
+            15: "rgb(13,148,136)",
+            20: "rgb(234,88,12)",
+            30: "rgb(202,138,4)",
+            60: "rgb(22,163,74)",
+            120: "rgb(147,51,234)",
+            250: "rgb(75,85,99)",
+        }
+        for period in (5, 10, 15, 20, 30, 60, 120, 250):
+            fig.add_trace(go.Scatter(
+                x=view_df["日期"], y=view_df[f"MA{period}"], mode="lines", name=f"MA{period}",
+                line={"width": 1.2, "color": ma_colors[period]},
+            ))
+        apply_plotly_layout(fig, height=DEFAULT_CHART_HEIGHT)
+        fig.update_layout(yaxis={"type": "log" if view_df["收盘价"].min() > 0 else "linear", "title": "点位"})
+        st.plotly_chart(fig, width="stretch")
+
+    with drawdown_tab:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=view_df["日期"], y=view_df["回撤(%)"], mode="lines", fill="tozeroy", name="回撤",
+            line={"color": "rgb(22,101,52)", "width": 1.8},
+        ))
+        max_drawdown_date_text = pd.Timestamp(view_max_drawdown_date).strftime("%Y-%m-%d")
+        fig.add_vline(x=max_drawdown_date_text, line_dash="dot", line_color="rgba(190,18,60,.75)")
+        fig.add_annotation(
+            x=max_drawdown_date_text, y=view_max_drawdown,
+            text=f"区间最大回撤 {view_max_drawdown:.2f}%", showarrow=True, arrowhead=2, ax=36, ay=28,
+        )
+        apply_plotly_layout(fig, height=420, showlegend=False)
+        fig.update_layout(yaxis_title="回撤(%)")
+        st.plotly_chart(fig, width="stretch")
+
+    with summary_tab:
+        render_detail_summary("桃囍微盘", detail, view_df, range_label, current_drawdown, max_drawdown)
+        observed = detail[detail["日期"].ge(pd.Timestamp("2026-06-23"))]
+        total_return = (latest["收盘价"] / first["收盘价"] - 1) * 100
+        observed_return = None if observed.empty else (latest["收盘价"] / observed.iloc[0]["收盘价"] - 1) * 100
+        supplement = pd.DataFrame([
+            ("编制以来（含估算）", format_pct(total_return)),
+            ("真实快照阶段以来", format_pct(observed_return)),
+            ("当前质量状态", latest_quality),
+            ("估算补缺说明", "2026-08-20点位使用08-19历史估算名单；其余真实阶段不扩大补缺"),
+        ], columns=["桃囍微盘专项", "数值"])
+        st.dataframe(supplement, width="stretch", hide_index=True)
+
+    with table_tab:
+        display_df = view_df[[
+            "日期", "收盘价", "日涨跌幅(%)", "开盘点位", "MA5", "MA10", "MA15", "MA20", "MA30", "MA60", "MA120", "MA250",
+            "偏离率(%)", "RSI(14)", "回撤(%)", "阶段", "质量状态", "输入哈希",
+        ]].copy()
+        display_df["日期"] = display_df["日期"].dt.strftime("%Y-%m-%d")
+        display_df = display_df.rename(columns={"收盘价": "close", "开盘点位": "open"})
+        numeric_columns = [
+            "close", "日涨跌幅(%)", "open", "MA5", "MA10", "MA15", "MA20", "MA30", "MA60", "MA120", "MA250",
+            "偏离率(%)", "RSI(14)", "回撤(%)",
+        ]
+        display_df[numeric_columns] = display_df[numeric_columns].round(2)
+        st.dataframe(
+            display_df.sort_values("日期", ascending=False),
+            width="stretch",
+            hide_index=True,
+            column_config={column: st.column_config.NumberColumn(format="%.2f") for column in numeric_columns},
+        )
+
+    with members_tab:
+        if constituents is None or constituents.empty:
+            st.warning("成分缓存缺失。")
+        else:
+            members = constituents.copy()
+            members["effective_date"] = pd.to_datetime(members["effective_date"], errors="coerce")
+            completed_date = latest["日期"]
+            effective_dates = members.loc[members["effective_date"].le(completed_date), "effective_date"]
+            current_date = effective_dates.max() if not effective_dates.empty else pd.NaT
+            pending_dates = members.loc[members["effective_date"].gt(completed_date), "effective_date"]
+            pending_date = pending_dates.min() if not pending_dates.empty else pd.NaT
+            columns = ["rank", "代码", "名称", "weight", "selection_date", "effective_date", "selection_source", "停牌状态", "停牌依据"]
+            current_tab, pending_tab = st.tabs(["当前生效20只", "下一日待生效20只"])
+            with current_tab:
+                current = members[members["effective_date"].eq(current_date)][columns].copy()
+                st.caption("无" if pd.isna(current_date) else f"生效日期：{current_date:%Y-%m-%d}")
+                st.dataframe(current, width="stretch", hide_index=True)
+            with pending_tab:
+                pending = members[members["effective_date"].eq(pending_date)][columns].copy()
+                st.caption("尚无下一日待生效名单" if pd.isna(pending_date) else f"待生效日期：{pending_date:%Y-%m-%d}")
+                st.dataframe(pending, width="stretch", hide_index=True)
 
 
 def centered_table(df: pd.DataFrame) -> None:
