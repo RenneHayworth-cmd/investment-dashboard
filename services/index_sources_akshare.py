@@ -211,15 +211,12 @@ def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: 
                 continue
             df = normalize_akshare_index_df(raw_df)
             if index_code.upper() == "H30269":
+                # CSIndex publishes the day's official close in the evening, after the
+                # 15:10/16:10 runs; EastMoney supplies that close earlier (quote, else the
+                # 15:00 minute point). If neither has it yet, still return the official
+                # rows so completed dates are kept; the caller reports today's gap and
+                # retries. Discarding the whole batch here once lost 09-28 entirely.
                 df = append_eastmoney_quote_row(df, "2.H30269")
-                shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-                latest_date = pd.to_datetime(df["trade_date"]).max().date()
-                if (
-                    shanghai_now.weekday() < 5
-                    and shanghai_now.time() >= time(11, 30)
-                    and latest_date < shanghai_now.date()
-                ):
-                    raise RuntimeError("东方财富实时报价未返回今日数据，保留缓存等待重试")
             return build_export_df(df, index_name, days=days)
         except Exception as exc:
             last_error = exc

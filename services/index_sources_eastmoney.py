@@ -24,6 +24,57 @@ from services.index_sources_sina import (
 )
 from services.index_sources_mx import get_mx_index_history
 
+EASTMONEY_TREND_HOSTS = (
+    "push2his.eastmoney.com",
+    "91.push2his.eastmoney.com",
+    "45.push2his.eastmoney.com",
+    "7.push2his.eastmoney.com",
+)
+A_SHARE_CLOSE_MINUTE = "15:00"
+
+
+def fetch_eastmoney_trend_close(secid: str) -> tuple[pd.Timestamp, float] | None:
+    """Completed A-share session close from EastMoney's minute series (trends2).
+
+    EastMoney quote and daily-kline hosts often refuse requests (502/503 or a
+    dropped connection) while trends2 still answers. Its last point is the
+    session close only once it is stamped 15:00; anything earlier is intraday
+    and must never become a formal daily row, so it returns None instead.
+    """
+    import requests
+
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3",
+        "fields2": "f51,f53",
+        "ndays": "1",
+        "iscr": "0",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    for host in EASTMONEY_TREND_HOSTS:
+        for scheme in ("https", "http"):
+            try:
+                response = requests.get(
+                    f"{scheme}://{host}/api/qt/stock/trends2/get",
+                    params=params, headers=headers, timeout=(4, 6),
+                )
+                response.raise_for_status()
+                trends = (response.json().get("data") or {}).get("trends") or []
+            except Exception:
+                continue
+            if not trends:
+                continue
+            stamp, _, rest = str(trends[-1]).partition(",")
+            day, _, minute = stamp.partition(" ")
+            price = pd.to_numeric(rest.split(",")[0], errors="coerce")
+            if minute != A_SHARE_CLOSE_MINUTE or pd.isna(price) or float(price) <= 0:
+                return None
+            trade_date = pd.to_datetime(day, errors="coerce")
+            return None if pd.isna(trade_date) else (pd.Timestamp(trade_date), float(price))
+    return None
+
+
 def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -72,17 +123,23 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: b
                     continue
             if quote:
                 break
-        if not quote:
-            return normalized
-        latest_price = pd.to_numeric(quote.get("f43"), errors="coerce")
-        quote_timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
-        if pd.isna(latest_price) or pd.isna(quote_timestamp):
-            return normalized
-        quote_timestamp_value = float(quote_timestamp)
-        if quote_timestamp_value > 10_000_000_000:
-            quote_timestamp_value = quote_timestamp_value / 1000
-        quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
         market_name = "港股" if str(secid).startswith(("124.", "125.", "305.")) else "A股"
+        if not quote:
+            if market_name != "A股":
+                return normalized
+            trend_close = fetch_eastmoney_trend_close(secid)
+            if trend_close is None:
+                return normalized
+            quote_date, latest_price = trend_close[0].date(), trend_close[1]
+        else:
+            latest_price = pd.to_numeric(quote.get("f43"), errors="coerce")
+            quote_timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
+            if pd.isna(latest_price) or pd.isna(quote_timestamp):
+                return normalized
+            quote_timestamp_value = float(quote_timestamp)
+            if quote_timestamp_value > 10_000_000_000:
+                quote_timestamp_value = quote_timestamp_value / 1000
+            quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
         quote_frame = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
         filtered_quote = filter_market_trading_dates(quote_frame, market_name)
         if filtered_quote is None or filtered_quote.empty:
@@ -338,7 +395,7 @@ def get_index_data_from_eastmoney_kline(
         if payload is not None and payload.get("data"):
             break
     if payload is None:
-        return get_index_data_from_akshare_eastmoney_fallback(
+        return _fallback_or_board_close(
             secid,
             index_name,
             days=days,
@@ -365,7 +422,7 @@ def get_index_data_from_eastmoney_kline(
             }
         )
     if not rows:
-        return get_index_data_from_akshare_eastmoney_fallback(
+        return _fallback_or_board_close(
             secid,
             index_name,
             days=days,
@@ -451,6 +508,25 @@ def _supplement_hk_independent_rows(
         except Exception:
             pass
     return normalized
+
+def _fallback_or_board_close(secid: str, index_name: str, **kwargs) -> pd.DataFrame | None:
+    """Daily-kline failure path: AkShare first, then, for mainland EastMoney boards
+    (``90.BK...``), the completed session close from trends2 as a single row.
+
+    The caller appends only unseen dates to the accumulated cache, so one row is
+    enough to close the latest gap; earlier gaps still show as missing.
+    """
+    try:
+        return get_index_data_from_akshare_eastmoney_fallback(secid, index_name, **kwargs)
+    except Exception:
+        if not str(secid).startswith("90."):
+            raise
+        trend_close = fetch_eastmoney_trend_close(secid)
+        if trend_close is None:
+            raise
+        row = pd.DataFrame([{"trade_date": trend_close[0], "close": trend_close[1]}])
+        return build_export_df(normalize_akshare_index_df(row), index_name, days=kwargs.get("days", 30))
+
 
 def get_index_data_from_akshare_eastmoney_fallback(
     secid: str,
