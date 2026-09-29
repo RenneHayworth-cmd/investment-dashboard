@@ -15,9 +15,11 @@ from services.microcap_live_trading import (
 FIELD_LABELS = {
     "trade_date": "成交日期（必填）", "symbol": "股票代码（必填）", "name": "股票名称",
     "side": "买卖方向（必填）", "price": "成交价格（必填）", "quantity": "成交数量（必填）",
-    "trade_time": "成交时间", "commission_amount": "佣金", "stamp_tax_amount": "印花税",
-    "total_fee": "总费用", "strategy": "策略/标签", "notes": "备注",
+    "trade_time": "成交时间", "gross_amount": "成交金额（校正均价）", "commission_amount": "佣金",
+    "stamp_tax_amount": "印花税", "other_fee_amount": "其他费用（过户费等，可多选）", "total_fee": "总费用",
+    "net_amount": "发生金额（逐笔对账）", "strategy": "策略/标签", "notes": "备注",
 }
+MULTI_COLUMN_FIELDS = {"other_fee_amount"}
 ALIASES = {
     "trade_date": ("成交日期", "日期", "发生日期", "交收日期", "成交时间"),
     "symbol": ("证券代码", "股票代码", "代码", "证券编号"),
@@ -26,8 +28,11 @@ ALIASES = {
     "price": ("成交价格", "成交均价", "价格", "成交价"),
     "quantity": ("成交数量", "成交股数", "数量", "发生数量"),
     "trade_time": ("成交时间", "时间"),
+    "gross_amount": ("成交金额",),
     "commission_amount": ("佣金", "交易佣金", "手续费"),
     "stamp_tax_amount": ("印花税", "印花税额"),
+    "other_fee_amount": ("过户费", "其他杂费", "清算费", "经手费", "证管费", "规费", "结算费"),
+    "net_amount": ("发生金额", "清算金额", "资金发生数"),
     "total_fee": ("总费用", "费用合计", "交易费用", "手续费合计"),
     "strategy": ("策略", "标签"),
     "notes": ("备注", "说明"),
@@ -42,6 +47,10 @@ def _default_column(field, headers):
                     continue
                 return header
     return "（不导入）"
+
+
+def _default_columns(field, headers):
+    return [header for header in headers if any(alias in header for alias in ALIASES.get(field, ()))]
 
 
 def render_microcap_import() -> None:
@@ -66,6 +75,14 @@ def render_microcap_import() -> None:
                 columns = st.columns(3)
                 mapping = {}
                 for index, field in enumerate(fields):
+                    if field in MULTI_COLUMN_FIELDS:
+                        chosen = columns[index % 3].multiselect(
+                            FIELD_LABELS[field], headers, default=_default_columns(field, headers),
+                            key=f"{form_key}_{field}",
+                        )
+                        if chosen:
+                            mapping[field] = chosen
+                        continue
                     choice = columns[index % 3].selectbox(
                         FIELD_LABELS[field], ["（不导入）"] + headers,
                         index=(headers.index(_default_column(field, headers)) + 1) if _default_column(field, headers) in headers else 0,
@@ -93,10 +110,10 @@ def render_microcap_import() -> None:
                         )
                     table = pd.DataFrame(preview["rows"])
                     table["gross_amount"] = (table["price"] * table["quantity"]).round(2)
-                    table["total_fee"] = table["commission_amount"] + table["stamp_tax_amount"]
+                    table["total_fee"] = (table["commission_amount"] + table["stamp_tax_amount"] + table["other_fee_amount"]).round(2)
                     st.dataframe(
-                        table.rename(columns={"source_row": "源行号", "trade_date": "成交日期", "trade_time": "成交时间", "symbol": "代码", "name": "名称", "side": "方向", "price": "价格", "quantity": "数量", "gross_amount": "成交金额", "commission_amount": "佣金", "stamp_tax_amount": "印花税", "total_fee": "总费用", "strategy": "策略/标签", "notes": "备注"}),
-                        hide_index=True, width="stretch",
+                        table.rename(columns={"source_row": "源行号", "trade_date": "成交日期", "trade_time": "成交时间", "symbol": "代码", "name": "名称", "side": "方向", "price": "价格", "quantity": "数量", "gross_amount": "成交金额", "commission_amount": "佣金", "stamp_tax_amount": "印花税", "other_fee_amount": "其他费用", "total_fee": "总费用", "strategy": "策略/标签", "notes": "备注"}),
+                        hide_index=True, width="stretch", column_config={"价格": st.column_config.NumberColumn(format="%.3f")},
                     )
                     if st.button("确认导入整批成交", type="primary", key=f"microcap_live_import_commit_{file_hash[:10]}"):
                         try:

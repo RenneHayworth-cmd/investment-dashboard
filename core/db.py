@@ -121,6 +121,7 @@ def init_db() -> None:
                 quantity INTEGER NOT NULL CHECK (quantity > 0),
                 commission_amount REAL NOT NULL DEFAULT 5.0 CHECK (commission_amount >= 0),
                 stamp_tax_amount REAL NOT NULL DEFAULT 0.0 CHECK (stamp_tax_amount >= 0),
+                other_fee_amount REAL NOT NULL DEFAULT 0.0 CHECK (other_fee_amount >= 0),
                 strategy TEXT,
                 notes TEXT,
                 source TEXT NOT NULL DEFAULT '手工',
@@ -136,6 +137,15 @@ def init_db() -> None:
             ON microcap_live_trades(trade_date, trade_time, id)
             """
         )
+        microcap_trade_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(microcap_live_trades)")
+        }
+        if "other_fee_amount" not in microcap_trade_columns:
+            # Transfer, clearing and other exchange fees listed apart from commission.
+            conn.execute(
+                "ALTER TABLE microcap_live_trades ADD COLUMN other_fee_amount "
+                "REAL NOT NULL DEFAULT 0.0 CHECK (other_fee_amount >= 0)"
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS microcap_live_cash_flows (

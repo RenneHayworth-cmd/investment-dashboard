@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -101,7 +102,12 @@ class MicrocapLivePageTests(unittest.TestCase):
         self.assertEqual(list(app.exception), [])
         captions = [c.value for c in app.caption]
         self.assertIn("横坐标仅排列完整正式估值交易日，周末和节假日已自动跳过。", captions)
-        self.assertGreaterEqual(len(app.get("plotly_chart")), 1)
+        charts = app.get("plotly_chart")
+        self.assertGreaterEqual(len(charts), 1)
+        spec = json.loads(charts[0].proto.spec)
+        bars = [t for t in spec["data"] if t.get("type") == "bar"][0]
+        # 3 dates should produce an adaptive bar width of 0.09 instead of default wide category block
+        self.assertEqual(bars.get("width"), 0.09)
         # Check segmented control exists for time period
         self.assertTrue(any("全部" in ctrl.options for ctrl in app.segmented_control))
         temp_dir.cleanup()

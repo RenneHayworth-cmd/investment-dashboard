@@ -142,6 +142,58 @@ class MicrocapLiveTradingTests(unittest.TestCase):
         self.assertEqual(len(list_microcap_trades()), 2)
         self.assertEqual(len(list_microcap_import_batches()), 1)
 
+    def test_import_books_transfer_fees_and_exact_amount_against_net_cash(self):
+        self._fund(30000, "2026-09-22")
+        # Shape of a real 交割单: 手续费 equals 佣金, 过户费 listed separately, rounded 成交均价.
+        raw = (
+            "证券代码\t证券名称\t操作\t成交数量\t成交均价\t成交金额\t发生金额\t手续费\t印花税\t其他杂费\t交收日期\t佣金\t过户费\t清算费(B股)\n"
+            "688701\t卓锦股份\t证券买入\t1200\t8.69\t10428\t-10433.11\t5\t0\t0\t20260923\t5\t0.11\t0\n"
+            "300621\t维业股份\t证券买入\t1400\t7.086\t9920\t-9925\t5\t0\t0\t20260923\t5\t0\t0\n"
+        ).encode("gbk")
+        mapping = {
+            "trade_date": "交收日期", "symbol": "证券代码", "name": "证券名称", "side": "操作",
+            "price": "成交均价", "quantity": "成交数量", "gross_amount": "成交金额",
+            "commission_amount": "佣金", "stamp_tax_amount": "印花税",
+            "other_fee_amount": ["其他杂费", "过户费", "清算费(B股)"], "net_amount": "发生金额",
+        }
+        preview = preview_microcap_trade_import(raw, "statement.xls", mapping)
+        self.assertTrue(preview["ok"], preview["errors"])
+        self.assertEqual([row["other_fee_amount"] for row in preview["rows"]], [0.11, 0.0])
+        commit_microcap_trade_import(preview)
+        snapshot = build_microcap_account_snapshot(price_histories={})
+        self.assertAlmostEqual(snapshot["summary"]["cash"], 30000 - 10433.11 - 9925, places=2)
+        self.assertAlmostEqual(snapshot["summary"]["fee_amount"], 10.11, places=2)
+        position = build_microcap_positions().set_index("symbol")
+        self.assertAlmostEqual(position.loc["300621", "cost_basis"], 9925, places=2)
+
+        unmapped = {key: value for key, value in mapping.items() if key != "other_fee_amount"}
+        rejected = preview_microcap_trade_import(raw + b" ", "statement2.xls", unmapped)
+        self.assertFalse(rejected["ok"])
+        self.assertIn("可能有费用列未映射", rejected["errors"][0])
+
+    def test_init_db_adds_other_fee_column_to_existing_ledger(self):
+        legacy = Path(self.temp_dir.name) / "legacy.db"
+        with sqlite3.connect(legacy) as conn:
+            conn.execute(
+                "CREATE TABLE microcap_live_trades (id INTEGER PRIMARY KEY, record_key TEXT, trade_date TEXT, "
+                "trade_time TEXT, symbol TEXT, name TEXT, side TEXT, price REAL, quantity INTEGER, "
+                "commission_amount REAL, stamp_tax_amount REAL, strategy TEXT, notes TEXT, source TEXT, "
+                "import_batch_id INTEGER, source_row INTEGER, created_at TEXT)"
+            )
+            conn.execute("INSERT INTO microcap_live_trades (id, commission_amount, stamp_tax_amount) VALUES (1, 5, 0)")
+        with patch("core.db.DB_PATH", legacy):
+            db.init_db()
+        with sqlite3.connect(legacy) as conn:
+            self.assertEqual(conn.execute("SELECT other_fee_amount FROM microcap_live_trades WHERE id=1").fetchone()[0], 0.0)
+
+    def test_manual_trade_other_fee_is_part_of_cost(self):
+        self._fund(2000)
+        add_microcap_trade(
+            trade_date="2026-09-01", symbol="600000", name="浦发银行", side="买入",
+            price=10, quantity=100, other_fee_amount=0.01,
+        )
+        self.assertAlmostEqual(build_microcap_positions().iloc[0]["cost_basis"], 1005.01, places=2)
+
     def test_invalid_batch_rolls_back_all_rows(self):
         self._fund(1000)
         raw = (
@@ -283,6 +335,28 @@ class MicrocapLiveTradingTests(unittest.TestCase):
         daily = build_microcap_daily_returns(price_histories=prices)
         self.assertEqual(daily.attrs["missing_days"], [{"date": "2026-09-01", "symbols": ["600000"]}])
         self.assertEqual(daily["date"].dt.strftime("%Y-%m-%d").tolist(), ["2026-09-02"])
+
+    def test_unsettled_session_is_not_reported_as_formal_gap(self):
+        self._fund(20000, "2026-09-24")
+        add_microcap_trade(
+            trade_date="2026-09-24", symbol="600000", name="浦发银行", side="买入",
+            price=10, quantity=100,
+        )
+        add_microcap_trade(
+            trade_date="2026-09-28", symbol="600000", name="浦发银行", side="买入",
+            price=10, quantity=100,
+        )
+        prices = {"600000": pd.DataFrame({"date": ["2026-09-24"], "close": [10]})}
+        before = build_microcap_account_snapshot(
+            price_histories=prices,
+            market_now=pd.Timestamp("2026-09-28 15:03:00", tz="Asia/Shanghai").to_pydatetime(),
+        )
+        self.assertFalse(any("历史正式行情缺口" in text for text in before["warnings"]))
+        after = build_microcap_account_snapshot(
+            price_histories=prices,
+            market_now=pd.Timestamp("2026-09-28 15:10:00", tz="Asia/Shanghai").to_pydatetime(),
+        )
+        self.assertTrue(any("2026-09-28缺600000" in text for text in after["warnings"]))
 
     def test_daily_account_baseline_and_intraday_quote_are_not_persisted(self):
         self._fund(1005)

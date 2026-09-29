@@ -14,6 +14,7 @@ from core.ui import (
     DEFAULT_CHART_HEIGHT,
     DOWN_COLOR,
     UP_COLOR,
+    adaptive_bar_width,
     apply_plotly_layout,
     build_sparse_trading_date_ticks,
     filter_by_time_range,
@@ -21,8 +22,8 @@ from core.ui import (
 
 from components.live_record.tables import render_live_positions_table
 from core.return_calendar import render_return_calendar
-from services.market_calendar import get_market_window, is_market_trading_day, latest_settled_trade_date
-from services.microcap_live_market import fetch_microcap_realtime_quotes, load_microcap_histories
+from services.market_calendar import get_market_window, is_market_trading_day
+from services.microcap_live_market import fetch_microcap_realtime_quotes, load_microcap_histories, microcap_target_date
 from services.microcap_live_trading import (
     build_microcap_account_snapshot,
     build_microcap_positions,
@@ -119,7 +120,7 @@ def _first_event_date(trades, flows, adjustments):
 
 
 def _load_market_state(codes, first_date, current, manual_refresh):
-    target = latest_settled_trade_date(get_market_window("A股"), current).isoformat()
+    target = microcap_target_date(current)
     state_key = "microcap_live_history_state"
     old = st.session_state.get(state_key, {})
     scope = tuple(codes)
@@ -248,10 +249,13 @@ def render_microcap_dashboard() -> None:
         detail = trades.loc[trades["symbol"].astype(str).eq(selected)].copy() if not trades.empty else pd.DataFrame()
         if not detail.empty:
             detail["成交金额"] = (pd.to_numeric(detail["price"], errors="coerce") * pd.to_numeric(detail["quantity"], errors="coerce")).round(2)
-            detail["总费用"] = pd.to_numeric(detail["commission_amount"], errors="coerce") + pd.to_numeric(detail["stamp_tax_amount"], errors="coerce")
-            detail = detail.rename(columns={"trade_date": "成交日期", "symbol": "代码", "name": "名称", "side": "方向", "price": "成交价", "quantity": "股数", "commission_amount": "佣金", "stamp_tax_amount": "印花税"})
-            cols = ["成交日期", "代码", "名称", "方向", "成交价", "股数", "成交金额", "佣金", "印花税", "总费用"]
-            st.dataframe(detail[cols], hide_index=True, width="stretch")
+            detail["总费用"] = (
+                pd.to_numeric(detail["commission_amount"], errors="coerce") + pd.to_numeric(detail["stamp_tax_amount"], errors="coerce")
+                + pd.to_numeric(detail["other_fee_amount"], errors="coerce").fillna(0)
+            ).round(2)
+            detail = detail.rename(columns={"trade_date": "成交日期", "symbol": "代码", "name": "名称", "side": "方向", "price": "成交价", "quantity": "股数", "commission_amount": "佣金", "stamp_tax_amount": "印花税", "other_fee_amount": "其他费用"})
+            cols = ["成交日期", "代码", "名称", "方向", "成交价", "股数", "成交金额", "佣金", "印花税", "其他费用", "总费用"]
+            st.dataframe(detail[cols], hide_index=True, width="stretch", column_config={"成交价": st.column_config.NumberColumn(format="%.3f")})
 
     daily = snapshot["formal_daily"]
     st.markdown("#### 正式收盘盈亏曲线")
@@ -303,6 +307,7 @@ def render_microcap_dashboard() -> None:
                 x=chart_dates,
                 y=chart_view_daily["daily_pnl"],
                 name="每日盈亏",
+                width=adaptive_bar_width(len(chart_dates)),
                 marker={"color": pnl_colors},
                 opacity=0.75,
                 customdata=chart_view_daily[["account_pnl", "total_assets", "daily_return_pct", "nav"]],

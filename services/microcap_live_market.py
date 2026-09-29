@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import math
 
@@ -11,10 +11,22 @@ import requests
 
 from core.cache import load_dataset, save_dataset
 from services.fund_analysis import infer_tickflow_symbol
-from services.market_calendar import get_market_window, latest_settled_trade_date
+from services.market_calendar import get_market_window, latest_settled_trade_date, previous_trading_day
 
 DATA_TYPE = "microcap_live_close_v1"
 TZ = ZoneInfo("Asia/Shanghai")
+# The current session's close is expected from 15:05; until daily bars publish,
+# it comes from a post-close quote snapshot (see load_microcap_histories).
+SETTLEMENT_DELAY = timedelta(minutes=5)
+# Merge priority: official daily bars win over post-close snapshots for the same date.
+HISTORY_SOURCES = ("tickflow", "akshare", "akshare_tx", "tickflow_close_snapshot", "eastmoney_close_snapshot")
+
+
+def microcap_target_date(market_now: datetime) -> str:
+    """Latest A-share session whose formal stock close should already be published."""
+    return latest_settled_trade_date(
+        get_market_window("A股"), market_now, settlement_delay=SETTLEMENT_DELAY,
+    ).isoformat()
 
 
 def _normalize_history(frame: pd.DataFrame | None) -> pd.DataFrame:
@@ -160,53 +172,91 @@ def load_microcap_histories(
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
     """Load unadjusted formal closes; append only unseen completed-session rows."""
     current = market_now or datetime.now(TZ)
-    target_date = latest_settled_trade_date(get_market_window("A股"), current).isoformat()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=TZ)
+    target_date = microcap_target_date(current)
     normalized_codes = sorted({str(code).zfill(6) for code in symbols if str(code).strip()})
     histories: dict[str, pd.DataFrame] = {}
     failures: dict[str, str] = {}
-    for code in normalized_codes:
-        # core.cache keeps legacy filenames keyed by symbol/source/period; namespace
-        # the on-disk symbol so this raw A-share history cannot overwrite ETF data.
+    # core.cache keeps legacy filenames keyed by symbol/source/period; namespace
+    # the on-disk symbol so this raw A-share history cannot overwrite ETF data.
+    frames = {
+        code: {
+            source: _normalize_history(load_dataset(f"microcap_live_{code}", source, DATA_TYPE, period="1d")[0])
+            for source in HISTORY_SOURCES
+        }
+        for code in normalized_codes
+    }
+
+    def merged_of(code: str) -> pd.DataFrame:
+        merged = pd.DataFrame(columns=["date", "close"])
+        for source in HISTORY_SOURCES:
+            merged = _append_only(merged, frames[code][source], target_date)
+        return merged
+
+    def last_date(code: str) -> str:
+        merged = merged_of(code)
+        return "" if merged.empty else str(merged["date"].max())
+
+    def fetch_daily(code: str) -> None:
         cache_symbol = f"microcap_live_{code}"
-        tick_cache, _ = load_dataset(cache_symbol, "tickflow", DATA_TYPE, period="1d")
-        ak_cache, _ = load_dataset(cache_symbol, "akshare", DATA_TYPE, period="1d")
-        tx_cache, _ = load_dataset(cache_symbol, "akshare_tx", DATA_TYPE, period="1d")
-        tick = _normalize_history(tick_cache)
-        ak = _normalize_history(ak_cache)
-        tx = _normalize_history(tx_cache)
-        merged = _append_only(_append_only(tick, ak, target_date), tx, target_date)
-        if allow_fetch and (merged.empty or merged["date"].max() < target_date):
-            requested = (
-                (pd.Timestamp(merged["date"].max()) - pd.Timedelta(days=3)).date().isoformat()
-                if not merged.empty else (start_date or "2000-01-01")
-            )
-            try:
-                fresh_tick = _tickflow_history(code, api_key, 10000)
-                tick = _append_only(tick, fresh_tick, target_date)
-                if not tick.empty:
-                    save_dataset(cache_symbol, code, "tickflow", DATA_TYPE, tick, period="1d")
-            except Exception as exc:
-                failures[code] = f"TickFlow正式日线：{type(exc).__name__}: {exc}"
-            merged = _append_only(_append_only(tick, ak, target_date), tx, target_date)
-            if merged.empty or merged["date"].max() < target_date:
-                try:
-                    fresh_ak = _akshare_history(code, requested, target_date)
-                    source = fresh_ak.attrs.get("source", "akshare")
-                    if source == "akshare_tx":
-                        tx = _append_only(tx, fresh_ak, target_date)
-                        if not tx.empty:
-                            save_dataset(cache_symbol, code, "akshare_tx", DATA_TYPE, tx, period="1d")
-                    else:
-                        ak = _append_only(ak, fresh_ak, target_date)
-                        if not ak.empty:
-                            save_dataset(cache_symbol, code, "akshare", DATA_TYPE, ak, period="1d")
-                    failures.pop(code, None)
-                except Exception as exc:
-                    previous = failures.get(code, "")
-                    failures[code] = (previous + "；" if previous else "") + f"AkShare正式日线：{type(exc).__name__}: {exc}"
-                merged = _append_only(_append_only(tick, ak, target_date), tx, target_date)
-            elif not tick.empty:
+        own = frames[code]
+        merged = merged_of(code)
+        requested = (
+            (pd.Timestamp(merged["date"].max()) - pd.Timedelta(days=3)).date().isoformat()
+            if not merged.empty else (start_date or "2000-01-01")
+        )
+        try:
+            own["tickflow"] = _append_only(own["tickflow"], _tickflow_history(code, api_key, 10000), target_date)
+            if not own["tickflow"].empty:
+                save_dataset(cache_symbol, code, "tickflow", DATA_TYPE, own["tickflow"], period="1d")
+        except Exception as exc:
+            failures[code] = f"TickFlow正式日线：{type(exc).__name__}: {exc}"
+        if last_date(code) >= target_date:
+            if not own["tickflow"].empty:
                 failures.pop(code, None)
+            return
+        try:
+            fresh_ak = _akshare_history(code, requested, target_date)
+            source = "akshare_tx" if fresh_ak.attrs.get("source") == "akshare_tx" else "akshare"
+            own[source] = _append_only(own[source], fresh_ak, target_date)
+            if not own[source].empty:
+                save_dataset(cache_symbol, code, source, DATA_TYPE, own[source], period="1d")
+            failures.pop(code, None)
+        except Exception as exc:
+            previous = failures.get(code, "")
+            failures[code] = (previous + "；" if previous else "") + f"AkShare正式日线：{type(exc).__name__}: {exc}"
+
+    if allow_fetch:
+        market = get_market_window("A股")
+        # Daily-bar vendors publish the current session long after the close, but a
+        # post-close snapshot already carries the final price. Use it only for the
+        # current session and only when the cache is otherwise complete, so the
+        # snapshot can never paper over an older missing date.
+        snapshot_day = target_date if target_date == current.date().isoformat() else None
+        daily_goal = previous_trading_day(market, current.date()).isoformat() if snapshot_day else target_date
+        for code in normalized_codes:
+            if last_date(code) < daily_goal:
+                fetch_daily(code)
+        if snapshot_day:
+            ready = [code for code in normalized_codes if last_date(code) == daily_goal]
+            if ready:
+                close_at = datetime.combine(current.date(), market.sessions[-1][1], tzinfo=TZ)
+                snapshots, snapshot_error = _close_snapshots(ready, api_key, current, close_at)
+                for code, row in snapshots.items():
+                    source = row["cache_source"]
+                    fresh = pd.DataFrame({"date": [snapshot_day], "close": [row["price"]]})
+                    frames[code][source] = _append_only(frames[code][source], fresh, target_date)
+                    save_dataset(f"microcap_live_{code}", code, source, DATA_TYPE, frames[code][source], period="1d")
+                    failures.pop(code, None)
+                for code in ready:
+                    if code not in snapshots:
+                        fetch_daily(code)
+                        if last_date(code) < target_date and snapshot_error:
+                            failures[code] = "；".join(p for p in (failures.get(code), snapshot_error) if p)
+
+    for code in normalized_codes:
+        merged = merged_of(code)
         if not merged.empty:
             histories[code] = merged
             if merged["date"].max() < target_date:
@@ -215,6 +265,33 @@ def load_microcap_histories(
             histories[code] = pd.DataFrame(columns=["date", "close"])
             failures.setdefault(code, "本地无未复权正式收盘缓存")
     return histories, failures
+
+
+def _close_snapshots(
+    codes: list[str], api_key: str, current: datetime, close_at: datetime,
+) -> tuple[dict[str, dict], str]:
+    """Post-close quotes stamped at or after today's close; TickFlow first, then EastMoney."""
+    result: dict[str, dict] = {}
+    errors = []
+    for label, cache_source, fetch in (
+        ("TickFlow收盘快照", "tickflow_close_snapshot", lambda missing: _tickflow_quotes(missing, api_key.strip(), current)),
+        ("东方财富收盘快照", "eastmoney_close_snapshot", lambda missing: _eastmoney_quotes(missing, current)),
+    ):
+        missing = [code for code in codes if code not in result]
+        if not missing:
+            break
+        try:
+            quotes = fetch(missing)
+        except Exception as exc:
+            errors.append(_brief(label, exc))
+            continue
+        for code, quote in quotes.items():
+            quote_time = pd.Timestamp(quote.get("quote_time"))
+            quote_time = quote_time.tz_localize(TZ) if quote_time.tzinfo is None else quote_time.tz_convert(TZ)
+            price = pd.to_numeric(quote.get("price"), errors="coerce")
+            if code in missing and quote_time >= close_at and pd.notna(price) and float(price) > 0:
+                result[code] = {"price": float(price), "cache_source": cache_source}
+    return result, "; ".join(errors)
 
 
 def _is_open(market_now: datetime) -> bool:
@@ -233,22 +310,38 @@ def _code_from_tickflow(value) -> str | None:
     return digits[-6:] if len(digits) >= 6 else None
 
 
+TICKFLOW_QUOTE_BATCH = 5  # TickFlow quotes endpoint rejects more than 5 symbols per request
+
+
 def _tickflow_quotes(codes: list[str], api_key: str, current: datetime) -> dict[str, dict]:
+    """Batch TickFlow quotes 5 at a time; a failed batch only drops its own symbols.
+
+    Raises the last error only when every batch failed, so callers can report it.
+    """
     if not api_key:
         return {}
     from tickflow import TickFlow
     from services.position_analysis import _tickflow_quote_datetime
     client = TickFlow(api_key=api_key, timeout=10, max_retries=0)
+    frames, last_error, batches = [], None, 0
     try:
-        frame = client.quotes.get(
-            symbols=[infer_tickflow_symbol(code) for code in codes], as_dataframe=True,
-        )
+        for start in range(0, len(codes), TICKFLOW_QUOTE_BATCH):
+            batches += 1
+            batch = [infer_tickflow_symbol(code) for code in codes[start:start + TICKFLOW_QUOTE_BATCH]]
+            try:
+                frame = client.quotes.get(symbols=batch, as_dataframe=True)
+            except Exception as exc:  # keep other batches
+                last_error = exc
+                continue
+            if frame is not None and not frame.empty:
+                frames.append(frame if "symbol" in frame.columns else frame.reset_index())
     finally:
         client.close()
-    if frame is None or frame.empty:
+    if not frames:
+        if last_error is not None and batches:
+            raise last_error
         return {}
-    if "symbol" not in frame.columns:
-        frame = frame.reset_index()
+    frame = pd.concat(frames, ignore_index=True)
     result = {}
     for _, row in frame.iterrows():
         code = _code_from_tickflow(row.get("symbol"))
@@ -258,6 +351,67 @@ def _tickflow_quotes(codes: list[str], api_key: str, current: datetime) -> dict[
             result[code] = {"price": float(price), "quote_time": quote_time,
                             "source": "TickFlow实时行情", "status": "实时"}
     return result
+
+
+EASTMONEY_ULIST_URLS = (
+    "https://push2.eastmoney.com/api/qt/ulist.np/get",
+    "https://36.push2.eastmoney.com/api/qt/ulist.np/get",
+    "https://pushguest.eastmoney.com/api/qt/ulist.np/get",
+)
+
+
+def _eastmoney_secid(code: str) -> str:
+    # Shanghai A (6xxxxx) and B (900xxx) use market 1; Shenzhen and Beijing use market 0.
+    return ("1." if code.startswith(("6", "900")) else "0.") + code
+
+
+def _brief(label: str, exc: Exception) -> str:
+    return f"{label}：{type(exc).__name__}: {str(exc)[:80]}"
+
+
+def _eastmoney_quotes(codes: list[str], current: datetime) -> dict[str, dict]:
+    """One batched EastMoney request for all codes; direct connection first, then the system proxy.
+
+    AkShare only goes through the system proxy, so a flaky local proxy used to knock out every
+    fallback quote. Raises the last error when no host/route answered.
+    """
+    params = {"fltt": 2, "invt": 2, "fields": "f2,f12,f124",
+              "secids": ",".join(_eastmoney_secid(code) for code in codes)}
+    headers = {"Accept": "application/json,text/plain,*/*", "Referer": "https://quote.eastmoney.com/",
+               "User-Agent": "Mozilla/5.0"}
+    last_error: Exception | None = None
+    for trust_env, route in ((False, "直连"), (True, "代理")):
+        session = requests.Session()
+        session.trust_env = trust_env
+        try:
+            for url in EASTMONEY_ULIST_URLS:
+                try:
+                    response = session.get(url, params=params, headers=headers, timeout=8)
+                    response.raise_for_status()
+                    rows = ((response.json().get("data") or {}).get("diff") or [])
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                result = {}
+                for row in rows:
+                    code = str(row.get("f12") or "").zfill(6)
+                    price = pd.to_numeric(row.get("f2"), errors="coerce")
+                    stamp = pd.to_numeric(row.get("f124"), errors="coerce")
+                    if code not in codes or pd.isna(price) or not math.isfinite(float(price)) or float(price) <= 0 or pd.isna(stamp):
+                        continue
+                    quote_time = datetime.fromtimestamp(float(stamp), TZ)
+                    if quote_time.date() != current.date():
+                        continue
+                    result[code] = {"price": float(price), "quote_time": quote_time,
+                                    "source": f"东方财富实时行情（{route}）", "status": "实时"}
+                if result:
+                    return result
+                last_error = ValueError("东方财富未返回当日有效价格")
+        finally:
+            session.close()
+    if last_error is not None:
+        raise last_error
+    return {}
 
 
 def _akshare_quote(code: str, current: datetime) -> dict | None:
@@ -304,18 +458,25 @@ def fetch_microcap_realtime_quotes(
     if not codes or not _is_open(current):
         return {}, {}
     quotes, failures = {}, {}
-    tickflow_error = ""
+    errors = []
     try:
         quotes.update(_tickflow_quotes(codes, api_key.strip(), current))
     except Exception as exc:
-        tickflow_error = f"TickFlow：{type(exc).__name__}: {exc}"
+        errors.append(_brief("TickFlow", exc))
+    missing = [code for code in codes if code not in quotes]
+    if missing:
+        try:
+            quotes.update(_eastmoney_quotes(missing, current))
+        except Exception as exc:
+            errors.append(_brief("东方财富", exc))
+    tickflow_error = "; ".join(errors)
     missing = [code for code in codes if code not in quotes]
     bj_missing = [code for code in missing if code.startswith(("4", "8", "9"))]
     if bj_missing:
         try:
             quotes.update(_akshare_bj_quotes(bj_missing, current))
         except Exception as exc:
-            bj_error = f"AkShare全市场快照：{type(exc).__name__}: {exc}"
+            bj_error = _brief("AkShare全市场快照", exc)
             for code in bj_missing:
                 failures[code] = "; ".join(part for part in (tickflow_error, bj_error) if part)
     ordinary_missing = [code for code in missing if code not in bj_missing]
@@ -331,7 +492,7 @@ def fetch_microcap_realtime_quotes(
                     else:
                         failures[code] = "; ".join(part for part in (tickflow_error, "AkShare未返回有效实时价格") if part)
                 except Exception as exc:
-                    ak_error = f"AkShare实时快照：{type(exc).__name__}: {exc}"
+                    ak_error = _brief("AkShare实时快照", exc)
                     failures[code] = "; ".join(part for part in (tickflow_error, ak_error) if part)
     for code in bj_missing:
         if code not in quotes and code not in failures:

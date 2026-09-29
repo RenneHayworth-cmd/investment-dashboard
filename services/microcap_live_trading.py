@@ -20,7 +20,7 @@ FLOW_TYPES = ("期初资金", "资金转入", "资金转出", "现金分红", "�
 ADJUSTMENT_TYPES = ("期初持仓", "送转")
 TRADE_COLUMNS = [
     "id", "record_key", "trade_date", "trade_time", "symbol", "name", "side",
-    "price", "quantity", "commission_amount", "stamp_tax_amount", "strategy",
+    "price", "quantity", "commission_amount", "stamp_tax_amount", "other_fee_amount", "strategy",
     "notes", "source", "import_batch_id", "source_row", "created_at",
 ]
 CASH_FLOW_COLUMNS = [
@@ -64,6 +64,16 @@ def _round_money(value) -> float:
 
 def _trade_gross(price, quantity) -> Decimal:
     return (Decimal(str(price)) * int(quantity)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _other_fee(row) -> Decimal:
+    """Transfer/clearing/other fees; frames built before the column existed read as 0."""
+    value = row.get("other_fee_amount") if hasattr(row, "get") else None
+    return Decimal("0") if value is None or pd.isna(value) else Decimal(str(value))
+
+
+def _trade_fee_total(row) -> float:
+    return float(Decimal(str(row["commission_amount"])) + Decimal(str(row["stamp_tax_amount"])) + _other_fee(row))
 
 
 def _date(value, label="日期") -> str:
@@ -238,12 +248,13 @@ def _validate_ledger(conn):
             gross = _trade_gross(row["price"], quantity)
             commission = Decimal(str(row["commission_amount"]))
             tax = Decimal(str(row["stamp_tax_amount"]))
+            other = _other_fee(row)
             if row["side"] == "买入":
                 if tax != 0:
                     raise ValueError(f"第{event_id}笔买入不应收取印花税。")
-                cash -= gross + commission
+                cash -= gross + commission + other
                 state["quantity"] = int(state["quantity"]) + quantity
-                state["basis"] = Decimal(state["basis"]) + gross + commission
+                state["basis"] = Decimal(state["basis"]) + gross + commission + other
             else:
                 held = int(state["quantity"])
                 if held < quantity:
@@ -252,7 +263,7 @@ def _validate_ledger(conn):
                 removed = basis * quantity / held if held else Decimal("0")
                 state["quantity"] = held - quantity
                 state["basis"] = max(Decimal("0"), basis - removed)
-                cash += gross - commission - tax
+                cash += gross - commission - tax - other
         else:
             symbol = row["symbol"]
             state = positions.setdefault(symbol, {"quantity": 0, "basis": Decimal("0"), "name": row["name"]})
@@ -334,7 +345,7 @@ def _trade_fees(side: str, gross: float, settings: dict, commission=None, stamp_
 
 def add_microcap_trade(
     *, trade_date, symbol, name, side, price, quantity, trade_time=None,
-    commission_amount=None, stamp_tax_amount=None, strategy="", notes="",
+    commission_amount=None, stamp_tax_amount=None, other_fee_amount=0.0, strategy="", notes="",
     source="手工", record_key=None,
 ) -> int:
     day = _date(trade_date, "成交日期")
@@ -353,6 +364,7 @@ def add_microcap_trade(
     gross = _trade_gross(trade_price, qty)
     settings = get_microcap_fee_settings()
     commission, tax = _trade_fees(direction, gross, settings, commission_amount, stamp_tax_amount)
+    other = _money(other_fee_amount or 0, "其他费用")
     connection = _conn(write=True)
     try:
         if not _has_initial_capital(connection):
@@ -360,10 +372,10 @@ def add_microcap_trade(
         cursor = connection.execute(
             """INSERT INTO microcap_live_trades
             (record_key,trade_date,trade_time,symbol,name,side,price,quantity,commission_amount,
-             stamp_tax_amount,strategy,notes,source,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             stamp_tax_amount,other_fee_amount,strategy,notes,source,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (record_key or uuid.uuid4().hex, day, time_text, code, display_name, direction,
-             trade_price, qty, commission, tax, str(strategy or "").strip(), str(notes or "").strip(),
+             trade_price, qty, commission, tax, other, str(strategy or "").strip(), str(notes or "").strip(),
              str(source or "手工"), datetime.now().isoformat(timespec="seconds")),
         )
         _validate_ledger(connection)
@@ -514,20 +526,19 @@ def _states_after(events):
             state["name"] = row["name"]
             qty = int(row["quantity"])
             gross = float(_trade_gross(row["price"], qty))
-            commission = float(row["commission_amount"])
-            tax = float(row["stamp_tax_amount"])
-            fees_by_symbol[code] = fees_by_symbol.get(code, 0.0) + commission + tax
+            fees = _trade_fee_total(row)
+            fees_by_symbol[code] = fees_by_symbol.get(code, 0.0) + fees
             if row["side"] == "买入":
-                cash -= gross + commission + tax
+                cash -= gross + fees
                 state["quantity"] += qty
-                state["cost_basis"] += gross + commission + tax
-                state["invested_basis"] += gross + commission + tax
+                state["cost_basis"] += gross + fees
+                state["invested_basis"] += gross + fees
             else:
                 held = state["quantity"]
                 removed_basis = state["cost_basis"] * qty / held if held else 0.0
                 state["quantity"] -= qty
                 state["cost_basis"] = max(0.0, state["cost_basis"] - removed_basis)
-                proceeds = gross - commission - tax
+                proceeds = gross - fees
                 cash += proceeds
                 realized += proceeds - removed_basis
                 state["realized_pnl"] += proceeds - removed_basis
@@ -582,7 +593,7 @@ def build_microcap_symbol_history(trades=None, adjustments=None, price_histories
         code = row["symbol"]
         stat = totals.setdefault(code, {"buy_cost": 0.0, "sell_proceeds": 0.0, "fees": 0.0, "first_date": row["trade_date"], "last_date": row["trade_date"]})
         gross = float(_trade_gross(row["price"], row["quantity"]))
-        fees = float(row["commission_amount"]) + float(row["stamp_tax_amount"])
+        fees = _trade_fee_total(row)
         stat["fees"] += fees
         stat["last_date"] = row["trade_date"]
         if row["side"] == "买入":
@@ -726,7 +737,7 @@ def build_microcap_daily_returns(
                 state = state_positions.setdefault(code, {"quantity": 0, "cost_basis": 0.0, "name": row["name"], "realized_pnl": 0.0})
                 quantity = int(row["quantity"])
                 gross = float(_trade_gross(row["price"], quantity))
-                fees = float(row["commission_amount"]) + float(row["stamp_tax_amount"])
+                fees = _trade_fee_total(row)
                 if row["side"] == "买入":
                     state_cash -= gross + fees
                     state["quantity"] += quantity
@@ -811,7 +822,7 @@ def _symbol_daily_pnl(symbol, valuation_day, mark_price, previous_close, events)
             quantity = int(row["quantity"])
             mark_value = _round_money(quantity * mark_price)
             gross = float(_trade_gross(row["price"], quantity))
-            fees = float(row["commission_amount"]) + float(row["stamp_tax_amount"])
+            fees = _trade_fee_total(row)
             if row["side"] == "买入":
                 pnl += mark_value - gross - fees
                 return_base += gross
@@ -944,7 +955,11 @@ def build_microcap_account_snapshot(
         current_pnl = pd.NA
     return_pct = current_pnl / baseline * 100 if pd.notna(current_pnl) and baseline and baseline > 0 else pd.NA
     warnings = []
-    missing_days = formal_daily.attrs.get("missing_days", [])
+    from services.microcap_live_market import microcap_target_date
+
+    # A session whose formal close is not due yet is pending, not a gap.
+    settled_day = microcap_target_date(now)
+    missing_days = [item for item in formal_daily.attrs.get("missing_days", []) if item["date"] <= settled_day]
     if missing_days:
         recent_gaps = missing_days[-5:]
         gap_text = "；".join(f"{item['date']}缺{','.join(item['symbols'])}" for item in recent_gaps)
@@ -980,7 +995,7 @@ def build_microcap_account_snapshot(
         "cost_basis": cost_basis, "realized_pnl": realized, "unrealized_pnl": market_value - cost_basis if complete else pd.NA,
         "account_pnl": current_pnl, "cumulative_return_pct": return_pct,
         "daily_pnl": daily_pnl, "daily_return_pct": daily_return_pct,
-        "fee_amount": float(trades[["commission_amount", "stamp_tax_amount"]].sum().sum()) if not trades.empty else 0.0,
+        "fee_amount": float(sum(_trade_fee_total(row) for row in trades.to_dict("records"))) if not trades.empty else 0.0,
         "dividends": dividends, "position_ratio_pct": market_value / float(total_assets) * 100 if complete and float(total_assets) > 0 else pd.NA,
         "nav": 1 + return_pct / 100 if pd.notna(return_pct) else pd.NA,
     }
@@ -1073,6 +1088,16 @@ def _mapped_value(row, mapping, field):
     return None if pd.isna(value) or str(value).strip() == "" else value
 
 
+def _mapped_fee_sum(row, mapping, field, label):
+    """Sum a fee field that brokers may split across several columns (过户费, 其他杂费, ...)."""
+    columns = mapping.get(field) or []
+    if isinstance(columns, str):
+        columns = [columns]
+    values = [_numeric(_mapped_value(row, {field: column}, field), f"{label}（{column}）", optional=True) for column in columns]
+    values = [value for value in values if value is not None]
+    return sum(values) if values else None
+
+
 def inspect_microcap_import_columns(file_bytes: bytes, file_name: str) -> dict:
     """Return input headers for the page's user-controlled column mapper."""
     frame = _read_import_file(bytes(file_bytes), file_name)
@@ -1120,21 +1145,29 @@ def preview_microcap_trade_import(file_bytes: bytes, file_name: str, mapping: di
                 raise ValueError("成交数量必须为正整数。")
             if price <= 0:
                 raise ValueError("成交价格必须大于0。")
-            gross = _trade_gross(price, int(quantity_value))
+            quantity = int(quantity_value)
+            file_gross = _numeric(_mapped_value(source, mapping, "gross_amount"), "成交金额", optional=True)
+            if file_gross is not None:
+                # 成交均价 is rounded; keep the broker's exact amount by storing amount / quantity.
+                if abs(Decimal(str(file_gross)) - _trade_gross(price, quantity)) > Decimal(str(0.0005 * quantity + 0.01)):
+                    raise ValueError(f"成交金额{file_gross:,.2f}与成交价×数量不一致。")
+                price = file_gross / quantity
+            gross = _trade_gross(price, quantity)
             commission_input = _numeric(_mapped_value(source, mapping, "commission_amount"), "佣金", optional=True)
             tax_input = _numeric(_mapped_value(source, mapping, "stamp_tax_amount"), "印花税", optional=True)
+            other_input = _mapped_fee_sum(source, mapping, "other_fee_amount", "其他费用") or 0.0
             total_fee = _numeric(_mapped_value(source, mapping, "total_fee"), "总费用", optional=True)
             if total_fee is not None:
                 if commission_input is not None and tax_input is not None:
-                    if abs(commission_input + tax_input - total_fee) > 0.02:
-                        raise ValueError("佣金与印花税合计和总费用不一致。")
+                    if abs(commission_input + tax_input + other_input - total_fee) > 0.02:
+                        raise ValueError("佣金、印花税与其他费用合计和总费用不一致。")
                 elif commission_input is not None:
-                    tax_input = total_fee - commission_input
+                    tax_input = total_fee - commission_input - other_input
                 else:
                     tax_input = tax_input if tax_input is not None else (
                         _round_money(gross * Decimal(str(settings["stamp_tax_rate_pct"])) / Decimal("100")) if side == "卖出" else 0.0
                     )
-                    commission_input = total_fee - tax_input
+                    commission_input = total_fee - tax_input - other_input
                 if commission_input < -0.005 or (tax_input is not None and tax_input < -0.005):
                     raise ValueError("拆分后的佣金或印花税为负，请核对文件字段映射。")
             if commission_input is None:
@@ -1143,8 +1176,19 @@ def preview_microcap_trade_import(file_bytes: bytes, file_name: str, mapping: di
                 tax_input = _round_money(gross * Decimal(str(settings["stamp_tax_rate_pct"])) / Decimal("100")) if side == "卖出" else 0.0
             commission = _money(commission_input, "佣金")
             tax = _money(tax_input, "印花税")
+            other = _money(other_input, "其他费用")
             if side == "买入" and tax != 0:
                 raise ValueError("买入印花税必须为0。")
+            net_amount = _numeric(_mapped_value(source, mapping, "net_amount"), "发生金额", optional=True)
+            if net_amount is not None:
+                fees = Decimal(str(commission)) + Decimal(str(tax)) + Decimal(str(other))
+                expected = gross + fees if side == "买入" else gross - fees
+                gap = abs(Decimal(str(abs(net_amount))) - expected)
+                if gap > Decimal("0.01"):
+                    raise ValueError(
+                        f"发生金额{net_amount:,.2f}与成交金额及费用合计{expected:,.2f}相差{gap:,.2f}元，"
+                        "可能有费用列未映射。"
+                    )
             name_value = _mapped_value(source, mapping, "name")
             time_value = _mapped_value(source, mapping, "trade_time")
             strategy_value = _mapped_value(source, mapping, "strategy")
@@ -1152,8 +1196,8 @@ def preview_microcap_trade_import(file_bytes: bytes, file_name: str, mapping: di
             rows.append({
                 "trade_date": trade_day, "trade_time": _time(time_value), "symbol": symbol,
                 "name": str(name_value or symbol).strip(), "side": side,
-                "price": float(price), "quantity": int(quantity_value),
-                "commission_amount": commission, "stamp_tax_amount": tax,
+                "price": float(price), "quantity": quantity,
+                "commission_amount": commission, "stamp_tax_amount": tax, "other_fee_amount": other,
                 "strategy": str(strategy_value or "").strip(), "notes": str(notes_value or "").strip(),
                 "source_row": source_row,
             })
@@ -1188,11 +1232,11 @@ def commit_microcap_trade_import(preview: dict) -> dict:
             connection.execute(
                 """INSERT INTO microcap_live_trades
                 (record_key,trade_date,trade_time,symbol,name,side,price,quantity,commission_amount,
-                 stamp_tax_amount,strategy,notes,source,import_batch_id,source_row,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 stamp_tax_amount,other_fee_amount,strategy,notes,source,import_batch_id,source_row,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (f"{preview['file_hash']}:{source_row}", row["trade_date"], row.get("trade_time"),
                  row["symbol"], row["name"], row["side"], row["price"], row["quantity"],
-                 row["commission_amount"], row["stamp_tax_amount"], row.get("strategy", ""),
+                 row["commission_amount"], row["stamp_tax_amount"], row.get("other_fee_amount", 0.0), row.get("strategy", ""),
                  row.get("notes", ""), preview["file_name"], batch_id, source_row,
                  datetime.now().isoformat(timespec="seconds")),
             )
