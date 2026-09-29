@@ -24,9 +24,10 @@ true/1/yes/on 表示开启；无效值报错并停止，不会默默打开。
 `reminder.env` 为 `ENABLE_FANGTANG=true`、`ENABLE_WECHAT=false`、`REMINDER_DRY_RUN=false`，
 09:45 等时点已在实际发送方糖；随后又加入 `ENABLE_WXPUSHER=true`（SPT token 只在服务器
 `reminder.env` 里，不进 Git）。Windows 任务显式设置 Fangtang=false、WeChat=true、
-WxPusher=true，方糖不会双发。升级旧代码时缺少开关将停止发送，务必同步设置 Windows 任务环境。
-**注意：WxPusher 目前两个节点都开着，每个时点会收到两条相同的 WxPusher 消息**（账本按节点
-独立）；只想收一条时，关掉其中一个节点的 `ENABLE_WXPUSHER`。
+WxPusher=false，方糖不会双发，WxPusher 只由 Lightsail 发送。升级旧代码时缺少开关将停止发送，
+务必同步设置 Windows 任务环境。WxPusher 收件人由 token 决定，不由发送机器决定：手机、
+Windows 桌面客户端等登录同一账号的客户端都会收到。若把它改回 Windows 发送，须同时关掉
+Lightsail 的 `ENABLE_WXPUSHER`，否则每个时点会收到两条（账本按节点独立）。
 铁矿石脚本永远只选择微信，不会因 Fangtang=true 改为双发；禁用微信时不改变其
 阈值状态，重新启用后继续原有首次跌破/恢复后重布防规则。
 
