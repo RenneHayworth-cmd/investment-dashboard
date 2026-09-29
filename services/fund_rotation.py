@@ -107,8 +107,9 @@ def run_ma20_timing_backtest(
     lot_size: int = 100,
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
+    base_position_pct: float = 0.0,
 ) -> TimingBacktestResult:
-    """运行单标的均线择时回测。"""
+    """运行单标的均线择时回测；base_position_pct 为首日买入并一直持有的底仓比例。"""
 
     return _timing.run_ma20_timing_backtest(
         fund=fund,
@@ -119,6 +120,7 @@ def run_ma20_timing_backtest(
         lot_size=lot_size,
         start_date=start_date,
         end_date=end_date,
+        base_position_pct=base_position_pct,
     )
 
 

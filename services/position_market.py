@@ -17,6 +17,7 @@ from services.fund_analysis import (
     FUND_ADJUST_FORWARD_RATIO,
     FUND_ADJUST_NONE,
     FUND_CACHE_SCHEMA_VERSION,
+    TickFlowNoDataError,
     analyze_fund_nav,
     build_fund_cache_symbol,
     fetch_tickflow_fund_close,
@@ -240,6 +241,33 @@ def _fetch_position_etf_history(
         count=int(count),
         adjust=adjust,
     )
+
+
+def fetch_backtest_fund_close(
+    *,
+    symbol: str,
+    api_key: str = "",
+    count: int,
+    adjust: str | None,
+) -> pd.DataFrame:
+    """Exchange-fund daily history for backtests.
+
+    TickFlow first; when it has no bars for the symbol (some LOFs such as 161128),
+    use the EastMoney/AkShare exchange history with the Sina fallback. Transient
+    TickFlow errors are re-raised so one cache never mixes sources.
+    """
+    base_code = normalize_etf_base_code(symbol)
+    if base_code in ETF_AKSHARE_HISTORY_CODES:
+        return _fetch_exchange_fund_close(symbol=symbol, count=int(count), adjust=adjust)
+    try:
+        result = fetch_tickflow_fund_close(symbol=symbol, api_key=api_key, count=int(count), adjust=adjust)
+    except TickFlowNoDataError as tickflow_exc:
+        try:
+            return _fetch_exchange_fund_close(symbol=symbol, count=int(count), adjust=adjust)
+        except Exception as fallback_exc:
+            raise ValueError(f"{tickflow_exc} 场内备用源也失败：{fallback_exc}") from fallback_exc
+    result.attrs["position_history_source"] = "TickFlow"
+    return result
 
 
 def _merge_current_day_refresh(
@@ -622,7 +650,9 @@ def _fetch_exchange_fund_close(
 ) -> pd.DataFrame:
     adjustment = normalize_fund_adjustment(adjust)
     if adjustment in {FUND_ADJUST_FORWARD_RATIO, FUND_ADJUST_BACKWARD_RATIO}:
-        raise ValueError("161128的东方财富/AkShare正式历史不支持比例复权。")
+        raise ValueError(
+            f"{normalize_etf_base_code(symbol)}的东方财富/新浪场内历史不支持比例复权，请改用差值复权。"
+        )
     eastmoney_error = ""
     try:
         result = _fetch_eastmoney_exchange_fund_close(

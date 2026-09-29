@@ -9,9 +9,9 @@ import streamlit as st
 from core.cache import save_dataset
 from services.fund_analysis import (
     build_fund_cache_symbol,
-    fetch_tickflow_fund_close,
     infer_tickflow_symbol,
 )
+from services.position_market import fetch_backtest_fund_close
 from services.fund_rotation import (
     PORTFOLIO_STRATEGY_CASH,
     PORTFOLIO_STRATEGY_HALF_TIMING,
@@ -323,7 +323,7 @@ def render_portfolio_timing_mode() -> None:
                     with st.spinner(
                         f"正在获取 {allocation.symbol} 的{adjust_option}日线…"
                     ):
-                        raw_df = fetch_tickflow_fund_close(
+                        raw_df = fetch_backtest_fund_close(
                             symbol=allocation.symbol,
                             api_key=api_key,
                             count=FULL_HISTORY_COUNT,

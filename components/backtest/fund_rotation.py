@@ -10,10 +10,10 @@ from core.cache import save_dataset
 from services.fund_analysis import (
     build_fund_cache_symbol,
     fetch_eastmoney_fund_nav,
-    fetch_tickflow_fund_close,
     infer_tickflow_symbol,
     read_uploaded_table,
 )
+from services.position_market import fetch_backtest_fund_close
 from services.fund_rotation import (
     EXECUTION_AFTER_CLOSE,
     EXECUTION_NEXT_OPEN,
@@ -322,9 +322,9 @@ def render_fund_rotation_mode() -> None:
                             )
                         else:
                             with st.spinner(
-                                f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线…"
+                                f"正在拉取 {symbol} 的{adjust_option}日线…"
                             ):
-                                raw_df = fetch_tickflow_fund_close(
+                                raw_df = fetch_backtest_fund_close(
                                     symbol=symbol,
                                     api_key=api_key,
                                     count=FULL_HISTORY_COUNT,

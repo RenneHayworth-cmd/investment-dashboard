@@ -10,9 +10,9 @@ from streamlit.testing.v1 import AppTest
 
 PAGE = Path(__file__).parents[1] / "pages" / "3_策略回测.py"
 NETWORK_CALLS = (
-    "components.backtest.ma_timing.fetch_tickflow_fund_close",
-    "components.backtest.portfolio_timing.fetch_tickflow_fund_close",
-    "components.backtest.fund_rotation.fetch_tickflow_fund_close",
+    "components.backtest.ma_timing.fetch_backtest_fund_close",
+    "components.backtest.portfolio_timing.fetch_backtest_fund_close",
+    "components.backtest.fund_rotation.fetch_backtest_fund_close",
     "components.backtest.fund_rotation.fetch_eastmoney_fund_nav",
     "components.annual_etf_dynamic.fetch_annual_etf_raw_history",
     "components.annual_etf_dynamic.fetch_annual_dividends",
@@ -39,7 +39,7 @@ class StrategyBacktestPageTests(unittest.TestCase):
             app = AppTest.from_file(str(PAGE), default_timeout=20).run()
 
         _assert_clean(app)
-        self.assertEqual(app.radio[0].value, "单标的MA20择时")
+        self.assertEqual(app.radio[0].value, "单标的均线择时")
         self.assertTrue(any("默认用 512890" in item.value for item in app.info))
         for mock in mocks:
             mock.assert_not_called()

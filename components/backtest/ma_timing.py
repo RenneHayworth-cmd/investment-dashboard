@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import os
 
 import pandas as pd
@@ -9,9 +10,10 @@ import streamlit as st
 from core.cache import save_dataset
 from services.fund_analysis import (
     build_fund_cache_symbol,
-    fetch_tickflow_fund_close,
     infer_tickflow_symbol,
 )
+from services.fund_rotation_summary import build_timing_calendar_year_table
+from services.position_market import fetch_backtest_fund_close
 from services.fund_rotation import (
     build_standard_backtest_periods,
     normalize_rotation_dataframe,
@@ -40,6 +42,7 @@ def build_timing_period_table(
     initial_capital: float,
     transaction_cost: float,
     lot_size: int,
+    base_position_pct: float = 0.0,
 ) -> pd.DataFrame:
     rows = []
     for label, period_start in build_standard_backtest_periods(end_date):
@@ -53,6 +56,7 @@ def build_timing_period_table(
                 lot_size=lot_size,
                 start_date=period_start,
                 end_date=end_date,
+                base_position_pct=base_position_pct,
             )
             summary = period_result.summary
             rows.append(
@@ -83,7 +87,7 @@ def render_timing_nav_chart(result_df: pd.DataFrame) -> None:
             x=result_df["日期"],
             y=result_df["账户净值"],
             mode="lines",
-            name="MA20择时",
+            name="均线择时",
             hovertemplate="%{x|%Y-%m-%d}<br>账户净值=%{y:.2f}<extra></extra>",
             line=dict(width=2.4, color="#d62728"),
         )
@@ -187,10 +191,14 @@ def render_timing_signal_chart(
     st.plotly_chart(fig, width="stretch")
 
 
+DEFAULT_TIMING_START_DATE = date(2019, 1, 1)
+
+
 def render_ma20_timing_mode() -> None:
-    default_start_date, default_end_date = default_backtest_dates()
+    _, default_end_date = default_backtest_dates()
+    default_start_date = DEFAULT_TIMING_START_DATE
     with st.sidebar:
-        st.subheader("MA20择时参数")
+        st.subheader("均线择时参数")
         ma_period = st.number_input("均线周期", min_value=2, max_value=250, value=20, step=1)
         timing_threshold_pct = st.number_input(
             "触发阈值(%)",
@@ -199,6 +207,15 @@ def render_ma20_timing_mode() -> None:
             value=1.0,
             step=0.1,
             help="高于均线上方该比例才买入，低于均线下方该比例才卖出。",
+        )
+        base_position_pct = st.number_input(
+            "底仓比例(%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=5.0,
+            help="回测首日按收盘价买入这部分并一直持有，其余资金按均线择时。"
+            "0 为全仓择时；50 为半仓持有、半仓择时；25 为 25% 底仓、75% 择时。",
         )
         timing_initial_capital = st.number_input(
             "初始资金", min_value=1000.0, value=100000.0, step=10000.0
@@ -241,10 +258,13 @@ def render_ma20_timing_mode() -> None:
             value=os.getenv("TICKFLOW_API_KEY", ""),
             type="password",
         )
-        run_clicked = st.form_submit_button("运行MA20择时回测", type="primary")
+        run_clicked = st.form_submit_button("运行均线择时回测", type="primary")
 
     if not run_clicked:
-        st.info("默认用 512890 跑 MA20 择时；信号按当日收盘价和 MA20 缓冲带比较，成交价也使用当日收盘价。")
+        st.info(
+            f"默认用 512890 跑 MA{int(ma_period)} 择时；信号按当日收盘价和 MA{int(ma_period)} 缓冲带比较，"
+            "成交价也使用当日收盘价。均线周期可在左侧调整。"
+        )
         return
     if pd.Timestamp(timing_start_date) > pd.Timestamp(timing_end_date):
         st.error("开始日期不能晚于结束日期。")
@@ -256,13 +276,14 @@ def render_ma20_timing_mode() -> None:
         cache_symbol = build_fund_cache_symbol("fund_rotation", symbol, adjust_value)
         cached_df, cache_meta, _cache_period = load_rotation_cache(cache_symbol)
         try:
-            with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 的{adjust_option}日线…"):
-                raw_df = fetch_tickflow_fund_close(
+            with st.spinner(f"正在拉取 {symbol} 的{adjust_option}日线…"):
+                raw_df = fetch_backtest_fund_close(
                     symbol=symbol,
                     api_key=api_key,
                     count=FULL_HISTORY_COUNT,
                     adjust=adjust_value,
                 )
+            history_source = raw_df.attrs.get("position_history_source", "TickFlow")
             save_dataset(
                 cache_symbol,
                 f"{symbol} {adjust_option}",
@@ -271,7 +292,7 @@ def render_ma20_timing_mode() -> None:
                 raw_df,
                 period=FULL_HISTORY_CACHE_PERIOD,
             )
-            st.success(f"{symbol} 已更新并保存到本地缓存。")
+            st.success(f"{symbol} 已从{history_source}更新并保存到本地缓存。")
         except Exception as fetch_exc:
             if cached_df is None:
                 raise
@@ -292,9 +313,10 @@ def render_ma20_timing_mode() -> None:
             lot_size=int(timing_lot_size),
             start_date=timing_start_date,
             end_date=timing_end_date,
+            base_position_pct=float(base_position_pct),
         )
     except Exception as exc:
-        st.error(f"MA20择时回测出错：{exc}")
+        st.error(f"均线择时回测出错：{exc}")
         return
 
     summary = result.summary
@@ -323,15 +345,46 @@ def render_ma20_timing_mode() -> None:
         initial_capital=float(timing_initial_capital),
         transaction_cost=float(timing_transaction_cost_bp) / 10000,
         lot_size=int(timing_lot_size),
+        base_position_pct=float(base_position_pct),
     )
     st.subheader("分期回测结果")
     st.dataframe(period_df, width="stretch", hide_index=True)
     st.download_button(
         "下载分期回测结果 CSV",
         data=to_csv_bytes(period_df),
-        file_name="ma20_timing_period_results.csv",
+        file_name="ma_timing_period_results.csv",
         mime="text/csv",
     )
+
+    st.subheader("逐年回测结果")
+    try:
+        full_history = run_ma20_timing_backtest(
+            fund=fund,
+            ma_period=int(ma_period),
+            threshold_pct=float(timing_threshold_pct),
+            initial_capital=float(timing_initial_capital),
+            transaction_cost=float(timing_transaction_cost_bp) / 10000,
+            lot_size=int(timing_lot_size),
+            end_date=result.end_date,
+            base_position_pct=float(base_position_pct),
+        )
+        yearly_df = build_timing_calendar_year_table(
+            full_history.data, full_history.trades, float(timing_initial_capital)
+        )
+    except Exception as exc:
+        st.warning(f"逐年结果计算失败：{exc}")
+    else:
+        st.caption(
+            f"按成立来（{full_history.summary.get('开始日期')} 起）连续回测拆分到自然年："
+            "每年以上一年末净值为起点，跨年持仓延续不重置；首年和最后一年可能不是完整年度，请看实际起止日。"
+        )
+        st.dataframe(yearly_df, width="stretch", hide_index=True)
+        st.download_button(
+            "下载逐年回测结果 CSV",
+            data=to_csv_bytes(yearly_df),
+            file_name="ma_timing_yearly_results.csv",
+            mime="text/csv",
+        )
 
     tab_nav, tab_signal, tab_drawdown, tab_trades, tab_daily, tab_summary = st.tabs(
         ["净值走势", "标的与信号", "回撤分析", "交易明细", "每日数据", "摘要"]
@@ -341,7 +394,7 @@ def render_ma20_timing_mode() -> None:
         st.download_button(
             "下载择时净值 CSV",
             data=to_csv_bytes(result.data),
-            file_name="ma20_timing_nav_data.csv",
+            file_name="ma_timing_nav_data.csv",
             mime="text/csv",
         )
     with tab_signal:
@@ -359,7 +412,7 @@ def render_ma20_timing_mode() -> None:
             st.download_button(
                 "下载交易明细 CSV",
                 data=to_csv_bytes(result.trades),
-                file_name="ma20_timing_trades.csv",
+                file_name="ma_timing_trades.csv",
                 mime="text/csv",
             )
     with tab_daily:

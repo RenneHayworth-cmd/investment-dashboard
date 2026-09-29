@@ -313,6 +313,10 @@ def stamp_fund_history_metadata(
     return result
 
 
+class TickFlowNoDataError(ValueError):
+    """TickFlow answered but has no daily bars for the symbol (e.g. some LOFs)."""
+
+
 def fetch_tickflow_fund_close(
     symbol: str,
     api_key: str = "",
@@ -330,7 +334,7 @@ def fetch_tickflow_fund_close(
     }
     df = client.klines.get(symbol, **kwargs)
     if df is None or df.empty:
-        raise ValueError(f"TickFlow 未返回 {symbol} 的日线数据。")
+        raise TickFlowNoDataError(f"TickFlow 未返回 {symbol} 的日线数据。")
 
     normalized = df.copy()
     normalized.columns = [str(col).strip() for col in normalized.columns]

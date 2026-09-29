@@ -65,10 +65,10 @@ st.markdown(
 
 strategy_mode = st.radio(
     "策略类型",
-    options=["单标的MA20择时", "多ETF配置择时", "年度动态组合", "多基金动量轮动"],
+    options=["单标的均线择时", "多ETF配置择时", "年度动态组合", "多基金动量轮动"],
     horizontal=True,
 )
-if strategy_mode == "单标的MA20择时":
+if strategy_mode == "单标的均线择时":
     render_ma20_timing_mode()
     st.stop()
 if strategy_mode == "多ETF配置择时":

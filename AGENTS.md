@@ -503,7 +503,10 @@ For fund rotation:
 - Single-asset MA20 timing on the `策略回测` page uses the same day's close for
   both signal and execution. Its configurable trigger threshold defaults to 1%:
   close above MA20 by the threshold buys, close below MA20 by the threshold
-  sells, with 100-share lot-size rounding by default.
+  sells, with 100-share lot-size rounding by default. An optional base-position
+  percentage (default 0) buys that share of capital at the first close and holds
+  it throughout; only the remaining capital follows the MA signal, and holding
+  days/win rate describe that timing sleeve.
 - The MA timing benchmark is labeled `一直持有收益` and always uses the first
   and last actual trading dates in the selected interval. Its start date must
   not shift with the configured MA period; before the MA is available, the

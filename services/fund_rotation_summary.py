@@ -73,6 +73,7 @@ def _build_timing_summary(
     total_buy_cost: float,
     total_sell_cost: float,
     realized_trade_pnls: list[float],
+    base_position_pct: float = 0.0,
 ) -> dict[str, object]:
     start_date = pd.Timestamp(result_df["日期"].iloc[0])
     end_date = pd.Timestamp(result_df["日期"].iloc[-1])
@@ -95,17 +96,24 @@ def _build_timing_summary(
     trade_count = len(trades_df)
     buy_count = int((trades_df["操作"] == "买入").sum()) if not trades_df.empty else 0
     sell_count = int((trades_df["操作"] == "卖出").sum()) if not trades_df.empty else 0
-    holding_days = int((result_df["持仓份额"] > 0).sum())
+    # Holding days describe the timing sleeve; a permanent base would make them trivially 100%.
+    timing_shares = result_df["择时份额"] if "择时份额" in result_df.columns else result_df["持仓份额"]
+    holding_days = int((timing_shares > 0).sum())
     holding_ratio = holding_days / len(result_df) if len(result_df) else 0
     closed_trade_count, winning_trade_count, trade_win_rate = _calculate_trade_win_stats(realized_trade_pnls)
+    rule = (
+        f"收盘价 > MA{ma_period} 上方 {threshold_pct:.2f}% 买入，"
+        f"收盘价 < MA{ma_period} 下方 {threshold_pct:.2f}% 卖出"
+    )
+    base_pct = float(base_position_pct)
+    if base_pct > 0:
+        rule = f"{base_pct:g}%底仓首日买入一直持有；其余{100 - base_pct:g}%资金：{rule}"
 
     return {
         "标的": fund.name,
         "代码": fund.symbol,
-        "策略": (
-            f"收盘价 > MA{ma_period} 上方 {threshold_pct:.2f}% 买入，"
-            f"收盘价 < MA{ma_period} 下方 {threshold_pct:.2f}% 卖出"
-        ),
+        "策略": rule,
+        "底仓比例(%)": round(base_pct, 2),
         "触发阈值(%)": round(float(threshold_pct), 2),
         "开始日期": start_date.strftime("%Y-%m-%d"),
         "结束日期": end_date.strftime("%Y-%m-%d"),
@@ -137,8 +145,69 @@ def _build_timing_summary(
         "累计总成本": round(total_buy_cost + total_sell_cost, 2),
     }
 
+
+def _seeded_max_drawdown_pct(values: pd.Series, baseline: float) -> float:
+    seeded = pd.concat([pd.Series([float(baseline)]), values], ignore_index=True)
+    return float((seeded / seeded.cummax() - 1).min() * 100)
+
+
+def build_timing_calendar_year_table(
+    result_df: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    initial_capital: float,
+) -> pd.DataFrame:
+    """Split one continuous MA-timing run into calendar years.
+
+    Each year starts from the previous year-end value (initial capital for the
+    first year), so positions carried across 12-31 are not reset and no
+    artificial year-start trades appear.
+    """
+    data = result_df.copy()
+    data["日期"] = pd.to_datetime(data["日期"])
+    trades = trades_df.copy()
+    if not trades.empty:
+        trades["日期"] = pd.to_datetime(trades["日期"])
+    timing_column = "择时份额" if "择时份额" in data.columns else "持仓份额"
+    rows = []
+    strategy_base = benchmark_base = float(initial_capital)
+    for year, group in data.groupby(data["日期"].dt.year, sort=True):
+        strategy = pd.to_numeric(group["账户净值"], errors="coerce").reset_index(drop=True)
+        benchmark = pd.to_numeric(group["一直持有净值"], errors="coerce").reset_index(drop=True)
+        strategy_return = float(strategy.iloc[-1]) / strategy_base - 1
+        benchmark_return = float(benchmark.iloc[-1]) / benchmark_base - 1
+        daily_returns = _calculate_nav_returns(group, strategy_base)
+        year_trades = trades.loc[trades["日期"].dt.year == year] if not trades.empty else trades
+        closed_pnls = (
+            pd.to_numeric(year_trades.loc[year_trades["操作"] == "卖出", "本次交易盈亏金额"], errors="coerce").dropna().tolist()
+            if not year_trades.empty else []
+        )
+        closed_count, winning_count, win_rate = _calculate_trade_win_stats(closed_pnls)
+        rows.append(
+            {
+                "年份": int(year),
+                "实际开始": group["日期"].iloc[0].strftime("%Y-%m-%d"),
+                "实际结束": group["日期"].iloc[-1].strftime("%Y-%m-%d"),
+                "策略收益率(%)": round(strategy_return * 100, 2),
+                "一直持有收益率(%)": round(benchmark_return * 100, 2),
+                "超额收益(%)": round((strategy_return - benchmark_return) * 100, 2),
+                "策略最大回撤(%)": round(_seeded_max_drawdown_pct(strategy, strategy_base), 2),
+                "一直持有最大回撤(%)": round(_seeded_max_drawdown_pct(benchmark, benchmark_base), 2),
+                "夏普比率": round(_calculate_sharpe_ratio(daily_returns), 2),
+                "交易次数": int(len(year_trades)),
+                "已平仓交易次数": closed_count,
+                "交易胜率(%)": round(win_rate, 2) if closed_count else None,
+                "择时持仓占比(%)": round(float((group[timing_column] > 0).mean() * 100), 2),
+                "年末信号": str(group["信号"].iloc[-1]),
+            }
+        )
+        strategy_base = float(strategy.iloc[-1])
+        benchmark_base = float(benchmark.iloc[-1])
+    return pd.DataFrame(rows)
+
+
 __all__ = [
     "_execution_mode_label",
     "_build_summary",
     "_build_timing_summary",
+    "build_timing_calendar_year_table",
 ]

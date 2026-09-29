@@ -120,7 +120,8 @@ class FundRotationTests(unittest.TestCase):
                 "threshold_pct: 'float' = 0.0, initial_capital: 'float' = 100000.0, "
                 "transaction_cost: 'float' = 6e-05, lot_size: 'int' = 100, "
                 "start_date: 'str | pd.Timestamp | None' = None, "
-                "end_date: 'str | pd.Timestamp | None' = None) -> 'TimingBacktestResult'"
+                "end_date: 'str | pd.Timestamp | None' = None, "
+                "base_position_pct: 'float' = 0.0) -> 'TimingBacktestResult'"
             ),
         )
         self.assertEqual(
@@ -577,6 +578,63 @@ class FundRotationTests(unittest.TestCase):
         self.assertEqual(result.start_date, requested_start)
         self.assertEqual(result.end_date, requested_end)
         self.assertFalse(result.data["MA20"].isna().any())
+
+    def test_ma_timing_base_position_is_held_while_timing_sleeve_trades(self):
+        dates = pd.bdate_range("2026-01-01", periods=6)
+        # MA2 with 0% band: up day buys, 8.0 sells, 12.0 rebuys.
+        prices = pd.Series([10.0, 10.0, 11.0, 8.0, 12.0, 12.0])
+        fund = RotationInput("X", "X", pd.DataFrame({"trade_date": dates, "open": prices, "close": prices}))
+
+        result = run_ma20_timing_backtest(
+            fund, ma_period=2, initial_capital=1000, transaction_cost=0.0, lot_size=1,
+            base_position_pct=25,
+        )
+
+        data = result.data.set_index("日期")
+        self.assertTrue((data["底仓份额"] == 25).all())
+        self.assertEqual(data["择时份额"].tolist(), [0, 0, 68, 0, 45, 45])
+        self.assertEqual(data.iloc[0]["操作"], "建立底仓")
+        # Timing sleeve 750: buy 68 @11 (cash 2), sell @8 (cash 546), buy 45 @12 (cash 6).
+        self.assertEqual(data.iloc[-1]["账户净值"], 25 * 12.0 + 45 * 12.0 + 6)
+        self.assertEqual(result.trades.iloc[0]["原因"], "建立25%底仓，一直持有")
+        self.assertEqual(result.summary["底仓比例(%)"], 25)
+        self.assertEqual(result.summary["已平仓交易次数"], 1)
+        self.assertEqual(result.summary["持仓天数"], 3)
+
+    def test_ma_timing_calendar_year_table_chains_to_total_return(self):
+        from services.fund_rotation_summary import build_timing_calendar_year_table
+
+        dates = pd.bdate_range("2023-10-02", "2026-03-31")
+        steps = np.sin(np.arange(len(dates)) / 9.0) * 0.006 + 0.0002
+        prices = pd.Series(10 * np.cumprod(1 + steps))
+        fund = RotationInput("X", "X", pd.DataFrame({"trade_date": dates, "open": prices, "close": prices}))
+        result = run_ma20_timing_backtest(fund, ma_period=5, threshold_pct=0.5, lot_size=1, base_position_pct=25)
+
+        yearly = build_timing_calendar_year_table(result.data, result.trades, 100000.0)
+
+        self.assertEqual(yearly["年份"].tolist(), [2023, 2024, 2025, 2026])
+        self.assertEqual(yearly.iloc[0]["实际开始"], "2023-10-02")
+        chained = np.prod(1 + yearly["策略收益率(%)"] / 100) - 1
+        self.assertAlmostEqual(chained * 100, result.summary["总收益率(%)"], delta=0.05)
+        chained_hold = np.prod(1 + yearly["一直持有收益率(%)"] / 100) - 1
+        self.assertAlmostEqual(chained_hold * 100, result.summary["一直持有收益率(%)"], delta=0.05)
+        self.assertEqual(int(yearly["交易次数"].sum()), len(result.trades))
+        self.assertTrue((yearly["策略最大回撤(%)"] <= 0).all())
+
+    def test_ma_timing_full_base_never_trades_and_matches_hold(self):
+        dates = pd.bdate_range("2026-01-01", periods=5)
+        prices = pd.Series([10.0, 12.0, 9.0, 13.0, 8.0])
+        fund = RotationInput("X", "X", pd.DataFrame({"trade_date": dates, "open": prices, "close": prices}))
+
+        result = run_ma20_timing_backtest(
+            fund, ma_period=2, initial_capital=1000, transaction_cost=0.0, lot_size=1,
+            base_position_pct=100,
+        )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.summary["总收益率(%)"], result.summary["一直持有收益率(%)"])
+        with self.assertRaises(ValueError):
+            run_ma20_timing_backtest(fund, ma_period=2, base_position_pct=120)
 
     def test_ma_drawdown_and_risk_metrics_include_initial_capital(self):
         dates = pd.bdate_range("2026-01-01", periods=8)

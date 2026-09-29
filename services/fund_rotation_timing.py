@@ -355,6 +355,7 @@ def run_ma20_timing_backtest(
     lot_size: int = 100,
     start_date: str | pd.Timestamp | None = None,
     end_date: str | pd.Timestamp | None = None,
+    base_position_pct: float = 0.0,
 ) -> TimingBacktestResult:
     if ma_period < 1:
         raise ValueError("均线周期必须大于 0。")
@@ -362,13 +363,15 @@ def run_ma20_timing_backtest(
         raise ValueError("触发阈值不能为负数。")
     if initial_capital <= 0:
         raise ValueError("初始资金必须大于 0。")
+    if not 0 <= base_position_pct <= 100:
+        raise ValueError("底仓比例必须在 0% 到 100% 之间。")
 
     data = fund.dataframe[["trade_date", "close"]].copy()
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce")
     data["close"] = pd.to_numeric(data["close"], errors="coerce")
     data = data.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
     if len(data) < ma_period:
-        raise ValueError("数据长度不足，无法计算 MA20 策略。")
+        raise ValueError(f"数据长度不足，无法计算 MA{ma_period} 策略。")
 
     ma_col = f"MA{ma_period}"
     data[ma_col] = data["close"].rolling(window=ma_period).mean()
@@ -383,7 +386,12 @@ def run_ma20_timing_backtest(
     if not data[ma_col].notna().any():
         raise ValueError("所选时间区间内均线尚未形成，请扩大区间或缩短均线周期。")
 
-    cash = float(initial_capital)
+    # The base sleeve is bought at the first close and never traded again; its lot
+    # residue stays in its own cash so the timing sleeve never exceeds its share.
+    base_capital = float(initial_capital) * float(base_position_pct) / 100
+    base_cash = base_capital
+    base_shares = 0.0
+    cash = float(initial_capital) - base_capital
     shares = 0.0
     position_cost_basis = 0.0
     total_buy_cost = 0.0
@@ -393,9 +401,33 @@ def run_ma20_timing_backtest(
     trades: list[dict[str, object]] = []
     benchmark_first_close = float(data["close"].iloc[0])
 
-    for _, row in data.iterrows():
+    for row_index, row in data.iterrows():
         trade_date = pd.Timestamp(row["trade_date"])
         close_price = float(row["close"])
+        base_action = ""
+        if row_index == 0 and base_capital > 0:
+            affordable_base = base_cash / (close_price * (1 + transaction_cost)) if close_price > 0 else 0.0
+            base_shares = _round_lot_shares(affordable_base, lot_size=lot_size)
+            if base_shares > 0:
+                gross_value = base_shares * close_price
+                cost = gross_value * transaction_cost
+                base_cash -= gross_value + cost
+                total_buy_cost += cost
+                base_action = "建立底仓"
+                trades.append(
+                    {
+                        "日期": trade_date,
+                        "操作": "买入",
+                        "成交价": round(close_price, 4),
+                        "份额": round(base_shares, 2),
+                        "成交金额": round(gross_value, 2),
+                        "手续费": round(cost, 2),
+                        "本次交易盈亏金额": None,
+                        "本次交易盈亏率(%)": None,
+                        "现金余额": round(cash + base_cash, 2),
+                        "原因": f"建立{float(base_position_pct):g}%底仓，一直持有",
+                    }
+                )
         ma_raw = pd.to_numeric(row[ma_col], errors="coerce")
         if pd.isna(ma_raw):
             ma_value = np.nan
@@ -440,7 +472,7 @@ def run_ma20_timing_backtest(
                         "手续费": round(cost, 2),
                         "本次交易盈亏金额": None,
                         "本次交易盈亏率(%)": None,
-                        "现金余额": round(cash, 2),
+                        "现金余额": round(cash + base_cash, 2),
                         "原因": f"收盘价 {close_price:.4f} > 买入线 {buy_line:.4f}",
                     }
                 )
@@ -464,14 +496,16 @@ def run_ma20_timing_backtest(
                     "手续费": round(cost, 2),
                     "本次交易盈亏金额": round(realized_pnl, 2),
                     "本次交易盈亏率(%)": round(realized_return, 2),
-                    "现金余额": round(cash, 2),
+                    "现金余额": round(cash + base_cash, 2),
                     "原因": f"收盘价 {close_price:.4f} < 卖出线 {sell_line:.4f}",
                 }
             )
             shares = 0.0
             position_cost_basis = 0.0
 
-        account_value = cash + shares * close_price
+        if base_action:
+            action = base_action if action in {"等待", "持有"} else f"{base_action}；择时{action}"
+        account_value = cash + base_cash + (shares + base_shares) * close_price
         benchmark_value = close_price / benchmark_first_close * initial_capital if benchmark_first_close > 0 else initial_capital
         rows.append(
             {
@@ -482,8 +516,10 @@ def run_ma20_timing_backtest(
                 "卖出线": round(sell_line, 4),
                 "信号": signal,
                 "操作": action,
-                "持仓份额": round(shares, 2),
-                "现金余额": round(cash, 2),
+                "持仓份额": round(shares + base_shares, 2),
+                "底仓份额": round(base_shares, 2),
+                "择时份额": round(shares, 2),
+                "现金余额": round(cash + base_cash, 2),
                 "账户净值": round(account_value, 2),
                 "策略累计收益率(%)": round((account_value / initial_capital - 1) * 100, 2),
                 "一直持有净值": round(benchmark_value, 2),
@@ -506,6 +542,7 @@ def run_ma20_timing_backtest(
         total_buy_cost=total_buy_cost,
         total_sell_cost=total_sell_cost,
         realized_trade_pnls=realized_trade_pnls,
+        base_position_pct=base_position_pct,
     )
     return TimingBacktestResult(
         start_date=pd.Timestamp(result_df["日期"].iloc[0]),
