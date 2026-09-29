@@ -18,6 +18,7 @@ from components.position_table import (
 from core.return_calendar import render_return_calendar
 from core.ui import (
     DEFAULT_CHART_HEIGHT,
+    adaptive_bar_width,
     apply_plotly_layout,
     build_sparse_trading_date_ticks,
     filter_by_time_range,
@@ -265,6 +266,7 @@ def render_position_timing_performance(
             x=chart_dates,
             y=daily["每日盈亏"],
             name="每日盈亏",
+            width=adaptive_bar_width(len(chart_dates)),
             marker_color=bar_colors,
             customdata=daily[["每日收益率(%)", "累计盈亏", "累计收益率(%)"]],
             hovertemplate=(

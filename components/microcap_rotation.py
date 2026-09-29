@@ -3,7 +3,7 @@ import json
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from core.ui import apply_plotly_layout
+from core.ui import adaptive_category_range, apply_plotly_layout, build_sparse_trading_date_ticks
 from services import microcap_rotation as service
 
 def table(rows):
@@ -40,17 +40,41 @@ def charts(rows):
     if common.empty:
         st.info("暂无共同区间。")
         return
-    st.caption(f"共同区间：{common.index[0]} 至 {common.index[-1]}；净值均以22万元为基准。")
+    st.caption(f"共同区间：{common.index[0]} 至 {common.index[-1]}；净值均以22万元为基准；横坐标仅排列交易日，非交易日已自动跳过。")
     nav,dd=st.tabs(["净值","回撤"])
+    common_dates=[str(d) for d in common.index]
+    tickvals,ticktext=build_sparse_trading_date_ticks(common_dates,max_ticks=7)
+    x_range=adaptive_category_range(len(common_dates),min_slots=20)
     for panel,drawdown in ((nav,False),(dd,True)):
         with panel:
             fig=go.Figure()
+            all_y=[]
             for s in common.columns:
                 y=(common[s]/common[s].cummax().clip(lower=220000)-1)*100 if drawdown else common[s]/220000
-                fig.add_trace(go.Scatter(x=common.index,y=y,name=s+" "+service.NAMES[s],
+                all_y.extend(y.tolist())
+                fig.add_trace(go.Scatter(x=common_dates,y=y,name=s+" "+service.NAMES[s],
                                         text=[f"{v:.2f}%" if drawdown else f"{v:.4f}" for v in y],
                                         hovertemplate="%{x}<br>%{text}<extra>%{fullData.name}</extra>"))
             apply_plotly_layout(fig,height=380)
+            fig.update_xaxes(
+                type="category",
+                categoryorder="array",
+                categoryarray=common_dates,
+                tickmode="array",
+                tickvals=tickvals,
+                ticktext=ticktext,
+                range=x_range,
+            )
+            if all_y:
+                y_min,y_max=min(all_y),max(all_y)
+                if drawdown:
+                    fig.update_yaxes(range=[min(-5.0, y_min * 1.15), 0.5])
+                else:
+                    span=y_max-y_min
+                    if span<0.05:
+                        mid=(y_min+y_max)/2
+                        half_span=max(0.025,span*0.6)
+                        fig.update_yaxes(range=[round(mid-half_span,4),round(mid+half_span,4)])
             st.plotly_chart(fig,width="stretch")
 
 def daily(view):

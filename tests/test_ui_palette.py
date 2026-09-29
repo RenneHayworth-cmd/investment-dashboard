@@ -14,10 +14,44 @@ from core.ui import (
     PRIMARY_COLOR,
     UP_COLOR,
     UP_TEXT_COLOR,
+    adaptive_bar_width,
+    adaptive_category_range,
     pnl_color,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class AdaptiveBarWidthTests(unittest.TestCase):
+    def test_few_days_scale_linearly_to_prevent_giant_bars(self):
+        self.assertEqual(adaptive_bar_width(1), 0.03)
+        self.assertEqual(adaptive_bar_width(3), 0.09)
+        self.assertEqual(adaptive_bar_width(5), 0.15)
+        self.assertEqual(adaptive_bar_width(10), 0.3)
+
+    def test_many_days_capped_at_max_category_width(self):
+        self.assertEqual(adaptive_bar_width(20), 0.6)
+        self.assertEqual(adaptive_bar_width(50), 0.6)
+        self.assertEqual(adaptive_bar_width(250), 0.6)
+
+    def test_empty_or_zero_returns_max_category_width(self):
+        self.assertEqual(adaptive_bar_width(0), 0.6)
+        self.assertEqual(adaptive_bar_width(-1), 0.6)
+
+
+class AdaptiveCategoryRangeTests(unittest.TestCase):
+    def test_few_days_return_min_slots_range(self):
+        self.assertEqual(adaptive_category_range(1), [-0.5, 19.5])
+        self.assertEqual(adaptive_category_range(3), [-0.5, 19.5])
+        self.assertEqual(adaptive_category_range(19), [-0.5, 19.5])
+
+    def test_many_days_return_none(self):
+        self.assertIsNone(adaptive_category_range(20))
+        self.assertIsNone(adaptive_category_range(50))
+
+    def test_empty_or_zero_returns_none(self):
+        self.assertIsNone(adaptive_category_range(0))
+        self.assertIsNone(adaptive_category_range(-1))
 
 
 class PnlColorTests(unittest.TestCase):

@@ -34,6 +34,41 @@ def pnl_color(value: object, *, up: str = UP_COLOR, down: str = DOWN_COLOR, flat
     return up if float(number) > 0 else down
 
 
+def adaptive_bar_width(
+    count: int,
+    *,
+    max_category_width: float = 0.6,
+    max_chart_ratio: float = 0.03,
+    min_width: float = 0.03,
+) -> float:
+    """Calculate an adaptive bar width for discrete categorical x-axes.
+
+    Prevents bars from blowing up into massive rectangles when there are only
+    a few trading days (e.g. 1-10 days), while smoothly allowing normal 60%
+    category filling when there are many days.
+    """
+    if count <= 0:
+        return max_category_width
+    return round(min(max_category_width, max(min_width, max_chart_ratio * count)), 4)
+
+
+def adaptive_category_range(
+    count: int,
+    min_slots: int = 20,
+) -> list[float] | None:
+    """Return a category axis range ensuring at least min_slots width when data points are few.
+
+    Prevents lines and markers from stretching across the entire width of the chart
+    when there are only a few trading days (e.g. 1-10 days), giving a natural
+    and stable visual proportion (1/20 per trading day).
+    """
+    if count <= 0:
+        return None
+    if count < min_slots:
+        return [-0.5, min_slots - 0.5]
+    return None
+
+
 def apply_global_style() -> None:
     st.markdown(
         """

@@ -57,4 +57,46 @@ class RotationUITests(unittest.TestCase):
                 self.assertFalse(app.error)
                 update.assert_not_called()
 
+    def test_charts_discrete_trading_day_axes(self):
+        import json
+        rows = [
+            {"date": "2026-09-23", "strategy": "A", "equity": 220000.0},
+            {"date": "2026-09-24", "strategy": "A", "equity": 219780.0},
+            {"date": "2026-09-28", "strategy": "A", "equity": 218328.0},
+            {"date": "2026-09-23", "strategy": "D", "equity": 219912.0},
+            {"date": "2026-09-24", "strategy": "D", "equity": 219318.0},
+            {"date": "2026-09-28", "strategy": "D", "equity": 217844.0},
+        ]
+        test_script = """
+import streamlit as st
+from components.microcap_rotation import charts
+charts(st.session_state["rows"])
+"""
+        app = AppTest.from_string(test_script)
+        app.session_state["rows"] = rows
+        app.run()
+        self.assertFalse(app.exception)
+        charts_rendered = app.get("plotly_chart")
+        self.assertEqual(len(charts_rendered), 2)
+        for chart_element in charts_rendered:
+            spec = json.loads(chart_element.proto.spec)
+            xaxis = spec.get("layout", {}).get("xaxis", {})
+            self.assertEqual(xaxis.get("type"), "category")
+            self.assertEqual(xaxis.get("categoryarray"), ["2026-09-23", "2026-09-24", "2026-09-28"])
+            self.assertEqual(xaxis.get("tickvals"), ["2026-09-23", "2026-09-24", "2026-09-28"])
+            self.assertEqual(xaxis.get("range"), [-0.5, 19.5])
+
+        # Nav chart has minimum vertical buffer centered around values
+        nav_spec = json.loads(charts_rendered[0].proto.spec)
+        nav_yrange = nav_spec.get("layout", {}).get("yaxis", {}).get("range")
+        self.assertIsNotNone(nav_yrange)
+        self.assertLessEqual(nav_yrange[0], 0.98)
+        self.assertGreaterEqual(nav_yrange[1], 1.01)
+
+        # Drawdown chart has minimum -5.0% floor
+        dd_spec = json.loads(charts_rendered[1].proto.spec)
+        dd_yrange = dd_spec.get("layout", {}).get("yaxis", {}).get("range")
+        self.assertEqual(dd_yrange, [-5.0, 0.5])
+
+
 if __name__=="__main__": unittest.main()
