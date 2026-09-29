@@ -305,21 +305,28 @@ def get_index_data_from_eastmoney_kline(
     }
     last_error = None
     payload = None
-    for trust_env in (False, True):
-        session = requests.Session()
-        session.trust_env = trust_env
+    # Failures move between hosts (and between https/http) from minute to minute
+    # when calling from outside mainland China, so try every host on both schemes.
+    routes = [
+        (host, scheme)
         for host in (
             "push2his.eastmoney.com",
             "91.push2his.eastmoney.com",
             "45.push2his.eastmoney.com",
             "7.push2his.eastmoney.com",
-        ):
+        )
+        for scheme in ("https", "http")
+    ]
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        for host, scheme in routes:
             try:
                 response = session.get(
-                    f"https://{host}/api/qt/stock/kline/get",
+                    f"{scheme}://{host}/api/qt/stock/kline/get",
                     params=params,
                     headers=headers,
-                    timeout=10,
+                    timeout=(5, 10),
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -327,6 +334,7 @@ def get_index_data_from_eastmoney_kline(
                     break
             except Exception as exc:
                 last_error = exc
+                payload = None
         if payload is not None and payload.get("data"):
             break
     if payload is None:

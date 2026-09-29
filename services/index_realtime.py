@@ -585,6 +585,118 @@ def _normalize_timestamp(value, timezone_name: str) -> datetime:
     return datetime.fromtimestamp(timestamp_value, tz=timezone.utc).astimezone(ZoneInfo(timezone_name))
 
 
+TENCENT_QUOTE_MARKETS = {"1": "sh", "0": "sz"}
+EASTMONEY_HISTORY_HOSTS = (
+    "push2his.eastmoney.com",
+    "91.push2his.eastmoney.com",
+    "45.push2his.eastmoney.com",
+    "7.push2his.eastmoney.com",
+)
+
+
+def _fetch_tencent_index_quote(secid: str, timezone_name: str) -> dict[str, object] | None:
+    """Exchange index quote from Tencent; used when every EastMoney quote host fails.
+
+    From the overseas server EastMoney quote hosts answer 502 or drop the
+    connection, while qt.gtimg.cn is reliable. EastMoney-only boards (``90.BK...``)
+    are not listed there.
+    """
+    market, _, code = secid.partition(".")
+    prefix = TENCENT_QUOTE_MARKETS.get(market)
+    if not prefix or not code.isdigit():
+        return None
+    import requests
+
+    try:
+        response = requests.get(
+            f"https://qt.gtimg.cn/q={prefix}{code}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        text = response.content.decode("gbk", errors="replace")
+    except Exception:
+        return None
+    matched = re.search(r'="([^"]*)"', text)
+    fields = matched.group(1).split("~") if matched else []
+    if len(fields) < 33 or fields[2] != code:
+        return None
+    price = pd.to_numeric(fields[3], errors="coerce")
+    if pd.isna(price) or float(price) <= 0:
+        return None
+    try:
+        quote_time = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo(timezone_name))
+    except ValueError:
+        return None
+    previous_close = pd.to_numeric(fields[4], errors="coerce")
+    change_pct = pd.to_numeric(fields[32], errors="coerce")
+    return {
+        "price": float(price),
+        "previous_close": None if pd.isna(previous_close) else float(previous_close),
+        "change_pct": None if pd.isna(change_pct) else float(change_pct),
+        "volume": None,
+        "position": None,
+        "quote_time": quote_time,
+        "source": "腾讯行情",
+    }
+
+
+def _fetch_eastmoney_board_trend_quote(secid: str, timezone_name: str) -> dict[str, object] | None:
+    """Latest minute point of an EastMoney board (e.g. BK1158) from the trends2 API.
+
+    Boards exist only on EastMoney. When its quote hosts fail, the history hosts
+    still often answer; rotate hosts and schemes because failures move between
+    them from minute to minute.
+    """
+    import requests
+
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f53",
+        "ndays": "1",
+        "iscr": "0",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+    for host in EASTMONEY_HISTORY_HOSTS:
+        for scheme in ("https", "http"):
+            try:
+                response = requests.get(
+                    f"{scheme}://{host}/api/qt/stock/trends2/get",
+                    params=params,
+                    headers=headers,
+                    timeout=(4, 6),
+                )
+                response.raise_for_status()
+                data = response.json().get("data") or {}
+            except Exception:
+                continue
+            trends = data.get("trends") or []
+            if not trends:
+                continue
+            stamp, _, value = str(trends[-1]).partition(",")
+            price = pd.to_numeric(value.split(",")[0], errors="coerce")
+            try:
+                quote_time = datetime.strptime(stamp, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(timezone_name))
+            except ValueError:
+                continue
+            if pd.isna(price) or float(price) <= 0:
+                continue
+            previous_close = pd.to_numeric(data.get("preClose"), errors="coerce")
+            has_previous = not pd.isna(previous_close) and float(previous_close) > 0
+            return {
+                "price": float(price),
+                "previous_close": float(previous_close) if has_previous else None,
+                "change_pct": (float(price) / float(previous_close) - 1) * 100 if has_previous else None,
+                "volume": None,
+                "position": None,
+                "quote_time": quote_time,
+                "source": "东方财富分时",
+            }
+    return None
+
+
 def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | None:
     if index_name == "恒生港股通高息低波":
         sina_quote = fetch_sina_hk_realtime_quote("HSHYLV")
@@ -640,6 +752,13 @@ def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | N
                 "quote_time": quote_time,
                 "source": "东方财富",
             }
+    fallback = (
+        _fetch_eastmoney_board_trend_quote(secid, timezone_name)
+        if secid.startswith("90.")
+        else _fetch_tencent_index_quote(secid, timezone_name)
+    )
+    if fallback is not None:
+        return fallback
     if index_name == "恒生港股通高息低波":
         config = INDEX_CONFIG[index_name]
         try:
