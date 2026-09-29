@@ -61,6 +61,7 @@ class MicrocapLivePageTests(unittest.TestCase):
                     {"600000": pd.DataFrame({"date": [today], "close": [10.5]})}, {}
                 )),
                 patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=None),
                 patch("components.microcap_live.rotation._load_snapshots", return_value=pd.DataFrame()),
             ):
                 app = AppTest.from_file(str(page_path), default_timeout=30).run()
@@ -96,6 +97,7 @@ class MicrocapLivePageTests(unittest.TestCase):
             with (
                 patch("components.microcap_live.dashboard.load_microcap_histories", return_value=(histories, {})),
                 patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=None),
                 patch("components.microcap_live.rotation._load_snapshots", return_value=pd.DataFrame()),
             ):
                 app = AppTest.from_file(str(page_path), default_timeout=30).run()
@@ -142,6 +144,7 @@ class MicrocapLivePageTests(unittest.TestCase):
             with (
                 patch("components.microcap_live.dashboard.load_microcap_histories", return_value=({}, {})),
                 patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=None),
                 patch("components.microcap_live.rotation._market_open", return_value=False),
                 patch("components.microcap_live.rotation._load_snapshots", return_value=self._rotation_snapshots("2026-09-24")),
                 patch("components.microcap_live.rotation.fetch_microcap_stocks") as fetch_mock,
@@ -172,6 +175,7 @@ class MicrocapLivePageTests(unittest.TestCase):
             with (
                 patch("components.microcap_live.dashboard.load_microcap_histories", return_value=({}, {})),
                 patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=None),
                 patch("components.microcap_live.rotation._market_open", return_value=True),
                 patch("components.microcap_live.rotation._load_snapshots", return_value=self._rotation_snapshots("2026-09-24")),
                 patch("components.microcap_live.rotation.fetch_microcap_stocks", return_value=live) as fetch_mock,
@@ -202,6 +206,7 @@ class MicrocapLivePageTests(unittest.TestCase):
             with (
                 patch("components.microcap_live.dashboard.load_microcap_histories", return_value=({}, {})),
                 patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=None),
                 patch("components.microcap_live.rotation._market_open", return_value=True),
                 patch("components.microcap_live.rotation._load_snapshots", return_value=self._rotation_snapshots("2026-09-24")),
                 patch("components.microcap_live.rotation.fetch_microcap_stocks", return_value=live),
@@ -219,3 +224,57 @@ class MicrocapLivePageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MicrocapLiveLunchValuationTests(unittest.TestCase):
+    """Lunch and 15:00-to-formal-close must value holdings at today's quotes, not yesterday's close."""
+
+    def _run(self, *, now, phase, histories, quote_price):
+        from core.db import init_db
+        from services.microcap_live_trading import add_microcap_cash_flow, add_microcap_trade
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        database_path = Path(temp_dir.name) / "cache.db"
+        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        quotes = {"600000": {"price": quote_price, "quote_time": now.replace(hour=11, minute=30), "source": "测试报价", "status": "实时"}}
+        with patch("core.db.DB_PATH", database_path), patch("core.db.ensure_dirs"):
+            init_db()
+            add_microcap_cash_flow(flow_date="2026-09-22", entry_type="期初资金", amount=10000)
+            add_microcap_trade(trade_date="2026-09-22", symbol="600000", name="浦发银行", side="买入", price=10, quantity=500)
+            with (
+                patch("components.microcap_live.dashboard.datetime", FixedDateTime),
+                patch("components.microcap_live.dashboard.quote_phase", return_value=phase),
+                patch("components.microcap_live.dashboard._market_open", return_value=False),
+                patch("components.microcap_live.dashboard.load_microcap_histories", return_value=(histories, {})),
+                patch("components.microcap_live.dashboard.fetch_microcap_realtime_quotes", return_value=(quotes, {})) as fetch,
+                patch("components.microcap_live.rotation._load_snapshots", return_value=pd.DataFrame()),
+            ):
+                app = AppTest.from_file(str(page_path), default_timeout=30).run()
+                app.run()  # a rerun inside the lunch break
+        self.assertEqual(list(app.exception), [])
+        return app, fetch
+
+    def test_lunch_values_holdings_at_the_morning_close_and_fetches_once(self):
+        now = datetime(2026, 9, 29, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        histories = {"600000": pd.DataFrame({"date": ["2026-09-24", "2026-09-28"], "close": [10.2, 10.0]})}
+        app, fetch = self._run(now=now, phase="lunch", histories=histories, quote_price=10.8)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertTrue(any("5,400.00" in metric.value for metric in app.metric))  # 500 x 10.8, not 500 x 10.0
+        self.assertIn("午间休市", " ".join(item.value for item in app.caption))
+
+    def test_after_close_keeps_quotes_until_todays_formal_close_exists(self):
+        now = datetime(2026, 9, 29, 15, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
+        without_today = {"600000": pd.DataFrame({"date": ["2026-09-28"], "close": [10.0]})}
+        app, fetch = self._run(now=now, phase="after_close", histories=without_today, quote_price=10.8)
+        self.assertGreaterEqual(fetch.call_count, 1)
+        self.assertTrue(any("5,400.00" in metric.value for metric in app.metric))
+        with_today = {"600000": pd.DataFrame({"date": ["2026-09-28", "2026-09-29"], "close": [10.0, 10.6]})}
+        app, fetch = self._run(now=now.replace(hour=16), phase="after_close", histories=with_today, quote_price=10.8)
+        fetch.assert_not_called()
+        self.assertTrue(any("5,300.00" in metric.value for metric in app.metric))  # formal 10.6

@@ -294,14 +294,32 @@ def _close_snapshots(
     return result, "; ".join(errors)
 
 
-def _is_open(market_now: datetime) -> bool:
+def quote_phase(market_now: datetime) -> str | None:
+    """Where a trading day stands for transient valuation quotes.
+
+    ``session`` while trading, ``lunch`` between the two sessions, ``after_close``
+    from 15:00 on; ``None`` before the open and on non-trading days. Quotes stay
+    useful at lunch (the morning close) and after 15:00 until the formal close
+    lands, so neither phase should fall back to the previous day's close.
+    """
     market = get_market_window("A股")
     if not market_now.tzinfo:
         market_now = market_now.replace(tzinfo=TZ)
-    if not any(start <= market_now.time().replace(tzinfo=None) < end for start, end in market.sessions):
-        return False
     from services.market_calendar import is_market_trading_day
-    return is_market_trading_day(market, market_now)
+    if not is_market_trading_day(market, market_now):
+        return None
+    now_time = market_now.time().replace(tzinfo=None)
+    if any(start <= now_time < end for start, end in market.sessions):
+        return "session"
+    if now_time < market.sessions[0][0]:
+        return None
+    if now_time >= market.sessions[-1][1]:
+        return "after_close"
+    return "lunch"
+
+
+def _is_open(market_now: datetime) -> bool:
+    return quote_phase(market_now) == "session"
 
 
 def _code_from_tickflow(value) -> str | None:
@@ -455,7 +473,7 @@ def fetch_microcap_realtime_quotes(
     """Fetch transient intraday marks. This function never writes them to cache."""
     current = market_now or datetime.now(TZ)
     codes = sorted({str(code).zfill(6) for code in symbols if str(code).strip()})
-    if not codes or not _is_open(current):
+    if not codes or quote_phase(current) is None:
         return {}, {}
     quotes, failures = {}, {}
     errors = []

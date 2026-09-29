@@ -23,7 +23,12 @@ from core.ui import (
 from components.live_record.tables import render_live_positions_table
 from core.return_calendar import render_return_calendar
 from services.market_calendar import get_market_window, is_market_trading_day
-from services.microcap_live_market import fetch_microcap_realtime_quotes, load_microcap_histories, microcap_target_date
+from services.microcap_live_market import (
+    fetch_microcap_realtime_quotes,
+    load_microcap_histories,
+    microcap_target_date,
+    quote_phase,
+)
 from services.microcap_live_trading import (
     build_microcap_account_snapshot,
     build_microcap_positions,
@@ -161,15 +166,32 @@ def render_microcap_dashboard() -> None:
         quote_age = 999999
     quote_failures = quote_state.get("failures", {})
     quotes = quote_state.get("quotes", {})
-    if _market_open(current) and codes and quote_age >= 110:
+    held = build_microcap_positions(trades, adjustments).get("symbol", pd.Series(dtype=str)).astype(str).tolist()
+    phase = quote_phase(current)
+    today = current.date().isoformat()
+    formal_today_missing = [
+        code for code in held
+        if code not in histories or histories[code].empty or str(histories[code]["date"].max()) < today
+    ]
+    # Lunch keeps the morning close; after 15:00 keep same-day quotes until every
+    # held symbol has today's formal close, never falling back to yesterday.
+    use_quotes = phase in {"session", "lunch"} or (phase == "after_close" and bool(formal_today_missing))
+    fetched_today = not pd.isna(quote_fetched_at) and quote_fetched_at.date() == current.date()
+    if phase == "lunch":
+        lunch_start = current.replace(hour=11, minute=30, second=0, microsecond=0)
+        have_lunch_close = fetched_today and quote_fetched_at >= lunch_start
+        refresh_due = not have_lunch_close or (bool(quote_failures) and quote_age >= 600)
+    else:
+        refresh_due = quote_age >= 110
+    if use_quotes and held and refresh_due:
         quotes, quote_failures = fetch_microcap_realtime_quotes(
-            build_microcap_positions(trades, adjustments).get("symbol", pd.Series(dtype=str)).tolist(),
+            held,
             api_key=st.session_state.get("microcap_live_tickflow_key", os.getenv("TICKFLOW_API_KEY", "")), market_now=current,
         )
         quote_state = {"fetched_at": current.isoformat(), "quotes": quotes, "failures": quote_failures}
         st.session_state["microcap_live_quote_state"] = quote_state
-    elif not _market_open(current):
-        quotes = {}
+    elif not use_quotes:
+        quotes, quote_failures = {}, {}
 
     snapshot = build_microcap_account_snapshot(
         trades, flows, adjustments, histories, quotes=quotes, market_now=current,
@@ -193,7 +215,11 @@ def render_microcap_dashboard() -> None:
     if failures:
         for code, error in failures.items():
             st.warning(f"{code} 行情不完整：{error}")
-    if quote_failures and _market_open(current):
+    if use_quotes and quotes and phase == "lunch":
+        st.caption("午间休市：持仓按上午收盘价估值，13:00 起恢复盘中报价。")
+    elif use_quotes and quotes and phase == "after_close":
+        st.caption("已收盘：今日正式收盘价尚未全部入库，持仓暂按收盘时的报价估值。")
+    if quote_failures and use_quotes:
         st.caption("盘中报价未覆盖：" + "；".join(f"{code}：{error}" for code, error in quote_failures.items()))
     for warning in snapshot["warnings"]:
         st.warning(warning)

@@ -362,3 +362,34 @@ class MicrocapLiveMarketTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_quote_phase_covers_lunch_and_after_close():
+    tz = ZoneInfo("Asia/Shanghai")
+    at = lambda h, m, day=29: market.quote_phase(datetime(2026, 9, day, h, m, tzinfo=tz))
+    assert at(9, 15) is None            # before the open
+    assert at(10, 0) == "session"
+    assert at(11, 30) == "lunch"
+    assert at(12, 59) == "lunch"
+    assert at(13, 0) == "session"
+    assert at(15, 0) == "after_close"
+    assert at(16, 30) == "after_close"
+    assert at(12, 0, day=25) is None    # Mid-Autumn holiday
+    assert at(12, 0, day=27) is None    # Sunday
+
+
+def test_quotes_are_fetched_during_lunch():
+    current = datetime(2026, 9, 29, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    lunch_close = {"600000": {"price": 10.5, "quote_time": current.replace(hour=11, minute=30), "source": "t", "status": "实时"}}
+    with patch("services.microcap_live_market._tickflow_quotes", return_value=lunch_close) as tickflow:
+        quotes, failures = market.fetch_microcap_realtime_quotes(["600000"], api_key="k", market_now=current)
+    tickflow.assert_called_once()
+    assert quotes["600000"]["price"] == 10.5 and not failures
+
+
+def test_no_quote_request_before_the_open():
+    with patch("services.microcap_live_market._tickflow_quotes") as tickflow:
+        quotes, failures = market.fetch_microcap_realtime_quotes(
+            ["600000"], api_key="k", market_now=datetime(2026, 9, 29, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")))
+    tickflow.assert_not_called()
+    assert (quotes, failures) == ({}, {})
