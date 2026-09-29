@@ -152,16 +152,9 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
         self.assertTrue(result.actions.empty)
 
     def test_notification_slots_and_state_round_trip(self):
-        expected_slots = ("09:45", "11:45", "13:45", "14:50", "14:54")
-        for slot in expected_slots:
-            hour, minute = (int(value) for value in slot.split(":"))
-            self.assertEqual(
-                alert_slot(self.market_now.replace(hour=hour, minute=minute)),
-                slot,
-            )
-        self.assertIsNone(
-            alert_slot(self.market_now.replace(hour=14, minute=51))
-        )
+        self.assertEqual(alert_slot(self.market_now.replace(hour=14, minute=50)), "14:50")
+        for hour, minute in ((9, 45), (11, 45), (13, 45), (14, 51), (14, 54)):
+            self.assertIsNone(alert_slot(self.market_now.replace(hour=hour, minute=minute)))
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "state.json"
             state = PositionTimingNotificationState(
@@ -176,7 +169,7 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
             save_notification_state(state, path)
             self.assertEqual(load_notification_state(path), state)
 
-    def test_no_action_message_states_that_later_checks_continue(self):
+    def test_no_action_message_says_1450_is_the_only_notice(self):
         preview = position.PositionTimingTradePreviewResult(
             formal_date="2026-08-27",
             preview_date="2026-08-28",
@@ -185,16 +178,14 @@ class PositionTimingTradeAlertTests(unittest.TestCase):
         title, description, outcome = format_notification(preview, slot="14:50")
         self.assertEqual(outcome, "no_action")
         self.assertIn("今日无需操作", title)
-        self.assertIn("14:54仍会继续检查行情", description)
-        self.assertIn("不再重复", description)
+        self.assertIn("今日唯一一次提醒", description)
+        self.assertNotIn("14:54", description)
 
-        later_title, later_description, later_outcome = format_notification(
-            preview,
-            slot="14:54",
-        )
-        self.assertEqual(later_outcome, "no_action")
-        self.assertIn("14:54当前无需操作", later_title)
-        self.assertIn("后续时点仍会继续检查", later_description)
+        # A manual --force run at another time is labelled as such.
+        manual_title, manual_description, manual_outcome = format_notification(preview, slot="10:12")
+        self.assertEqual(manual_outcome, "no_action")
+        self.assertIn("10:12当前无需操作", manual_title)
+        self.assertIn("每日仅在14:50发送", manual_description)
 
     def test_1450_no_action_only_suppresses_later_no_action_messages(self):
         state = PositionTimingNotificationState(

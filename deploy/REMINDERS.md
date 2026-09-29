@@ -22,7 +22,7 @@ true/1/yes/on 表示开启；无效值报错并停止，不会默默打开。
 
 当前生产状态（2026-09-29 登录服务器核对）：迁移已完成。Lightsail
 `reminder.env` 为 `ENABLE_FANGTANG=true`、`ENABLE_WECHAT=false`、`REMINDER_DRY_RUN=false`，
-09:45 等时点已在实际发送方糖；随后又加入 `ENABLE_WXPUSHER=true`（SPT token 只在服务器
+已在实际发送方糖；随后又加入 `ENABLE_WXPUSHER=true`（SPT token 只在服务器
 `reminder.env` 里，不进 Git）。Windows 任务显式设置 Fangtang=false、WeChat=true、
 WxPusher=false，方糖不会双发，WxPusher 只由 Lightsail 发送。升级旧代码时缺少开关将停止发送，
 务必同步设置 Windows 任务环境。WxPusher 收件人由 token 决定，不由发送机器决定：手机、
@@ -98,7 +98,7 @@ ETF 动作键：交易日 | ETF500K | preview | 正式持仓基准日 | 策略�
 实际安装入口：`bash deploy/install-etf-reminder.sh`。初次只创建禁用发送的 dry-run 配置；
 再次安装保留私有配置。服务不依赖 Docker 重建，使用仓库 `.venv`。
 
-`position-etf-reminder.timer` 每天上海时间 09:45、11:45、13:45、14:50、14:54 触发。
+`position-etf-reminder.timer` 每天上海时间 14:50 触发一次（2026-09-29 起；此前为 09:45、11:45、13:45、14:50、14:54 五个时点）。
 Python 仍调用原交易日判断，节假日跳过；不补跑停机期间错过的盘中时点。
 宿主机可保持 UTC，timer 的 OnCalendar 和 Python 均明确 Asia/Shanghai。
 `position-etf-reminder.service` 为 oneshot，结束退出，不常驻；CPU 上限半个核，

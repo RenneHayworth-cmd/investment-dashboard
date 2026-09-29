@@ -1,12 +1,8 @@
 [Unit]
-Description=ETF original five daily notification slots (Asia/Shanghai)
+Description=ETF daily notification at 14:50 (Asia/Shanghai)
 
 [Timer]
-OnCalendar=*-*-* 09:45:00 Asia/Shanghai
-OnCalendar=*-*-* 11:45:00 Asia/Shanghai
-OnCalendar=*-*-* 13:45:00 Asia/Shanghai
 OnCalendar=*-*-* 14:50:00 Asia/Shanghai
-OnCalendar=*-*-* 14:54:00 Asia/Shanghai
 AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=false

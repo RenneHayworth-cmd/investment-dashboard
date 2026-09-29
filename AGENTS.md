@@ -624,7 +624,8 @@ Commit only relevant source changes. Do not revert unrelated user changes.
 - Keep ETF signal computation in existing position services. Event/channel
   receipts live in a cross-platform SQLite ledger under REMINDER_STATE_DIR.
   Pending/uncertain delivery must not be blindly retried; only confirmed success
-  is sent. Keep current five Shanghai notification slots and market calendar.
+  is sent. Notify once per A-share trading day at 14:50 Asia/Shanghai (user
+  decision 2026-09-29, replacing the former five slots) and keep the market calendar.
 - Deploy units and operations: deploy/REMINDERS.md. During migration the timer
   is dry-run; activating Fangtang requires user confirmation that Windows Fangtang stopped.
 

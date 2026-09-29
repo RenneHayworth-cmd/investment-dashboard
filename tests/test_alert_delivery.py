@@ -299,8 +299,9 @@ def test_systemd_scope_is_etf_only():
     units = Path("deploy/systemd")
     assert {p.name for p in units.iterdir()} == {"position-etf-reminder.service", "position-etf-reminder.timer"}
     timer = (units / "position-etf-reminder.timer").read_text()
-    for slot in ("09:45", "11:45", "13:45", "14:50", "14:54"):
-        assert f"OnCalendar=*-*-* {slot}:00 Asia/Shanghai" in timer
+    calendars = [line for line in timer.splitlines() if line.startswith("OnCalendar=")]
+    assert calendars == ["OnCalendar=*-*-* 14:50:00 Asia/Shanghai"]
+    assert etf.ALERT_SLOTS == ((14, 50),)
 
 
 # --- WxPusher ---------------------------------------------------------------

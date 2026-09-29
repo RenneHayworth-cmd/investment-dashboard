@@ -35,7 +35,8 @@ from services.price_alerts import (  # noqa: E402
 )
 
 
-ALERT_SLOTS = ((9, 45), (11, 45), (13, 45), (14, 50), (14, 54))
+# User decision 2026-09-29: one daily notice at 14:50, early enough to trade before the close.
+ALERT_SLOTS = ((14, 50),)
 STATE_PATH = state_dir() / "position_timing_trade_alert.json"
 LOCK_PATH = state_dir() / "position_timing_trade_alert.lock"
 LOG_PATH = state_dir() / "position_timing_trade_alert.log"
@@ -269,9 +270,9 @@ def format_notification(preview, *, slot: str) -> tuple[str, str, str]:
                 *common,
                 "",
                 (
-                    "14:54仍会继续检查行情；若仍无需操作，不再重复通知。"
+                    "这是今日唯一一次提醒；收盘前若价格大幅波动，请以收盘价自行复核。"
                     if first_slot
-                    else "后续时点仍会继续检查行情；若信号变化，将发送最新交易建议。"
+                    else "这是手动检查结果；定时提醒每日仅在14:50发送。"
                 ),
             ]
         )
@@ -360,7 +361,7 @@ def main() -> int:
 
     slot = alert_slot(now)
     if slot is None and not args.force:
-        print("跳过：当前不在09:45、11:45、13:45、14:50、14:54通知时刻。")
+        print("跳过：当前不在14:50通知时刻。")
         return 0
     slot = slot or now.strftime("%H:%M")
     trade_date = now.date().isoformat()
