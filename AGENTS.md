@@ -86,7 +86,7 @@ before a larger handoff or commit.
   background-loop toggle or auto-started updater.
 - Iron ore price alerts run independently through
   `scripts/monitor_iron_ore_price.py`; do not tie them to a Streamlit page loop.
-  The default threshold is 730 yuan/ton. Notify ordinary WeChat through
+  The default threshold is 700 yuan/ton (state and lock files are named per threshold, so a new threshold starts armed). Notify ordinary WeChat through
   Hermes WeChat only on the first below-threshold observation, suppress repeats
   until the price returns to or above the threshold, and never persist or log
   the SendKey. The Windows scheduled task may invoke the script every minute;
@@ -614,8 +614,11 @@ Commit only relevant source changes. Do not revert unrelated user changes.
 
 ## Reminder deployment
 
-- All Fangtang/Hermes sends require explicit ENABLE_FANGTANG / ENABLE_WECHAT;
-  missing flags fail closed. REMINDER_DRY_RUN blocks every send, including tests.
+- All Fangtang/Hermes/WxPusher sends require explicit ENABLE_FANGTANG / ENABLE_WECHAT /
+  ENABLE_WXPUSHER; missing flags fail closed. REMINDER_DRY_RUN blocks every send,
+  including tests. WxPusher (WXPUSHER_APP_TOKEN + WXPUSHER_UIDS/WXPUSHER_TOPIC_IDS) is
+  plain HTTPS, allowed on Lightsail, ETF position alerts only; enable each channel on
+  one production node because delivery ledgers are per node.
 - Lightsail runs only ETF reminders, with Hermes always disabled. Never deploy
   iron-ore reminders or install Hermes on Lightsail. Windows iron ore stays WeChat only.
 - Keep ETF signal computation in existing position services. Event/channel

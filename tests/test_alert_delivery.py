@@ -23,9 +23,11 @@ from scripts import monitor_iron_ore_price as iron
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
-    for name in ("ENABLE_FANGTANG", "ENABLE_WECHAT", "REMINDER_DRY_RUN", "REMINDER_NODE"):
+    for name in ("ENABLE_FANGTANG", "ENABLE_WECHAT", "ENABLE_WXPUSHER", "REMINDER_DRY_RUN", "REMINDER_NODE",
+                 "WXPUSHER_APP_TOKEN", "WXPUSHER_UIDS", "WXPUSHER_TOPIC_IDS"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("REMINDER_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(price_alerts, "WXPUSHER_CONFIG_DIR", tmp_path / "no-config")
 
 
 def enable(monkeypatch):
@@ -299,3 +301,202 @@ def test_systemd_scope_is_etf_only():
     timer = (units / "position-etf-reminder.timer").read_text()
     for slot in ("09:45", "11:45", "13:45", "14:50", "14:54"):
         assert f"OnCalendar=*-*-* {slot}:00 Asia/Shanghai" in timer
+
+
+# --- WxPusher ---------------------------------------------------------------
+
+WX_CONFIG = price_alerts.WxPusherConfig("AT_secret_token", ("UID_a",), ())
+
+
+def wx_response(code=1000, items=({"uid": "UID_a", "code": 1000, "status": "创建发送任务成功"},)):
+    response = Mock()
+    response.raise_for_status = Mock()
+    response.json.return_value = {"code": code, "msg": "处理成功", "data": list(items), "success": code == 1000}
+    return response
+
+
+def test_wxpusher_flag_is_off_by_default_and_allowed_on_lightsail(monkeypatch):
+    assert "wxpusher" not in delivery.enabled_channels()
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    monkeypatch.setenv("REMINDER_NODE", "lightsail")
+    monkeypatch.setenv("ENABLE_WECHAT", "true")
+    assert delivery.enabled_channels() == ("wxpusher",)
+    monkeypatch.setenv("REMINDER_DRY_RUN", "true")
+    assert delivery.enabled_channels() == ()
+    monkeypatch.setenv("REMINDER_DRY_RUN", "false")
+    monkeypatch.setenv("ENABLE_WXPUSHER", "maybe")
+    with pytest.raises(ValueError):
+        delivery.enabled_channels()
+
+
+def test_wxpusher_disabled_never_touches_the_network():
+    with patch("requests.post") as post:
+        assert price_alerts.send_wxpusher_message(WX_CONFIG, "标题")["skipped"]
+    post.assert_not_called()
+
+
+def test_wxpusher_posts_markdown_with_summary_and_recipients(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    config = price_alerts.WxPusherConfig("AT_secret_token", ("UID_a", "UID_b"), (7,))
+    with patch("requests.post", return_value=wx_response(items=[
+        {"uid": "UID_a", "code": 1000}, {"uid": "UID_b", "code": 1000}, {"topicId": 7, "code": 1000},
+    ])) as post:
+        price_alerts.send_wxpusher_message(config, "ETF均线策略交易提醒 14:50", "- **卖出** 159967")
+    (url,), kwargs = post.call_args
+    assert url == "https://wxpusher.zjiecode.com/api/send/message"
+    body = kwargs["json"]
+    assert body == {
+        "appToken": "AT_secret_token",
+        "content": "## ETF均线策略交易提醒 14:50\n\n- **卖出** 159967",
+        "summary": "ETF均线策略交易提醒 14:50",
+        "contentType": 3,
+        "uids": ["UID_a", "UID_b"],
+        "topicIds": [7],
+    }
+    assert "AT_secret_token" not in url
+
+
+def test_wxpusher_summary_is_capped_and_oversize_content_is_rejected_before_sending(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    with patch("requests.post", return_value=wx_response()) as post:
+        price_alerts.send_wxpusher_message(WX_CONFIG, "题" * 300, "正文")
+        assert len(post.call_args.kwargs["json"]["summary"]) == 100
+        post.reset_mock()
+        with pytest.raises(delivery.DeliveryRejected):
+            price_alerts.send_wxpusher_message(WX_CONFIG, "标题", "字" * 25_000)  # < 40k chars but > 65,535 bytes
+        post.assert_not_called()
+
+
+@pytest.mark.parametrize("config", [
+    price_alerts.WxPusherConfig("", ("UID_a",), ()),
+    price_alerts.WxPusherConfig("AT_secret_token", (), ()),
+])
+def test_wxpusher_missing_credentials_or_recipients_are_rejected(monkeypatch, config):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    with patch("requests.post") as post, pytest.raises(delivery.DeliveryRejected):
+        price_alerts.send_wxpusher_message(config, "标题", "正文")
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("response,error", [
+    (wx_response(code=1001, items=()), delivery.DeliveryRejected),          # provider refused
+    (wx_response(items=({"uid": "UID_a", "code": 1002},)), delivery.DeliveryRejected),  # every recipient refused
+    (wx_response(items=({"uid": "UID_a", "code": 1000}, {"uid": "UID_b", "code": 1002})), delivery.DeliveryUncertain),
+    (wx_response(items=()), delivery.DeliveryUncertain),                    # accepted but no task detail
+])
+def test_wxpusher_response_classification(monkeypatch, response, error):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    with patch("requests.post", return_value=response), pytest.raises(error):
+        price_alerts.send_wxpusher_message(WX_CONFIG, "标题", "正文")
+
+
+def test_wxpusher_non_json_answer_is_uncertain(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    response = wx_response()
+    response.json.return_value = ["unexpected"]
+    with patch("requests.post", return_value=response), pytest.raises(delivery.DeliveryUncertain):
+        price_alerts.send_wxpusher_message(WX_CONFIG, "标题", "正文")
+
+
+def test_wxpusher_config_reads_env_then_files(monkeypatch, tmp_path):
+    (tmp_path / "wxpusher_app_token").write_text("AT_from_file\n", encoding="utf-8")
+    (tmp_path / "wxpusher_uids").write_text("UID_file\n", encoding="utf-8")
+    from_files = price_alerts.load_wxpusher_config(tmp_path)
+    assert (from_files.app_token, from_files.uids, from_files.topic_ids) == ("AT_from_file", ("UID_file",), ())
+    monkeypatch.setenv("WXPUSHER_APP_TOKEN", "AT_env")
+    monkeypatch.setenv("WXPUSHER_UIDS", "UID_1, UID_2")
+    monkeypatch.setenv("WXPUSHER_TOPIC_IDS", "12,34")
+    from_env = price_alerts.load_wxpusher_config(tmp_path)
+    assert (from_env.app_token, from_env.uids, from_env.topic_ids) == ("AT_env", ("UID_1", "UID_2"), (12, 34))
+    monkeypatch.setenv("WXPUSHER_TOPIC_IDS", "abc")
+    with pytest.raises(delivery.DeliveryRejected):
+        price_alerts.load_wxpusher_config(tmp_path)
+
+
+def test_position_alert_sends_through_wxpusher_and_ledger_blocks_a_repeat(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    monkeypatch.setenv("WXPUSHER_APP_TOKEN", "AT_secret_token")
+    monkeypatch.setenv("WXPUSHER_UIDS", "UID_a")
+    with patch("requests.post", return_value=wx_response()) as post:
+        channels, errors = etf.send_notification_channels("", "标题", "正文", keys=["2026-09-29|ETF500K|14:50"])
+        assert (channels, errors) == (("WxPusher",), ())
+        again, _ = etf.send_notification_channels("", "标题", "正文", keys=["2026-09-29|ETF500K|14:50"])
+    assert again == ("WxPusher",)
+    assert post.call_count == 1  # second run finds the event already sent
+    assert delivery.DeliveryLedger().statuses(["2026-09-29|ETF500K|14:50"], "wxpusher") == {
+        "2026-09-29|ETF500K|14:50": "sent"}
+    assert delivery.DeliveryLedger().statuses(["2026-09-29|ETF500K|14:50"], "fangtang") == {
+        "2026-09-29|ETF500K|14:50": "new"}
+
+
+def test_position_alert_wxpusher_failure_is_reported_without_the_token(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    monkeypatch.setenv("ENABLE_FANGTANG", "true")
+    monkeypatch.setenv("WXPUSHER_APP_TOKEN", "AT_secret_token")
+    monkeypatch.setenv("WXPUSHER_UIDS", "UID_a")
+    with patch.object(etf, "send_serverchan_message") as fangtang, \
+         patch("requests.post", side_effect=requests.ConnectionError("AT_secret_token boom")):
+        channels, errors = etf.send_notification_channels("SCT_x", "标题", "正文", keys=["event"])
+    assert channels == ("Server酱",)               # the other channel is unaffected
+    assert errors and "WxPusher推送失败" in errors[0] and "AT_secret_token" not in errors[0]
+    fangtang.assert_called_once()
+    assert delivery.DeliveryLedger().statuses(["event"], "wxpusher")["event"] == "uncertain"
+
+
+def test_position_alert_redacts_the_wxpusher_token(monkeypatch):
+    monkeypatch.setenv("WXPUSHER_APP_TOKEN", "AT_secret_token")
+    assert "AT_secret_token" not in etf.safe_text("请求失败 AT_secret_token")
+
+
+def test_wxpusher_spt_uses_simple_push_endpoint_without_uids(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    config = price_alerts.WxPusherConfig("SPT_secret_simple_token")
+    assert config.is_spt
+    spt_ok = wx_response(items=({"spt": "SPT_secret_simple_token", "uid": None, "code": 1000, "status": "创建发送任务成功"},))
+    with patch("requests.post", return_value=spt_ok) as post:
+        price_alerts.send_wxpusher_message(config, "ETF均线策略交易提醒测试", "这是一条测试")
+    (url,), kwargs = post.call_args
+    assert url == "https://wxpusher.zjiecode.com/api/send/message/simple-push"
+    assert kwargs["json"] == {
+        "content": "## ETF均线策略交易提醒测试\n\n这是一条测试",
+        "summary": "ETF均线策略交易提醒测试",
+        "contentType": 3,
+        "spt": "SPT_secret_simple_token",
+    }
+    assert "SPT_secret_simple_token" not in url
+
+
+def test_wxpusher_spt_rejection_is_classified_like_app_token(monkeypatch):
+    monkeypatch.setenv("ENABLE_WXPUSHER", "true")
+    config = price_alerts.WxPusherConfig("SPT_secret_simple_token")
+    with patch("requests.post", return_value=wx_response(code=1001, items=())), pytest.raises(delivery.DeliveryRejected):
+        price_alerts.send_wxpusher_message(config, "标题", "正文")
+
+
+def test_iron_ore_defaults_to_700_with_a_state_file_per_threshold():
+    assert iron.DEFAULT_THRESHOLD == 700.0
+    assert iron.state_path(700.0).name == "iron_ore_below_700.json"
+    assert iron.lock_path(700.0).name == "iron_ore_below_700.lock"
+    assert iron.state_path(730.0) != iron.state_path(700.0)
+    assert iron.state_path(692.5).name == "iron_ore_below_692.5.json"
+
+
+def test_lowering_the_threshold_starts_armed_instead_of_inheriting_below_state(tmp_path):
+    # The 730 regime left the price "already below" (notified on 2026-09-11, never recovered).
+    old_state = tmp_path / iron.state_path(730.0).name
+    price_alerts.save_price_alert_state(old_state, price_alerts.PriceAlertState(below_threshold=True, last_price=702.0))
+    when = datetime(2026, 9, 29, 10, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+    notify = Mock()
+    # Same state file with the new threshold would swallow this crossing (proves the hazard) ...
+    inherited = price_alerts.process_price_alert(
+        price=699.0, threshold=700.0, contract="I2701", checked_at=when, state_path=old_state, notify=notify)
+    assert inherited.status == "below_suppressed" and not notify.called
+    # ... whereas the per-threshold file starts armed and alerts on the first crossing below 700.
+    fresh = price_alerts.process_price_alert(
+        price=699.0, threshold=700.0, contract="I2701", checked_at=when,
+        state_path=tmp_path / iron.state_path(700.0).name, notify=notify)
+    assert fresh.status == "alerted"
+    assert "700" in notify.call_args.args[0]
+    assert price_alerts.process_price_alert(
+        price=695.0, threshold=700.0, contract="I2701", checked_at=when,
+        state_path=tmp_path / iron.state_path(700.0).name, notify=notify).status == "below_suppressed"

@@ -25,7 +25,7 @@ from services import position_performance
 from scripts import monitor_position_timing_trades as monitor
 
 
-@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true", "ENABLE_WXPUSHER": "false",
                            "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class PositionTimingTradeAlertTests(unittest.TestCase):
     def setUp(self):

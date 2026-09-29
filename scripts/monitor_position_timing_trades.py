@@ -23,13 +23,15 @@ from services.fund_analysis import FUND_ADJUST_FORWARD_ADDITIVE  # noqa: E402
 from services.market_calendar import get_market_window, is_market_trading_day  # noqa: E402
 from services import position_analysis as position  # noqa: E402
 from services.alert_delivery import (  # noqa: E402
-    DeliveryLedger, DeliveryUncertain, DeliveryRejected, channel_enabled, enabled_channels,
-    event_key, flag, process_lock, state_dir,
+    CHANNEL_FLAGS, CHANNEL_LABELS, DeliveryLedger, DeliveryUncertain, DeliveryRejected,
+    channel_enabled, enabled_channels, event_key, flag, process_lock, state_dir,
 )
 from services.price_alerts import (  # noqa: E402
     load_serverchan_sendkey,
+    load_wxpusher_config,
     send_hermes_weixin_message,
     send_serverchan_message,
+    send_wxpusher_message,
 )
 
 
@@ -59,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-notification",
         action="store_true",
-        help="立即通过Server酱和Hermes微信发送一条测试通知。",
+        help="立即通过所有已启用渠道（Server酱、Hermes微信、WxPusher）发送一条测试通知。",
     )
     return parser.parse_args()
 
@@ -134,7 +136,7 @@ def send_notification_channels(
     render=None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Only enabled channels; production ETF calls always supply event keys."""
-    labels = {"fangtang": "Server酱", "wechat": "Hermes微信"}
+    labels = CHANNEL_LABELS
     sent_channels = ([x for x in already_sent if x in
                       {labels[c] for c in enabled_channels()}] if keys is None else [])
     errors: list[str] = []
@@ -150,6 +152,9 @@ def send_notification_channels(
                 if not sendkey:
                     raise DeliveryRejected("SERVERCHAN_SENDKEY 未配置")
                 send_serverchan_message(sendkey, send_title, send_body)
+                return
+            if channel == "wxpusher":
+                send_wxpusher_message(load_wxpusher_config(), send_title, send_body)
                 return
             delays = (35, 60, 60)
             for attempt in range(len(delays) + 1):
@@ -309,7 +314,7 @@ def render_pending(preview, keys, pending, slot):
 def safe_text(value):
     # Only categories/market text reach journal; never credential-bearing URLs.
     import re
-    for name in ("TICKFLOW_API_KEY", "SERVERCHAN_SENDKEY"):
+    for name in ("TICKFLOW_API_KEY", "SERVERCHAN_SENDKEY", "WXPUSHER_APP_TOKEN"):
         secret = os.environ.get(name, "")
         if secret:
             value = value.replace(secret, "[已隐藏]")
@@ -325,7 +330,7 @@ def main() -> int:
     configure_logging()
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     sendkey = load_serverchan_sendkey() if channel_enabled("fangtang") else ""
-    expected = {"Server酱" if c == "fangtang" else "Hermes微信" for c in enabled_channels()}
+    expected = {CHANNEL_LABELS[c] for c in enabled_channels()}
 
     if args.test_notification:
         if args.dry_run or not expected:
@@ -415,7 +420,7 @@ def main() -> int:
         keys = notification_events(preview, slot=slot, trade_date=trade_date)
         if args.dry_run:
             print(f"试运行：{title}\n{description}")
-            for channel in ("fangtang", "wechat"):
+            for channel in CHANNEL_FLAGS:
                 for key, status in DeliveryLedger().statuses(keys, channel).items():
                     print(f"event={key}|{channel} ledger={status} dry_run=true")
             logging.info("dry_run outcome=%s action_count=%d events=%s", outcome, len(preview.actions), keys)

@@ -61,7 +61,7 @@ class NotificationModelTests(unittest.TestCase):
         self.assertEqual(d["actions"][0]["action"], "view")
 
 
-@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true", "ENABLE_WXPUSHER": "false",
                            "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class ChannelTests(unittest.TestCase):
     @patch("requests.post")

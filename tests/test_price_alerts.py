@@ -16,7 +16,7 @@ from services.price_alerts import (
 )
 
 
-@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true",
+@patch.dict("os.environ", {"ENABLE_FANGTANG": "true", "ENABLE_WECHAT": "true", "ENABLE_WXPUSHER": "false",
                            "REMINDER_DRY_RUN": "false", "REMINDER_NODE": "windows"})
 class PriceAlertTests(unittest.TestCase):
     @patch("services.price_alerts.subprocess.run")

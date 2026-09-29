@@ -92,6 +92,124 @@ def send_serverchan_message(
     return payload
 
 
+WXPUSHER_ENDPOINT = "https://wxpusher.zjiecode.com/api/send/message"
+# 极简推送: an SPT identifies the recipient itself, so no appToken/UID is involved.
+WXPUSHER_SPT_ENDPOINT = "https://wxpusher.zjiecode.com/api/send/message/simple-push"
+WXPUSHER_CONFIG_DIR = Path.home() / ".config" / "investment_dashboard"
+WXPUSHER_OK = 1000
+WXPUSHER_MAX_CONTENT_CHARS = 40_000
+WXPUSHER_MAX_CONTENT_BYTES = 65_535
+WXPUSHER_MAX_SUMMARY_CHARS = 100
+WXPUSHER_MAX_UIDS = 2000
+WXPUSHER_MAX_TOPICS = 5
+
+
+@dataclass(frozen=True)
+class WxPusherConfig:
+    app_token: str = ""  # an appToken (AT_...) or a simple-push token (SPT_...)
+    uids: tuple[str, ...] = ()
+    topic_ids: tuple[int, ...] = ()
+
+    @property
+    def is_spt(self) -> bool:
+        return self.app_token.startswith("SPT_")
+
+
+def _wxpusher_value(env_name: str, filename: str, directory: Path) -> str:
+    value = str(os.environ.get(env_name) or "").strip()
+    if value:
+        return value
+    try:
+        return (directory / filename).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def load_wxpusher_config(directory: Path | None = None) -> WxPusherConfig:
+    """appToken plus recipients from env (preferred) or ~/.config files; never logged."""
+    directory = directory or WXPUSHER_CONFIG_DIR
+    token = _wxpusher_value("WXPUSHER_APP_TOKEN", "wxpusher_app_token", directory)
+    uids = tuple(
+        item for item in re.split(r"[,\s]+", _wxpusher_value("WXPUSHER_UIDS", "wxpusher_uids", directory)) if item
+    )
+    topics = []
+    for item in re.split(r"[,\s]+", _wxpusher_value("WXPUSHER_TOPIC_IDS", "wxpusher_topic_ids", directory)):
+        if not item:
+            continue
+        if not item.isdigit():
+            raise DeliveryRejected("WXPUSHER_TOPIC_IDS 必须是数字，多个用逗号分隔")
+        topics.append(int(item))
+    return WxPusherConfig(token, uids, tuple(topics))
+
+
+def send_wxpusher_message(
+    config: WxPusherConfig,
+    title: str,
+    description: str = "",
+    *,
+    timeout: float = 10,
+) -> dict:
+    """POST one markdown message; accepted only when every recipient's task was created.
+
+    WxPusher has no title field: the summary is the notification preview and the
+    body carries the title as a heading. code 1000 means the send task was created.
+    """
+    if not channel_enabled("wxpusher"):
+        return {"skipped": True, "reason": "WxPusher渠道已禁用"}
+    import requests
+
+    normalized_title = str(title).replace("\r", " ").replace("\n", " ").strip()
+    if not normalized_title:
+        raise DeliveryRejected("WxPusher消息标题不能为空。")
+    if not config.app_token:
+        raise DeliveryRejected("WXPUSHER_APP_TOKEN 未配置")
+    if not config.is_spt:
+        if not config.uids and not config.topic_ids:
+            raise DeliveryRejected("WXPUSHER_UIDS 或 WXPUSHER_TOPIC_IDS 至少配置一项")
+        if len(config.uids) > WXPUSHER_MAX_UIDS or len(config.topic_ids) > WXPUSHER_MAX_TOPICS:
+            raise DeliveryRejected("WxPusher收件人数量超过单次上限")
+    body = str(description).strip()
+    content = f"## {normalized_title}\n\n{body}" if body else normalized_title
+    if len(content) > WXPUSHER_MAX_CONTENT_CHARS or len(content.encode("utf-8")) > WXPUSHER_MAX_CONTENT_BYTES:
+        raise DeliveryRejected("WxPusher消息超过长度上限")
+
+    request_body: dict = {
+        "content": content,
+        "summary": normalized_title[:WXPUSHER_MAX_SUMMARY_CHARS],
+        "contentType": 3,
+    }
+    if config.is_spt:
+        request_body["spt"] = config.app_token
+    else:
+        request_body["appToken"] = config.app_token
+        if config.uids:
+            request_body["uids"] = list(config.uids)
+        if config.topic_ids:
+            request_body["topicIds"] = list(config.topic_ids)
+    response = requests.post(
+        WXPUSHER_SPT_ENDPOINT if config.is_spt else WXPUSHER_ENDPOINT,
+        json=request_body,
+        headers={"Content-Type": "application/json;charset=utf-8"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("code") is None:
+        raise DeliveryUncertain("WxPusher未返回有效的送达确认")
+    if str(payload.get("code")) != str(WXPUSHER_OK):
+        raise DeliveryRejected("WxPusher API 明确拒绝发送")
+    results = payload.get("data")
+    if not isinstance(results, list) or not results:
+        raise DeliveryUncertain("WxPusher未返回发送任务明细")
+    accepted = [isinstance(item, dict) and str(item.get("code")) == str(WXPUSHER_OK) for item in results]
+    if not any(accepted):
+        raise DeliveryRejected("WxPusher拒绝了所有收件人")
+    if not all(accepted):
+        # Some recipients queued, some did not: a blind retry would duplicate.
+        raise DeliveryUncertain("WxPusher部分收件人发送失败，需核对后处理")
+    return payload
+
+
 def send_hermes_weixin_message(
     title: str,
     description: str = "",

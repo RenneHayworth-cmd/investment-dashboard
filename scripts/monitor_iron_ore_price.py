@@ -29,15 +29,24 @@ from services.alert_delivery import channel_enabled, flag, process_lock  # noqa:
 
 INDEX_NAME = "铁矿石主连"
 SYMBOL = "I0"
-DEFAULT_THRESHOLD = 730.0
-STATE_PATH = ROOT / "output" / "alerts" / "iron_ore_below_730.json"
-LOCK_PATH = ROOT / "output" / "alerts" / "iron_ore_below_730.lock"
+DEFAULT_THRESHOLD = 700.0
+ALERT_DIR = ROOT / "output" / "alerts"
+
+
+def state_path(threshold: float) -> Path:
+    """Armed/suppressed state belongs to one threshold: a new threshold starts armed,
+    so a state left by the old one (already below) cannot swallow the next crossing."""
+    return ALERT_DIR / f"iron_ore_below_{threshold:g}.json"
+
+
+def lock_path(threshold: float) -> Path:
+    return ALERT_DIR / f"iron_ore_below_{threshold:g}.lock"
 LOG_PATH = ROOT / "output" / "logs" / "iron_ore_price_alert.log"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="监控铁矿石主连价格并通过Hermes推送微信通知。")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="告警阈值，默认730。")
+    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="告警阈值，默认700。")
     parser.add_argument("--force", action="store_true", help="忽略交易时段限制，供手动检查使用。")
     parser.add_argument("--dry-run", action="store_true", help="不发送通知，也不修改告警状态。")
     parser.add_argument("--test-price", type=float, help="使用指定价格代替联网行情，供测试使用。")
@@ -55,8 +64,8 @@ def configure_logging() -> None:
 
 
 @contextmanager
-def single_instance_lock():
-    with process_lock(LOCK_PATH) as acquired:
+def single_instance_lock(threshold: float = DEFAULT_THRESHOLD):
+    with process_lock(lock_path(threshold)) as acquired:
         yield acquired
 
 
@@ -97,7 +106,7 @@ def main() -> int:
         print("跳过：当前不在铁矿石期货交易时段。")
         return 0
 
-    with single_instance_lock() as acquired:
+    with single_instance_lock(args.threshold) as acquired:
         if not acquired:
             print("跳过：上一轮铁矿石价格检查尚未完成。")
             return 0
@@ -147,7 +156,7 @@ def main() -> int:
                 threshold=args.threshold,
                 contract=contract,
                 checked_at=checked_at,
-                state_path=STATE_PATH,
+                state_path=state_path(args.threshold),
                 notify=notify,
             )
         logging.info("status=%s price=%.1f contract=%s", result.status, price, contract)

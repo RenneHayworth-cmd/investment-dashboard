@@ -21,16 +21,27 @@ def flag(name: str) -> bool:
     raise ValueError(f"{name} 必须为 true 或 false")
 
 
+CHANNEL_FLAGS = {
+    "fangtang": "ENABLE_FANGTANG",
+    "wechat": "ENABLE_WECHAT",
+    "wxpusher": "ENABLE_WXPUSHER",
+}
+# Names shown in notification results and state files.
+CHANNEL_LABELS = {"fangtang": "Server酱", "wechat": "Hermes微信", "wxpusher": "WxPusher"}
+
+
 def channel_enabled(channel: str) -> bool:
     if flag("REMINDER_DRY_RUN"):
         return False
+    # Hermes drives a local WeChat client; the Lightsail node never runs it.
+    # WxPusher is a plain HTTPS call, so it is allowed there.
     if channel == "wechat" and os.environ.get("REMINDER_NODE") == "lightsail":
         return False
-    return flag({"fangtang": "ENABLE_FANGTANG", "wechat": "ENABLE_WECHAT"}[channel])
+    return flag(CHANNEL_FLAGS[channel])
 
 
 def enabled_channels() -> tuple[str, ...]:
-    return tuple(c for c in ("fangtang", "wechat") if channel_enabled(c))
+    return tuple(c for c in CHANNEL_FLAGS if channel_enabled(c))
 
 
 def state_dir() -> Path:

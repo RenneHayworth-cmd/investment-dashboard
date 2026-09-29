@@ -14,18 +14,44 @@ Lightsail 仅承担 ETF 方糖提醒；Windows 的 ETF 与铁矿石提醒使用 
 
 ## 渠道策略
 
-`ENABLE_FANGTANG` 和 `ENABLE_WECHAT` 缺省、空值或 false 都表示关闭。
+`ENABLE_FANGTANG`、`ENABLE_WECHAT` 和 `ENABLE_WXPUSHER` 缺省、空值或 false 都表示关闭。
 true/1/yes/on 表示开启；无效值报错并停止，不会默默打开。
 `REMINDER_DRY_RUN=true` 强制关闭两渠道，包括测试通知入口和底层发送函数。
 `REMINDER_NODE=lightsail` 禁止微信；Linux ETF 专用入口还强制覆盖微信开关为 false。
 这些变量要进入脚本进程环境；普通 Windows/WSL 脚本不自动读取仓库 `.env`。
 
-迁移期：服务器 `ENABLE_FANGTANG=false`、`ENABLE_WECHAT=false`、
-`REMINDER_DRY_RUN=true`。正式切换必须等 Windows ETF 已停止方糖，且用户确认。
-届时服务器仅开启 Fangtang 并关闭 dry-run；Windows 明确设置 Fangtang=false、
-WeChat=true。升级旧代码时缺少开关将停止发送，务必同步设置 Windows 任务环境。
+当前生产状态（2026-09-29 登录服务器核对）：迁移已完成。Lightsail
+`reminder.env` 为 `ENABLE_FANGTANG=true`、`ENABLE_WECHAT=false`、`REMINDER_DRY_RUN=false`，
+09:45 等时点已在实际发送方糖；随后又加入 `ENABLE_WXPUSHER=true`（SPT token 只在服务器
+`reminder.env` 里，不进 Git）。Windows 任务显式设置 Fangtang=false、WeChat=true、
+WxPusher=true，方糖不会双发。升级旧代码时缺少开关将停止发送，务必同步设置 Windows 任务环境。
+**注意：WxPusher 目前两个节点都开着，每个时点会收到两条相同的 WxPusher 消息**（账本按节点
+独立）；只想收一条时，关掉其中一个节点的 `ENABLE_WXPUSHER`。
 铁矿石脚本永远只选择微信，不会因 Fangtang=true 改为双发；禁用微信时不改变其
 阈值状态，重新启用后继续原有首次跌破/恢复后重布防规则。
+
+### WxPusher 渠道
+
+`ENABLE_WXPUSHER` 与另外两个开关规则相同：缺省/空值/false 关闭，无效值报错停止，
+`REMINDER_DRY_RUN=true` 强制关闭。它只是一次 HTTPS POST，因此**允许在 Lightsail 使用**
+（`REMINDER_NODE=lightsail` 只禁 Hermes 微信）。只用于 ETF 持仓提醒，铁矿石脚本不使用它。
+账本不跨节点共享，同一渠道只能在一个生产节点开启，否则同一提醒会重复收到。
+
+配置放在 `reminder.env`，不写进 Git、不发到对话：
+
+- `WXPUSHER_APP_TOKEN`：保密，两种取值。`AT_` 开头是后台应用的 appToken，须再配 UID 或主题；`SPT_` 开头是极简推送 token（扫码获取，只能发给自己），走 `/api/send/message/simple-push`，不需要 UID/主题。SPT 泄漏后任何人都能给你发消息。
+- `WXPUSHER_UIDS`：接收者 UID，多个用逗号分隔（关注应用后在“我的”页面获取）。
+- `WXPUSHER_TOPIC_IDS`：主题 ID，多个用逗号分隔，至多 5 个。UID 与主题至少配一项。
+- 也可放在 `~/.config/investment_dashboard/wxpusher_app_token`、`wxpusher_uids`、
+  `wxpusher_topic_ids`；环境变量优先。
+
+发送方式：`POST https://wxpusher.zjiecode.com/api/send/message`，Markdown 正文（标题作为
+一级标题写入正文），预览摘要取标题前 100 个字符；appToken 在请求体内，不出现在 URL。
+判定与账本：外层 code=1000 且每个收件人的 code 都是 1000（“创建发送任务成功”，即服务商
+已接收，不代表手机已展示）才记 `sent`；code 非 1000 或全部收件人被拒记 `failed`（可重试）；
+部分收件人被拒、缺少发送明细、响应无法解析、读取超时记 `uncertain`，阻止自动重发。
+正文超过 65,535 字节或 40,000 字符时在发送前拒绝，不静默截断。
+测试：开启 `ENABLE_WXPUSHER=true` 后运行 `--test-notification`（须关闭 dry-run）。
 
 ## 私有配置与持久化
 
@@ -44,7 +70,7 @@ WeChat=true。升级旧代码时缺少开关将停止发送，务必同步设置
 ## 事件与防重
 
 ETF 动作键：交易日 | ETF500K | preview | 正式持仓基准日 | 策略参数指纹 |
-六位 ETF 代码 | 买入/卖出 | 净数量；SQLite 主键再加 channel（fangtang/wechat）。
+六位 ETF 代码 | 买入/卖出 | 净数量；SQLite 主键再加 channel（fangtang/wechat/wxpusher）。
 指纹读取原 service 的 MA、阈值、仓位规则、权重、停车来源、资金、费用及整手参数。
 不把价格、报价时间和提醒时点当作新买卖事件。同一天相同净操作在后续时点不重发；
 数量或方向变化是新指令。一个批次仅渲染该渠道尚未成功发送的标的，保留先卖后买。
