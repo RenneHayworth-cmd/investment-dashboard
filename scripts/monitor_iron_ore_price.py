@@ -30,6 +30,9 @@ from services.alert_delivery import channel_enabled, flag, process_lock  # noqa:
 INDEX_NAME = "铁矿石主连"
 SYMBOL = "I0"
 DEFAULT_THRESHOLD = 700.0
+# Ladder alerts: 700, then 695, 690, ...; reset once price is back at 700 + step.
+# On 2026-09-29 the price flipped 699.5/700.0 and the single-level rule alerted 9 times.
+DEFAULT_STEP = 5.0
 ALERT_DIR = ROOT / "output" / "alerts"
 
 
@@ -41,12 +44,18 @@ def state_path(threshold: float) -> Path:
 
 def lock_path(threshold: float) -> Path:
     return ALERT_DIR / f"iron_ore_below_{threshold:g}.lock"
+
+
 LOG_PATH = ROOT / "output" / "logs" / "iron_ore_price_alert.log"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="监控铁矿石主连价格并通过Hermes推送微信通知。")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help="告警阈值，默认700。")
+    parser.add_argument(
+        "--step", type=float, default=DEFAULT_STEP,
+        help="阶梯间距，默认5元/吨：跌破700提醒后，下一次在跌破695、690……时提醒；回升到阈值+间距后重置。",
+    )
     parser.add_argument("--force", action="store_true", help="忽略交易时段限制，供手动检查使用。")
     parser.add_argument("--dry-run", action="store_true", help="不发送通知，也不修改告警状态。")
     parser.add_argument("--test-price", type=float, help="使用指定价格代替联网行情，供测试使用。")
@@ -149,6 +158,7 @@ def main() -> int:
                     checked_at=checked_at,
                     state_path=Path(directory) / "state.json",
                     notify=notify,
+                    step=args.step,
                 )
         else:
             result = process_price_alert(
@@ -158,6 +168,7 @@ def main() -> int:
                 checked_at=checked_at,
                 state_path=state_path(args.threshold),
                 notify=notify,
+                step=args.step,
             )
         logging.info("status=%s price=%.1f contract=%s", result.status, price, contract)
         print(result.message)

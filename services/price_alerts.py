@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,8 @@ class PriceAlertState:
     last_contract: str = ""
     last_check_at: str = ""
     last_alert_at: str = ""
+    # Lowest ladder level already alerted (e.g. 695.0); None when no alert is active.
+    alert_level: float | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +276,7 @@ def load_price_alert_state(path: Path) -> PriceAlertState:
         last_contract=str(payload.get("last_contract") or ""),
         last_check_at=str(payload.get("last_check_at") or ""),
         last_alert_at=str(payload.get("last_alert_at") or ""),
+        alert_level=_optional_float(payload.get("alert_level")),
     )
 
 
@@ -294,46 +298,82 @@ def process_price_alert(
     checked_at: datetime,
     state_path: Path,
     notify: Callable[[str, str], object],
+    step: float = 0.0,
 ) -> PriceAlertResult:
+    """Ladder alert below ``threshold``: 700, then 695, 690, ... when ``step`` is 5.
+
+    Each ladder level alerts once. Price hovering around a level already alerted, or
+    between two levels, stays quiet. A gap through several levels sends one alert for
+    the lowest level crossed. The ladder resets to ``threshold`` once price recovers to
+    ``threshold + step`` or higher. ``step=0`` keeps the single-level behaviour: alert
+    once below ``threshold`` and re-arm at ``threshold``.
+    """
     numeric_price = float(price)
     numeric_threshold = float(threshold)
+    numeric_step = max(0.0, float(step))
+    reset_level = numeric_threshold + numeric_step
     state = load_price_alert_state(state_path)
-    is_below = numeric_price < numeric_threshold
     checked_text = checked_at.isoformat(timespec="seconds")
+    active = state.below_threshold
+    alert_level = state.alert_level if state.alert_level is not None else (numeric_threshold if active else None)
 
-    if is_below and not state.below_threshold:
-        title = f"铁矿石主连跌破 {numeric_threshold:g} 元/吨"
+    def lowest_crossed_level() -> float:
+        if numeric_step <= 0:
+            return numeric_threshold
+        # Largest k with price < threshold - k * step.
+        k = max(0, math.ceil((numeric_threshold - numeric_price) / numeric_step) - 1)
+        return numeric_threshold - k * numeric_step
+
+    next_level = (
+        numeric_threshold if not active
+        else (alert_level - numeric_step if numeric_step > 0 else None)
+    )
+    if next_level is not None and numeric_price < next_level:
+        level = lowest_crossed_level()
+        following = level - numeric_step
+        title = f"铁矿石主连跌破 {level:g} 元/吨"
+        ladder_note = (
+            f"下一次提醒：跌破 {following:g} 元/吨；价格回升到 {reset_level:g} 元/吨及以上后，"
+            f"从 {numeric_threshold:g} 重新开始提醒。"
+            if numeric_step > 0
+            else "价格回到阈值及以上后，再次跌破会重新提醒。"
+        )
         description = (
             f"- 当前价格：**{numeric_price:.1f} 元/吨**\n"
-            f"- 监控阈值：{numeric_threshold:.1f} 元/吨\n"
+            f"- 本次触发：{level:.1f} 元/吨（监控起点 {numeric_threshold:.1f}）\n"
             f"- 当前合约：{contract or 'I0'}\n"
             f"- 行情时间：{checked_at:%Y-%m-%d %H:%M:%S}\n\n"
+            f"{ladder_note}\n\n"
             "价格来自指数监控使用的铁矿石主连实时行情。"
         )
         notify(title, description)
         state.last_alert_at = checked_text
         status = "alerted"
-        message = f"已推送：{contract or 'I0'} {numeric_price:.1f} < {numeric_threshold:.1f}"
+        message = f"已推送：{contract or 'I0'} {numeric_price:.1f} < {level:g}"
         notified = True
-    elif is_below:
-        status = "below_suppressed"
-        message = f"仍低于阈值，已抑制重复通知：{numeric_price:.1f}"
-        notified = False
-    elif state.below_threshold:
+        active, alert_level = True, level
+    elif active and numeric_price >= reset_level:
         status = "rearmed"
-        message = f"价格已回到阈值上方，重新布防：{numeric_price:.1f}"
+        message = f"价格已回升到 {reset_level:g} 及以上，从 {numeric_threshold:g} 重新布防：{numeric_price:.1f}"
+        notified = False
+        active, alert_level = False, None
+    elif active:
+        status = "below_suppressed" if numeric_price < numeric_threshold else "rearm_pending"
+        waiting_for = f"下一档 {next_level:g}" if next_level is not None else f"回到 {reset_level:g}"
+        message = f"已提醒至 {alert_level:g}，等待{waiting_for}：{numeric_price:.1f}"
         notified = False
     else:
         status = "normal"
         message = f"价格未触发：{numeric_price:.1f}"
         notified = False
 
-    state.below_threshold = is_below
+    state.below_threshold = active
+    state.alert_level = alert_level
     state.last_price = numeric_price
     state.last_contract = str(contract or "I0")
     state.last_check_at = checked_text
     save_price_alert_state(state_path, state)
-    return PriceAlertResult(status, message, notified, is_below)
+    return PriceAlertResult(status, message, notified, numeric_price < numeric_threshold)
 
 
 def _optional_float(value) -> float | None:

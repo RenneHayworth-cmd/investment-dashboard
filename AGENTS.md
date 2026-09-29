@@ -87,8 +87,11 @@ before a larger handoff or commit.
 - Iron ore price alerts run independently through
   `scripts/monitor_iron_ore_price.py`; do not tie them to a Streamlit page loop.
   The default threshold is 700 yuan/ton (state and lock files are named per threshold, so a new threshold starts armed). Notify ordinary WeChat through
-  Hermes WeChat only on the first below-threshold observation, suppress repeats
-  until the price returns to or above the threshold, and never persist or log
+  Hermes WeChat as a ladder (user decision 2026-09-29): once below 700, then once
+  each time a new 5-yuan level (695, 690, ...) is broken; a gap through several
+  levels alerts once for the lowest. Hovering near an alerted level never
+  re-alerts. Reset the ladder only when price is back at 705 (threshold + step)
+  or higher. Never persist or log
   the SendKey. The Windows scheduled task may invoke the script every minute;
   the script itself must skip non-trading sessions.
 - Index MA20 updates use controlled concurrency through

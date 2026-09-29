@@ -126,5 +126,81 @@ class PriceAlertTests(unittest.TestCase):
             self.assertFalse(load_price_alert_state(state_path).below_threshold)
 
 
+class LadderAlertTests(unittest.TestCase):
+    """Alert at 700, then 695, 690, ...; hovering around a level never re-alerts."""
+
+    def _replay(self, prices, *, step):
+        notifications = []
+        statuses = []
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            for minute, price in enumerate(prices):
+                result = process_price_alert(
+                    price=price,
+                    threshold=700,
+                    contract="I2701",
+                    checked_at=datetime(2026, 9, 29, 10, minute % 60, tzinfo=ZoneInfo("Asia/Shanghai")),
+                    state_path=state_path,
+                    notify=lambda title, description: notifications.append((title, description)),
+                    step=step,
+                )
+                statuses.append(result.status)
+        return notifications, statuses
+
+    # 2026-09-29 around 11:00: 699.5 / 700.0 flips, which produced 7 alerts in 30 minutes.
+    OSCILLATION = [701.0, 699.5, 700.0, 699.5, 700.0, 699.5, 700.5, 699.5, 700.0, 699.5, 703.0, 699.0]
+
+    def titles(self, notifications):
+        return [title for title, _ in notifications]
+
+    def test_oscillation_around_700_alerts_once(self):
+        notifications, statuses = self._replay(self.OSCILLATION, step=5)
+        self.assertEqual(self.titles(notifications), ["铁矿石主连跌破 700 元/吨"])
+        self.assertNotIn("rearmed", statuses)
+        self.assertIn("下一次提醒：跌破 695 元/吨", notifications[0][1])
+        self.assertIn("回升到 705 元/吨及以上", notifications[0][1])
+
+    def test_each_lower_level_alerts_once(self):
+        prices = [699.5, 697.0, 695.0, 694.5, 695.5, 694.5, 692.0, 689.5, 690.5, 689.0]
+        notifications, _ = self._replay(prices, step=5)
+        self.assertEqual(
+            self.titles(notifications),
+            ["铁矿石主连跌破 700 元/吨", "铁矿石主连跌破 695 元/吨", "铁矿石主连跌破 690 元/吨"],
+        )
+
+    def test_gap_through_several_levels_sends_one_alert_for_the_lowest(self):
+        notifications, _ = self._replay([701.0, 688.0, 686.0, 684.5], step=5)
+        self.assertEqual(self.titles(notifications), ["铁矿石主连跌破 690 元/吨", "铁矿石主连跌破 685 元/吨"])
+
+    def test_recovery_to_705_resets_the_ladder(self):
+        prices = [699.0, 694.0, 702.0, 699.0, 705.0, 699.5]
+        notifications, statuses = self._replay(prices, step=5)
+        self.assertEqual(statuses, ["alerted", "alerted", "rearm_pending", "below_suppressed", "rearmed", "alerted"])
+        self.assertEqual(
+            self.titles(notifications),
+            ["铁矿石主连跌破 700 元/吨", "铁矿石主连跌破 695 元/吨", "铁矿石主连跌破 700 元/吨"],
+        )
+
+    def test_step_zero_keeps_the_single_level_behaviour(self):
+        notifications, _ = self._replay(self.OSCILLATION, step=0)
+        self.assertEqual(len(notifications), 6)  # every drop below 700 after touching 700 again
+
+    def test_state_from_before_the_ladder_resumes_at_the_next_level(self):
+        # The live state file written today has below_threshold=true and no alert_level.
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({"below_threshold": True, "last_price": 699.5}), encoding="utf-8")
+            notifications = []
+            for price in (699.0, 700.0, 694.5):
+                process_price_alert(
+                    price=price, threshold=700, contract="I2701",
+                    checked_at=datetime(2026, 9, 29, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                    state_path=state_path, step=5,
+                    notify=lambda title, description: notifications.append(title),
+                )
+            self.assertEqual(notifications, ["铁矿石主连跌破 695 元/吨"])
+            self.assertEqual(load_price_alert_state(state_path).alert_level, 695.0)
+
+
 if __name__ == "__main__":
     unittest.main()
