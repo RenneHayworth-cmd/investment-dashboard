@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 from web.backend.security import install_log_redaction
 install_log_redaction()
+from web.backend.network import install_default_request_timeout
+install_default_request_timeout()
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
