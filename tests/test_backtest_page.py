@@ -1,4 +1,5 @@
 from contextlib import ExitStack
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -64,6 +65,17 @@ class StrategyBacktestPageTests(unittest.TestCase):
 
         for mock in mocks:
             mock.assert_not_called()
+
+    def test_date_range_modes_default_to_2019_start(self):
+        with patch("core.db.init_db"):
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            for mode in ("单标的均线择时", "多ETF配置择时", "多基金动量轮动"):
+                app.radio[0].set_value(mode)
+                app.run()
+                _assert_clean(app)
+                dates = {item.label: item.value for item in app.sidebar.date_input}
+                self.assertEqual(dates["开始日期"], date(2019, 1, 1), mode)
+                self.assertEqual(dates["结束日期"], pd.Timestamp.today().date(), mode)
 
     def test_annual_mode_keeps_preflight_confirmation_and_run_sequence(self):
         preflight = SimpleNamespace(

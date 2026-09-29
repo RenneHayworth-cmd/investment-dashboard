@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 import os
 
 import pandas as pd
@@ -191,12 +190,8 @@ def render_timing_signal_chart(
     st.plotly_chart(fig, width="stretch")
 
 
-DEFAULT_TIMING_START_DATE = date(2019, 1, 1)
-
-
 def render_ma20_timing_mode() -> None:
-    _, default_end_date = default_backtest_dates()
-    default_start_date = DEFAULT_TIMING_START_DATE
+    default_start_date, default_end_date = default_backtest_dates()
     with st.sidebar:
         st.subheader("均线择时参数")
         ma_period = st.number_input("均线周期", min_value=2, max_value=250, value=20, step=1)

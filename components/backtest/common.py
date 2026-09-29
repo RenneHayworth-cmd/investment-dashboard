@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -39,10 +41,12 @@ def format_cache_time(value: str | None) -> str:
         return str(value).replace("T", " ")
 
 
+DEFAULT_BACKTEST_START_DATE = date(2019, 1, 1)
+
+
 def default_backtest_dates() -> tuple[object, object]:
-    end_date = pd.Timestamp.today().normalize()
-    start_date = end_date - pd.DateOffset(years=5)
-    return start_date.date(), end_date.date()
+    """Shared sidebar defaults: fixed start, today as the end."""
+    return DEFAULT_BACKTEST_START_DATE, pd.Timestamp.today().normalize().date()
 
 
 def load_rotation_cache(cache_symbol: str):
