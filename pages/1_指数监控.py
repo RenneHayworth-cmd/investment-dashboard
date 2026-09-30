@@ -850,9 +850,11 @@ if update_clicked:
     contract_history_errors = []
     completed_lunch_keys = set(st.session_state.get("index_lunch_quote_keys", []))
     quote_names, lunch_keys = manual_quote_request_names(completed_lunch_keys)
+    quote_errors: dict[str, str] = {}
     quotes = fetch_realtime_index_quotes(
         max_workers=INDEX_UPDATE_WORKERS,
         force_index_names=quote_names,
+        errors=quote_errors,
     )
     if quotes:
         remember_runtime_realtime_quotes(quotes)
@@ -915,9 +917,14 @@ if update_clicked:
         message_parts.append(result.message)
     if contract_history_errors:
         message_parts.append("当前合约正式日线更新失败：" + " | ".join(contract_history_errors))
+    if quote_errors:
+        message_parts.append(
+            "盘中报价更新失败，保留上次有效数据："
+            + " | ".join(f"{name}：{error}" for name, error in quote_errors.items())
+        )
     if not message_parts:
         message_parts.append("当前没有需要联网更新的指数数据")
-    level = "warning" if contract_history_errors or (result is not None and (result.status != "success" or result.errors)) else "success"
+    level = "warning" if quote_errors or contract_history_errors or (result is not None and (result.status != "success" or result.errors)) else "success"
     st.session_state.index_update_notice = (level, "；".join(message_parts))
     st.rerun()
 

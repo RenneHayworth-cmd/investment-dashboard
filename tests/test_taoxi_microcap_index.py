@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
 import json
+from io import StringIO
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 from services.index_frames import build_export_df
 from services.taoxi_microcap_index import (
@@ -222,10 +224,11 @@ class TaoxiMicrocapTests(unittest.TestCase):
         save.assert_not_called()
 
     @patch("services.taoxi_microcap_index.save_dataset")
-    @patch("services.taoxi_microcap_index.requests.get")
+    @patch("services.taoxi_microcap_index.requests.get", side_effect=requests.ConnectionError("代理不可用"))
+    @patch("services.taoxi_microcap_index.requests.Session")
     @patch("services.taoxi_microcap_index.load_taoxi_constituents")
     @patch("services.taoxi_microcap_index.load_taoxi_history")
-    def test_intraday_requires_all_20_and_never_persists(self, load_history, load_members, request_get, save):
+    def test_intraday_requires_all_20_and_never_persists(self, load_history, load_members, session_factory, proxy_get, save):
         codes = [f"600{i:03d}" for i in range(20)]
         load_history.return_value = (pd.DataFrame([{"trade_date": "2026-09-28", "close": 1000}]), None)
         load_members.return_value = (pd.DataFrame([
@@ -238,10 +241,163 @@ class TaoxiMicrocapTests(unittest.TestCase):
             for code in codes[:-1]
         ]}}
         response.raise_for_status.return_value = None
-        request_get.return_value = response
+        session_factory.return_value.get.return_value = response
         with self.assertRaisesRegex(TaoxiDataError, "盘中行情缺少"):
             fetch_taoxi_intraday_quote(datetime(2026, 9, 29, 10, tzinfo=ZoneInfo("Asia/Shanghai")))
         save.assert_not_called()
+
+    @patch("services.taoxi_microcap_index._RUNTIME_QUOTE", None)
+    @patch("services.taoxi_microcap_index.save_dataset")
+    @patch("services.taoxi_microcap_index.requests.Session")
+    @patch("services.taoxi_microcap_index.load_taoxi_constituents")
+    @patch("services.taoxi_microcap_index.load_taoxi_history")
+    def test_intraday_matches_numeric_csv_codes_and_keeps_halted_weight(
+        self, load_history, load_members, session_factory, save,
+    ):
+        now = datetime(2026, 9, 30, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+        codes = [f"{i:06d}" for i in range(1, 11)] + [f"600{i:03d}" for i in range(10)]
+        history = pd.DataFrame([{"trade_date": "2026-09-29", "close": 1000.0}])
+        members = pd.DataFrame([
+            {"effective_date": "2026-09-30", "selection_date": "2026-09-29", "代码": code, "rank": rank}
+            for rank, code in enumerate(codes, 1)
+        ])
+        # 复现真实 core.cache 的 CSV 读回：六位代码变成整数，前导零丢失。
+        cached_members = pd.read_csv(StringIO(members.to_csv(index=False)))
+        self.assertEqual(cached_members["代码"].dtype.kind, "i")
+        load_history.return_value = (history, None)
+        load_members.return_value = (cached_members, None)
+        response = Mock()
+        rows = [
+            {"f12": code, "f2": 10.2, "f17": 10, "f18": 10, "f5": 1, "f6": 1, "f124": int(now.timestamp())}
+            for code in codes
+        ]
+        rows[0].update({"f2": "-", "f17": "-", "f18": "-", "f5": 0, "f6": 0})
+        response.json.return_value = {"data": {"diff": rows}}
+        session_factory.return_value.get.return_value = response
+
+        result = fetch_taoxi_intraday_quote(now)
+
+        self.assertAlmostEqual(result["price"], 1019.0)
+        self.assertAlmostEqual(result["change_pct"], 1.9)
+        self.assertEqual(result["constituent_count"], 20)
+        self.assertEqual(result["quote_time"], now)
+        requested = session_factory.return_value.get.call_args.kwargs["params"]["secids"].split(",")
+        self.assertEqual(len(requested), 20)
+        self.assertIn("0.000001", requested)
+        self.assertIn("1.600000", requested)
+        self.assertEqual(cached_members["代码"].dtype.kind, "i")
+        self.assertEqual(history.iloc[0]["close"], 1000.0)
+        self.assertFalse(session_factory.return_value.trust_env)
+        session_factory.return_value.close.assert_called_once()
+        save.assert_not_called()
+
+        with self.subTest("直连失败后使用环境代理"):
+            session_factory.return_value.get.side_effect = requests.ConnectionError("直连失败")
+            with patch("services.taoxi_microcap_index.requests.get", return_value=response) as proxy_get:
+                fallback_result = fetch_taoxi_intraday_quote(now)
+            self.assertAlmostEqual(fallback_result["price"], 1019.0)
+            proxy_get.assert_called_once()
+            self.assertEqual(proxy_get.call_args.kwargs["params"]["secids"].split(","), requested)
+            save.assert_not_called()
+
+
+class TaoxiIntradayFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 9, 30, 11, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.codes = [f"{i:06d}" for i in range(1, 11)] + [f"600{i:03d}" for i in range(10)]
+        history = pd.DataFrame([{"trade_date": "2026-09-29", "close": 1000.0}])
+        members = pd.DataFrame([
+            {"effective_date": "2026-09-30", "selection_date": "2026-09-29", "代码": code, "rank": rank}
+            for rank, code in enumerate(self.codes, 1)
+        ])
+        self.enterContext(patch("services.taoxi_microcap_index.load_taoxi_history", return_value=(history, None)))
+        self.enterContext(patch("services.taoxi_microcap_index.load_taoxi_constituents", return_value=(members, None)))
+        self.save = self.enterContext(patch("services.taoxi_microcap_index.save_dataset"))
+        self.session = self.enterContext(patch("services.taoxi_microcap_index.requests.Session")).return_value
+        self.proxy_get = self.enterContext(patch("services.taoxi_microcap_index.requests.get",
+            side_effect=requests.ConnectionError("代理不可用")))
+        self.previous = {"price": 999.0, "source": "上次有效数据"}
+        self.enterContext(patch("services.taoxi_microcap_index._RUNTIME_QUOTE", self.previous))
+
+    def eastmoney_response(self, codes=None, **overrides):
+        response = Mock()
+        response.json.return_value = {"data": {"diff": [
+            dict({"f12": code, "f2": 10.2, "f17": 10, "f18": 10,
+                "f5": 100, "f6": 1020, "f124": int(self.now.timestamp())}, **overrides)
+            for code in (self.codes if codes is None else codes)
+        ]}}
+        return response
+
+    def tencent_response(self, override=None):
+        lines = []
+        for code in self.codes:
+            fields = [""] * 38
+            fields[2], fields[3], fields[4], fields[5] = code, "10.2", "10", "10"
+            fields[6], fields[30], fields[37] = "100", self.now.strftime("%Y%m%d%H%M%S"), "1.02"
+            if override is not None:
+                override(code, fields)
+            market = "sh" if code.startswith("6") else "sz"
+            lines.append(f'v_{market}{code}="' + "~".join(fields) + '";')
+        return Mock(content="\n".join(lines).encode("gbk"))
+
+    def test_connection_failure_uses_one_direct_tencent_batch(self):
+        self.session.get.side_effect = [requests.ConnectionError("东方财富断开"), self.tencent_response()]
+        result = fetch_taoxi_intraday_quote(self.now)
+        self.assertAlmostEqual(result["price"], 1020.0)
+        self.assertAlmostEqual(result["change_pct"], 2.0)
+        self.assertEqual(result["quote_time"], self.now)
+        self.assertEqual(result["source"], "腾讯20只成分批量实时行情")
+        url = self.session.get.call_args.args[0]
+        self.assertEqual(url, "https://qt.gtimg.cn/q=" + ",".join(
+            ("sh" if c.startswith("6") else "sz") + c for c in self.codes))
+        self.assertEqual(self.session.get.call_count, 2)
+        self.assertFalse(self.session.trust_env)
+        self.session.close.assert_called_once()
+        self.proxy_get.assert_not_called()
+        self.save.assert_not_called()
+
+    def test_partial_eastmoney_response_uses_complete_tencent_batch(self):
+        self.session.get.side_effect = [self.eastmoney_response(self.codes[:-1]), self.tencent_response()]
+        result = fetch_taoxi_intraday_quote(self.now)
+        self.assertAlmostEqual(result["price"], 1020.0)
+        self.assertEqual(result["constituent_count"], 20)
+        self.proxy_get.assert_not_called()
+        self.save.assert_not_called()
+
+    def test_halted_tencent_member_keeps_its_weight(self):
+        def halted(code, fields):
+            if code == self.codes[0]:
+                fields[3] = fields[4] = fields[5] = fields[6] = fields[37] = "0"
+                fields[30] = "20260929150000"
+        self.session.get.side_effect = [requests.ConnectionError("断开"), self.tencent_response(halted)]
+        result = fetch_taoxi_intraday_quote(self.now)
+        self.assertAlmostEqual(result["price"], 1019.0)
+        self.assertEqual(result["quote_time"], self.now)
+        self.save.assert_not_called()
+
+    def test_stale_active_tencent_quote_falls_back_to_proxy(self):
+        def stale(code, fields):
+            if code == self.codes[0]:
+                fields[30] = "20260929150000"
+        self.session.get.side_effect = [requests.ConnectionError("断开"), self.tencent_response(stale)]
+        self.proxy_get.side_effect = None
+        self.proxy_get.return_value = self.eastmoney_response()
+        result = fetch_taoxi_intraday_quote(self.now)
+        self.assertEqual(result["source"], "东方财富20只成分批量实时行情")
+        self.proxy_get.assert_called_once()
+        self.save.assert_not_called()
+
+    def test_failed_batches_retain_previous_quote_and_never_persist(self):
+        from services.taoxi_microcap_index import load_runtime_taoxi_quote
+        def mismatched(code, fields):
+            if code == self.codes[0]:
+                fields[2] = "000999"
+        self.session.get.side_effect = [self.eastmoney_response(f124=int(self.now.timestamp()) - 86400),
+            self.tencent_response(mismatched)]
+        with self.assertRaisesRegex(TaoxiDataError, "盘中行情日期或时间无效.*盘中行情缺少000001"):
+            fetch_taoxi_intraday_quote(self.now)
+        self.assertEqual(load_runtime_taoxi_quote(), self.previous)
+        self.save.assert_not_called()
 
 
 if __name__ == "__main__":

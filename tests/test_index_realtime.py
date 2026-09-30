@@ -30,6 +30,24 @@ from services.index_realtime import (
 
 
 class IndexRealtimeTests(unittest.TestCase):
+    @patch("services.taoxi_microcap_index.fetch_taoxi_intraday_quote", side_effect=RuntimeError("东方财富20只成分行情不完整"))
+    @patch("services.index_realtime._fetch_eastmoney_quote")
+    def test_manual_taoxi_quote_failure_is_reported_without_losing_other_quotes(self, eastmoney, taoxi):
+        from services.index_realtime import fetch_realtime_index_quotes
+
+        now = datetime(2026, 9, 30, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
+        names, _ = manual_quote_request_names(now=now)
+        self.assertIn("桃囍微盘", names)
+        eastmoney.return_value = {"price": 3500.0, "quote_time": now}
+        errors = {}
+        quotes = fetch_realtime_index_quotes(
+            now=now, force_index_names={"桃囍微盘", "上证指数"}, max_workers=2, errors=errors,
+        )
+
+        taoxi.assert_called_once_with(now)
+        self.assertEqual(quotes, {"上证指数": eastmoney.return_value})
+        self.assertEqual(errors, {"桃囍微盘": "东方财富20只成分行情不完整"})
+
     def test_only_hshylv_enables_miaoxiang_backup_after_entity_audit(self):
         self.assertEqual(INDEX_CONFIG["恒生港股通高息低波"]["mx_expected_code"], "HSHYLV.HI")
         self.assertNotIn("mx_expected_code", INDEX_CONFIG["微盘股"])

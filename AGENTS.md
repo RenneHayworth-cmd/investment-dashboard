@@ -166,6 +166,13 @@ before a larger handoff or commit.
   On an A-share trading day, fetch one ETF quote batch every 10 minutes from
   09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
   lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
+- `桃囍微盘` (`TXWP20`) manual index updates calculate transient intraday points
+  from the 20 confirmed T-1 constituents. Normalize CSV-loaded stock codes to
+  six-digit strings before quote lookup; never persist the intraday result into
+  formal history. Try EastMoney then Tencent batch quotes directly before trying
+  environment proxies. Require all 20 unique members and same-day timestamps for
+  trading stocks; a partial or stale batch must fall back, never reduce the divisor.
+  Surface quote/calculation failures while retaining valid caches.
   from 14:50 through 15:00. Each batch updates all ETF cards and the transient
   timing-table preview for configured timing symbols. Use the same schedule to
   refresh the `I2701` futures card and the two futures-spread cards, retaining

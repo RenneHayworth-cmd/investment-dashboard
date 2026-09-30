@@ -891,6 +891,7 @@ def fetch_realtime_index_quotes(
     now: datetime | None = None,
     max_workers: int = 8,
     force_index_names: set[str] | None = None,
+    errors: dict[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
     forced = force_index_names or set()
     force_only = force_index_names is not None
@@ -925,7 +926,9 @@ def fetch_realtime_index_quotes(
             index_name = futures[future]
             try:
                 quote = future.result()
-            except Exception:
+            except Exception as exc:
+                if errors is not None:
+                    errors[index_name] = str(exc)
                 quote = None
             if quote is not None:
                 quotes[index_name] = quote

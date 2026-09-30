@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, time
 from pathlib import Path
 from threading import Lock
@@ -579,6 +580,70 @@ def _secid(code: str) -> str:
     return ("1." if str(code).startswith("6") else "0.") + str(code)
 
 
+def _tencent_constituent_rows(response, codes: list[str]) -> list[dict]:
+    """Map one Tencent stock batch to the fields used by the intraday calculation."""
+    expected = {("sh" if code.startswith("6") else "sz", code) for code in codes}
+    rows = []
+    for market, code, payload in re.findall(
+        r'v_(sh|sz)(\d{6})="([^"]*)"', response.content.decode("gbk", errors="replace")
+    ):
+        fields = payload.split("~")
+        if (market, code) not in expected or len(fields) < 38 or fields[2] != code:
+            continue
+        try:
+            stamp = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(
+                tzinfo=ZoneInfo("Asia/Shanghai")
+            ).timestamp()
+        except ValueError:
+            stamp = None
+        # Units differ between providers; volume/amount are used only to identify zero trades.
+        rows.append({"f12": code, "f2": fields[3], "f18": fields[4], "f17": fields[5],
+            "f5": fields[6], "f6": fields[37], "f124": stamp})
+    return rows
+
+
+def _calculate_intraday_quote(
+    rows: list[dict], codes: list[str], previous_close: float, current: datetime, source: str,
+) -> dict[str, object]:
+    by_code = {}
+    for row in rows:
+        code = str(row.get("f12") or "").zfill(6)
+        if code in codes:
+            if code in by_code:
+                raise TaoxiDataError(f"盘中行情代码重复：{code}")
+            by_code[code] = row
+    ratios, quote_times = [], []
+    for code in codes:
+        row = by_code.get(code)
+        if row is None:
+            raise TaoxiDataError(f"盘中行情缺少{code}")
+        latest, opened, preclose = (pd.to_numeric(row.get(key), errors="coerce") for key in ("f2", "f17", "f18"))
+        volume, amount = (pd.to_numeric(row.get(key), errors="coerce") for key in ("f5", "f6"))
+        halted = (not pd.isna(volume) and volume == 0) or (not pd.isna(amount) and amount == 0)
+        if halted:
+            ratios.append(1.0)
+        elif any(pd.isna(value) or not math.isfinite(float(value)) or float(value) <= 0
+                 for value in (latest, opened, preclose)):
+            raise TaoxiDataError(f"盘中行情字段不完整：{code}")
+        else:
+            ratios.append(float(latest) / float(preclose))
+        stamp = pd.to_numeric(row.get("f124"), errors="coerce")
+        try:
+            quote_time = datetime.fromtimestamp(float(stamp), ZoneInfo("Asia/Shanghai"))
+        except (ValueError, OverflowError, OSError):
+            quote_time = None
+        if not halted and (quote_time is None or quote_time.date() != current.date()
+                           or quote_time.timestamp() > current.timestamp() + 300):
+            raise TaoxiDataError(f"盘中行情日期或时间无效：{code}")
+        if quote_time is not None and quote_time.timestamp() <= current.timestamp() + 300:
+            quote_times.append(quote_time)
+    mean_ratio = sum(ratios) / 20
+    return {"price": previous_close * mean_ratio, "previous_close": previous_close,
+        "change_pct": (mean_ratio - 1) * 100,
+        "quote_time": max(quote_times) if quote_times else current,
+        "source": source, "constituent_count": 20}
+
+
 def fetch_taoxi_intraday_quote(now: datetime | None = None) -> dict[str, object]:
     current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     history, _ = load_taoxi_history()
@@ -588,43 +653,54 @@ def fetch_taoxi_intraday_quote(now: datetime | None = None) -> dict[str, object]
     latest_close_row = history.sort_values("trade_date").iloc[-1]
     previous_close = float(latest_close_row["close"])
     effective_date = pd.Timestamp(current.date())
-    members = constituents[pd.to_datetime(constituents["effective_date"]).eq(effective_date)].sort_values("rank")
+    members = constituents[pd.to_datetime(constituents["effective_date"]).eq(effective_date)].sort_values("rank").copy()
+    # CSV 读回时纯数字代码会成为整数，须恢复六位字符串才能匹配实时源。
+    members["代码"] = _codes(members["代码"])
     if len(members) != 20:
         raise TaoxiDataError("当天没有20只已确认生效成分")
+    codes = members["代码"].tolist()
+    if len(set(codes)) != 20 or any(not re.fullmatch(r"[036]\d{5}", code) for code in codes):
+        raise TaoxiDataError("当天成分代码无效或重复")
     selection_dates = pd.to_datetime(members["selection_date"], errors="coerce").dropna().dt.normalize().unique()
     latest_formal_date = pd.Timestamp(latest_close_row["trade_date"]).normalize()
     if len(selection_dates) != 1 or pd.Timestamp(selection_dates[0]).normalize() != latest_formal_date:
         raise TaoxiDataError("正式点位链存在缺口，禁止基于陈旧收盘计算盘中点位")
     params = {"fltt": 2, "invt": 2, "fields": "f2,f12,f17,f18,f5,f6,f124",
-        "secids": ",".join(_secid(code) for code in members["代码"])}
-    response = requests.get("https://push2.eastmoney.com/api/qt/ulist.np/get", params=params,
-        headers={"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0"}, timeout=12)
-    response.raise_for_status()
-    rows = ((response.json().get("data") or {}).get("diff") or [])
-    by_code = {str(row.get("f12") or "").zfill(6): row for row in rows}
-    ratios = []
-    quote_times = []
-    for _, member in members.iterrows():
-        code = member["代码"]
-        row = by_code.get(code)
-        if row is None:
-            raise TaoxiDataError(f"盘中行情缺少{code}")
-        latest, opened, preclose = (pd.to_numeric(row.get(key), errors="coerce") for key in ("f2", "f17", "f18"))
-        volume, amount = (pd.to_numeric(row.get(key), errors="coerce") for key in ("f5", "f6"))
-        halted = (not pd.isna(volume) and volume == 0) or (not pd.isna(amount) and amount == 0)
-        if halted:
-            ratios.append(1.0)
-        elif any(pd.isna(value) or float(value) <= 0 for value in (latest, opened, preclose)):
-            raise TaoxiDataError(f"盘中行情字段不完整：{code}")
-        else:
-            ratios.append(float(latest) / float(preclose))
-        stamp = pd.to_numeric(row.get("f124"), errors="coerce")
-        if not pd.isna(stamp):
-            quote_times.append(datetime.fromtimestamp(float(stamp), ZoneInfo("Asia/Shanghai")))
-    quote_time = max(quote_times) if quote_times else current
-    result = {"price": previous_close * sum(ratios) / 20, "previous_close": previous_close,
-        "change_pct": (sum(ratios) / 20 - 1) * 100, "quote_time": quote_time,
-        "source": "东方财富20只成分批量实时行情", "constituent_count": 20}
+        "secids": ",".join(_secid(code) for code in codes)}
+    url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+    tencent_url = "https://qt.gtimg.cn/q=" + ",".join(
+        ("sh" if code.startswith("6") else "sz") + code for code in codes
+    )
+    headers = {"Referer": "https://quote.eastmoney.com/", "User-Agent": "Mozilla/5.0"}
+    session = requests.Session()
+    session.trust_env = False
+    result = None
+    failures = []
+    try:
+        # Try an independent direct source before falling back to environment proxies.
+        # A partial, malformed or stale response is also a failed attempt, never a partial index.
+        for use_proxy in (False, True):
+            get = requests.get if use_proxy else session.get
+            for provider, endpoint in (("东方财富", url), ("腾讯", tencent_url)):
+                try:
+                    response = get(endpoint, params=params if provider == "东方财富" else None,
+                        headers=headers, timeout=(3, 5))
+                    response.raise_for_status()
+                    rows = (((response.json().get("data") or {}).get("diff") or [])
+                            if provider == "东方财富" else _tencent_constituent_rows(response, codes))
+                    result = _calculate_intraday_quote(
+                        rows, codes, previous_close, current, f"{provider}20只成分批量实时行情"
+                    )
+                    break
+                except (requests.RequestException, TaoxiDataError, ValueError, TypeError, AttributeError) as exc:
+                    route = "代理" if use_proxy else "直连"
+                    failures.append(f"{provider}{route}：{str(exc)[:180]}")
+            if result is not None:
+                break
+    finally:
+        session.close()
+    if result is None:
+        raise TaoxiDataError("20只成分实时行情均失败：" + "；".join(failures))
     with _RUNTIME_LOCK:
         global _RUNTIME_QUOTE
         _RUNTIME_QUOTE = dict(result)
