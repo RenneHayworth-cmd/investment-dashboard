@@ -36,6 +36,8 @@ from services.microcap_live_trading import (
     list_microcap_cash_flows,
     list_microcap_position_adjustments,
     list_microcap_trades,
+    microcap_first_event_date,
+    microcap_ledger_codes,
 )
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -108,22 +110,6 @@ def _summarize_positions(positions: pd.DataFrame) -> dict:
     }
 
 
-def _ledger_codes(trades, adjustments):
-    values = set()
-    for frame, col in ((trades, "symbol"), (adjustments, "symbol")):
-        if frame is not None and not frame.empty and col in frame:
-            values.update(frame[col].dropna().astype(str).str.extract(r"(\d{6})", expand=False).dropna())
-    return sorted(values)
-
-
-def _first_event_date(trades, flows, adjustments):
-    values = []
-    for frame, col in ((trades, "trade_date"), (flows, "flow_date"), (adjustments, "event_date")):
-        if frame is not None and not frame.empty and col in frame:
-            values.extend(frame[col].dropna().astype(str).tolist())
-    return min(values) if values else None
-
-
 def _load_market_state(codes, first_date, current, manual_refresh):
     target = microcap_target_date(current)
     state_key = "microcap_live_history_state"
@@ -137,12 +123,14 @@ def _load_market_state(codes, first_date, current, manual_refresh):
     should_fetch = bool(
         manual_refresh or old.get("scope") != scope or old.get("target") != target or elapsed >= 600
     )
-    if should_fetch:
-        st.session_state[state_key] = {"scope": scope, "target": target, "attempted_at": current.isoformat()}
     histories, failures = load_microcap_histories(
         codes, start_date=first_date, api_key=st.session_state.get("microcap_live_tickflow_key", os.getenv("TICKFLOW_API_KEY", "")),
         allow_fetch=should_fetch, market_now=current,
     )
+    if should_fetch:
+        # Recorded only after the per-code loop finishes: a rerun that interrupts it
+        # (2026-09-30: stopped after 600561, every 688 code left at 09-28) retries at once.
+        st.session_state[state_key] = {"scope": scope, "target": target, "attempted_at": current.isoformat()}
     return target, histories, failures, should_fetch
 
 
@@ -152,8 +140,8 @@ def render_microcap_dashboard() -> None:
     trades = list_microcap_trades()
     flows = list_microcap_cash_flows()
     adjustments = list_microcap_position_adjustments()
-    codes = _ledger_codes(trades, adjustments)
-    first_date = _first_event_date(trades, flows, adjustments)
+    codes = microcap_ledger_codes(trades, adjustments)
+    first_date = microcap_first_event_date(trades, flows, adjustments)
     manual_refresh = st.button("更新正式行情", key="microcap_live_refresh_formal")
     target, histories, failures, history_refreshed = _load_market_state(codes, first_date, current, manual_refresh)
 

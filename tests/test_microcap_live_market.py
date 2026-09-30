@@ -4,8 +4,18 @@ from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from services import microcap_live_market as market
+
+REAL_TENCENT_QUOTES = market._tencent_quotes
+
+
+@pytest.fixture(autouse=True)
+def _no_tencent_network():
+    """Tencent sits between EastMoney and AkShare; tests opt in by patching it themselves."""
+    with patch.object(market, "_tencent_quotes", return_value={}):
+        yield
 
 
 class MicrocapLiveMarketTests(unittest.TestCase):
@@ -301,6 +311,7 @@ class MicrocapLiveMarketTests(unittest.TestCase):
             patch("services.microcap_live_market._eastmoney_quotes", return_value={
                 "002316": {"price": 4.36, "quote_time": datetime(2026, 9, 28, 15, 5, 30, tzinfo=tz)},
             }),
+            patch("services.microcap.load_microcap_constituent_snapshots", return_value=(pd.DataFrame(), None)),
         ):
             histories, failures = market.load_microcap_histories(
                 ["002316"], allow_fetch=True, market_now=datetime(2026, 9, 28, 15, 6, tzinfo=tz),
@@ -352,6 +363,7 @@ class MicrocapLiveMarketTests(unittest.TestCase):
             patch("services.microcap_live_market._eastmoney_quotes", return_value={
                 "002316": {"price": 4.34, "quote_time": datetime(2026, 9, 28, 14, 59, 57, tzinfo=tz)},
             }),
+            patch("services.microcap.load_microcap_constituent_snapshots", return_value=(pd.DataFrame(), None)),
         ):
             histories, failures = market.load_microcap_histories(
                 ["002316"], allow_fetch=True, market_now=datetime(2026, 9, 28, 15, 6, tzinfo=tz),
@@ -393,3 +405,143 @@ def test_no_quote_request_before_the_open():
             ["600000"], api_key="k", market_now=datetime(2026, 9, 29, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")))
     tickflow.assert_not_called()
     assert (quotes, failures) == ({}, {})
+
+
+def _bk1158_snapshot(day, taken, rows):
+    return pd.DataFrame([
+        {"快照日期": day, "快照时间": taken, "代码": code, "最新价": price, "是否停牌": halted}
+        for code, price, halted in rows
+    ])
+
+
+def test_bk1158_constituent_snapshot_is_the_last_close_fallback():
+    tz = ZoneInfo("Asia/Shanghai")
+    close_at = datetime(2026, 9, 29, 15, 0, tzinfo=tz)
+    snap = _bk1158_snapshot("2026-09-29", "2026-09-29 15:05:19", [
+        ("688021", 20.27, False), ("300635", 11.9, True), ("002316", 4.4, False),
+    ])
+    with (
+        patch("services.microcap_live_market._tickflow_quotes", return_value={
+            "002316": {"price": 4.36, "quote_time": datetime(2026, 9, 29, 15, 0, 3, tzinfo=tz)},
+        }),
+        patch("services.microcap_live_market._eastmoney_quotes", side_effect=ConnectionError("down")),
+        patch("services.microcap.load_microcap_constituent_snapshots", return_value=(snap, None)),
+    ):
+        result, error = market._close_snapshots(["002316", "300635", "688021", "688067"], "k", close_at, close_at)
+    assert result == {
+        "002316": {"price": 4.36, "cache_source": "tickflow_close_snapshot"},  # network quote keeps priority
+        "688021": {"price": 20.27, "cache_source": "bk1158_close_snapshot"},
+    }  # 300635 suspended and 688067 absent are left to the daily bars
+    assert "东方财富" in error
+
+
+def test_bk1158_snapshot_must_be_taken_on_the_day_after_the_close():
+    tz = ZoneInfo("Asia/Shanghai")
+    close_at = datetime(2026, 9, 24, 15, 0, tzinfo=tz)
+    for taken in ("2026-09-24 14:30:00", "2026-09-26 19:56:27"):  # intraday, or re-taken days later
+        snap = _bk1158_snapshot("2026-09-24", taken, [("688021", 20.22, False)])
+        with patch("services.microcap.load_microcap_constituent_snapshots", return_value=(snap, None)):
+            assert market._bk1158_snapshot_closes(["688021"], close_at) == {}
+
+
+
+def _tencent_payload(rows):
+    """rows: (prefix, code, price, volume, stamp) -> a GBK Tencent batch body."""
+    lines = []
+    for prefix, code, price, volume, stamp in rows:
+        fields = ["1", "名称", code, str(price), "4.50", "4.60", str(volume)] + ["0"] * 23 + [stamp] + ["0"] * 10
+        lines.append(f'v_{prefix}{code}="{"~".join(fields)}";')
+    return "\n".join(lines).encode("gbk")
+
+
+def test_tencent_rows_keep_only_stocks_traded_today():
+    tz = ZoneInfo("Asia/Shanghai")
+    current = datetime(2026, 9, 30, 15, 6, tzinfo=tz)
+    body = _tencent_payload([
+        ("sz", "002316", 4.95, 120000, "20260930150003"),
+        ("bj", "920799", 30.36, 19020, "20260930150000"),
+        ("bj", "830799", 34.28, 0, "20260930090000"),     # delisted old code: no trade today
+        ("sh", "688021", 19.84, 5000, "20260929150000"),   # yesterday's quote
+        ("sz", "600000", 9.48, 5000, "20260930150000"),    # wrong exchange for the code
+    ])
+    rows = market._tencent_rows(body, ["002316", "920799", "830799", "688021", "600000"], current, "直连")
+    assert sorted(rows) == ["002316", "920799"]
+    assert rows["002316"]["price"] == 4.95
+    assert rows["002316"]["quote_time"] == datetime(2026, 9, 30, 15, 0, 3, tzinfo=tz)
+    assert rows["002316"]["source"] == "腾讯实时行情（直连）"
+    assert [market._tencent_symbol(c) for c in ("600000", "900901", "002316", "300635", "920799", "430047")] == [
+        "sh600000", "sh900901", "sz002316", "sz300635", "bj920799", "bj430047"]
+
+
+def test_tencent_batch_tries_direct_connection_before_proxy():
+    current = datetime(2026, 9, 30, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    routes, urls = [], []
+
+    class Response:
+        content = _tencent_payload([("sz", "002316", 4.8, 100, "20260930095958")])
+
+        def raise_for_status(self):
+            pass
+
+    class Session:
+        def __init__(self):
+            self.trust_env = True
+
+        def get(self, url, **kwargs):
+            routes.append(self.trust_env)
+            urls.append(url)
+            if not self.trust_env:
+                raise ConnectionError("direct blocked")
+            return Response()
+
+        def close(self):
+            pass
+
+    with patch.object(market.requests, "Session", Session):
+        result = REAL_TENCENT_QUOTES(["002316", "688021"], current)
+    assert routes == [False, True]
+    assert urls[0] == "https://qt.gtimg.cn/q=sz002316,sh688021"
+    assert list(result) == ["002316"] and "代理" in result["002316"]["source"]
+
+    with patch.object(market.requests, "Session", Session), \
+         patch.object(Session, "get", side_effect=ConnectionError("both down")):
+        with pytest.raises(ConnectionError):
+            REAL_TENCENT_QUOTES(["002316"], current)
+
+
+def test_tencent_fills_what_tickflow_and_eastmoney_missed_before_akshare():
+    current = datetime(2026, 9, 30, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    tencent = {"300635": {"price": 11.8, "quote_time": current, "source": "腾讯实时行情（直连）", "status": "实时"}}
+    with (
+        patch("services.microcap_live_market._tickflow_quotes", side_effect=TimeoutError("rate limited")),
+        patch("services.microcap_live_market._eastmoney_quotes", side_effect=ConnectionError("down")),
+        patch("services.microcap_live_market._tencent_quotes", return_value=tencent) as tx,
+        patch("services.microcap_live_market._akshare_quote") as ak_mock,
+    ):
+        quotes, failures = market.fetch_microcap_realtime_quotes(["300635"], api_key="k", market_now=current)
+    tx.assert_called_once_with(["300635"], current)
+    ak_mock.assert_not_called()
+    assert quotes == tencent and not failures
+
+
+def test_tencent_close_snapshot_sits_between_eastmoney_and_bk1158():
+    tz = ZoneInfo("Asia/Shanghai")
+    close_at = datetime(2026, 9, 30, 15, 0, tzinfo=tz)
+    snap = _bk1158_snapshot("2026-09-30", "2026-09-30 15:05:19", [("688021", 19.9, False), ("300635", 11.8, False)])
+    with (
+        patch("services.microcap_live_market._tickflow_quotes", return_value={}),
+        patch("services.microcap_live_market._eastmoney_quotes", side_effect=ConnectionError("down")),
+        patch("services.microcap_live_market._tencent_quotes", return_value={
+            "002316": {"price": 4.95, "quote_time": datetime(2026, 9, 30, 15, 0, 3, tzinfo=tz)},
+            "688021": {"price": 19.84, "quote_time": datetime(2026, 9, 30, 14, 59, 58, tzinfo=tz)},  # before the close
+        }) as tx,
+        patch("services.microcap.load_microcap_constituent_snapshots", return_value=(snap, None)),
+    ):
+        result, error = market._close_snapshots(["002316", "688021"], "k", close_at, close_at)
+    tx.assert_called_once_with(["002316", "688021"], close_at)
+    assert result == {
+        "002316": {"price": 4.95, "cache_source": "tencent_close_snapshot"},
+        "688021": {"price": 19.9, "cache_source": "bk1158_close_snapshot"},
+    }
+    assert "东方财富" in error
+    assert market.HISTORY_SOURCES.index("tencent_close_snapshot") < market.HISTORY_SOURCES.index("bk1158_close_snapshot")

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import math
+import re
 
 import pandas as pd
 import requests
@@ -19,7 +20,11 @@ TZ = ZoneInfo("Asia/Shanghai")
 # it comes from a post-close quote snapshot (see load_microcap_histories).
 SETTLEMENT_DELAY = timedelta(minutes=5)
 # Merge priority: official daily bars win over post-close snapshots for the same date.
-HISTORY_SOURCES = ("tickflow", "akshare", "akshare_tx", "tickflow_close_snapshot", "eastmoney_close_snapshot")
+HISTORY_SOURCES = (
+    "tickflow", "akshare", "akshare_tx",
+    "tickflow_close_snapshot", "eastmoney_close_snapshot", "tencent_close_snapshot",
+    "bk1158_close_snapshot",
+)
 
 
 def microcap_target_date(market_now: datetime) -> str:
@@ -270,12 +275,13 @@ def load_microcap_histories(
 def _close_snapshots(
     codes: list[str], api_key: str, current: datetime, close_at: datetime,
 ) -> tuple[dict[str, dict], str]:
-    """Post-close quotes stamped at or after today's close; TickFlow first, then EastMoney."""
+    """Post-close quotes stamped at or after today's close: TickFlow, EastMoney, Tencent, then the local BK1158 snapshot."""
     result: dict[str, dict] = {}
     errors = []
     for label, cache_source, fetch in (
         ("TickFlow收盘快照", "tickflow_close_snapshot", lambda missing: _tickflow_quotes(missing, api_key.strip(), current)),
         ("东方财富收盘快照", "eastmoney_close_snapshot", lambda missing: _eastmoney_quotes(missing, current)),
+        ("腾讯收盘快照", "tencent_close_snapshot", lambda missing: _tencent_quotes(missing, current)),
     ):
         missing = [code for code in codes if code not in result]
         if not missing:
@@ -291,7 +297,39 @@ def _close_snapshots(
             price = pd.to_numeric(quote.get("price"), errors="coerce")
             if code in missing and quote_time >= close_at and pd.notna(price) and float(price) > 0:
                 result[code] = {"price": float(price), "cache_source": cache_source}
+    missing = [code for code in codes if code not in result]
+    if missing:
+        try:
+            result.update(_bk1158_snapshot_closes(missing, close_at))
+        except Exception as exc:
+            errors.append(_brief("BK1158成分快照", exc))
     return result, "; ".join(errors)
+
+
+def _bk1158_snapshot_closes(codes: list[str], close_at: datetime) -> dict[str, dict]:
+    """Last resort from the local 15:05 BK1158 constituent snapshot (no network).
+
+    Its time is when the 400-stock list was taken, not a per-stock trade time, so only a
+    snapshot taken on the same day at or after the close counts, and suspended rows are
+    left to the daily bars. Held stocks that have left BK1158 are simply absent.
+    """
+    from services.microcap import load_microcap_constituent_snapshots
+
+    snapshots, _ = load_microcap_constituent_snapshots()
+    if snapshots is None or snapshots.empty:
+        return {}
+    rows = snapshots[snapshots["快照日期"].astype(str) == close_at.date().isoformat()]
+    result: dict[str, dict] = {}
+    for _, row in rows.iterrows():
+        code = str(row.get("代码") or "").zfill(6)
+        taken = pd.Timestamp(row.get("快照时间"))
+        if code not in codes or pd.isna(taken) or bool(row.get("是否停牌")):
+            continue
+        taken = taken.tz_localize(TZ) if taken.tzinfo is None else taken.tz_convert(TZ)
+        price = pd.to_numeric(row.get("最新价"), errors="coerce")
+        if taken >= close_at and taken.date() == close_at.date() and pd.notna(price) and float(price) > 0:
+            result[code] = {"price": float(price), "cache_source": "bk1158_close_snapshot"}
+    return result
 
 
 def quote_phase(market_now: datetime) -> str | None:
@@ -432,6 +470,68 @@ def _eastmoney_quotes(codes: list[str], current: datetime) -> dict[str, dict]:
     return {}
 
 
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+TENCENT_QUOTE_BATCH = 60
+
+
+def _tencent_symbol(code: str) -> str:
+    if code.startswith(("6", "900")):
+        return "sh" + code
+    return ("bj" if code.startswith(("4", "8", "9")) else "sz") + code
+
+
+def _tencent_rows(content: bytes, codes: list[str], current: datetime, route: str) -> dict[str, dict]:
+    """Parse one Tencent batch; keep only stocks that traded today (a suspended row repeats the previous close)."""
+    result = {}
+    for prefix, code, payload in re.findall(r'v_(sh|sz|bj)(\d{6})="([^"]*)"', content.decode("gbk", errors="replace")):
+        fields = payload.split("~")
+        if code not in codes or len(fields) < 38 or fields[2] != code or _tencent_symbol(code) != prefix + code:
+            continue
+        price, volume = (pd.to_numeric(fields[index], errors="coerce") for index in (3, 6))
+        try:
+            quote_time = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        if (pd.isna(price) or not math.isfinite(float(price)) or float(price) <= 0
+                or pd.isna(volume) or float(volume) <= 0 or quote_time.date() != current.date()):
+            continue
+        result[code] = {"price": float(price), "quote_time": quote_time,
+                        "source": f"腾讯实时行情（{route}）", "status": "实时"}
+    return result
+
+
+def _tencent_quotes(codes: list[str], current: datetime) -> dict[str, dict]:
+    """Batched Tencent quotes, a vendor independent of EastMoney; direct connection first, then the system proxy.
+
+    Raises the last error only when no batch returned a usable price.
+    """
+    headers = {"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"}
+    result: dict[str, dict] = {}
+    last_error: Exception | None = None
+    for start in range(0, len(codes), TENCENT_QUOTE_BATCH):
+        batch = codes[start:start + TENCENT_QUOTE_BATCH]
+        url = TENCENT_QUOTE_URL + ",".join(_tencent_symbol(code) for code in batch)
+        for trust_env, route in ((False, "直连"), (True, "代理")):
+            session = requests.Session()
+            session.trust_env = trust_env
+            try:
+                response = session.get(url, headers=headers, timeout=8)
+                response.raise_for_status()
+                rows = _tencent_rows(response.content, batch, current, route)
+            except Exception as exc:
+                last_error = exc
+                continue
+            finally:
+                session.close()
+            if rows:
+                result.update(rows)
+                break
+            last_error = ValueError("腾讯未返回当日有效价格")
+    if not result and last_error is not None:
+        raise last_error
+    return result
+
+
 def _akshare_quote(code: str, current: datetime) -> dict | None:
     import akshare as ak
     frame = ak.stock_bid_ask_em(symbol=code)
@@ -487,6 +587,12 @@ def fetch_microcap_realtime_quotes(
             quotes.update(_eastmoney_quotes(missing, current))
         except Exception as exc:
             errors.append(_brief("东方财富", exc))
+    missing = [code for code in codes if code not in quotes]
+    if missing:
+        try:
+            quotes.update(_tencent_quotes(missing, current))
+        except Exception as exc:
+            errors.append(_brief("腾讯", exc))
     tickflow_error = "; ".join(errors)
     missing = [code for code in codes if code not in quotes]
     bj_missing = [code for code in missing if code.startswith(("4", "8", "9"))]

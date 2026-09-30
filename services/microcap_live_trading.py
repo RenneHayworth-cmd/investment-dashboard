@@ -166,6 +166,23 @@ def list_microcap_position_adjustments() -> pd.DataFrame:
     return adjustments if not adjustments.empty else pd.DataFrame(columns=ADJUSTMENT_COLUMNS)
 
 
+def microcap_ledger_codes(trades: pd.DataFrame, adjustments: pd.DataFrame) -> list[str]:
+    """Six-digit codes that ever appeared in the ledger (trades and position adjustments)."""
+    values = set()
+    for frame, col in ((trades, "symbol"), (adjustments, "symbol")):
+        if frame is not None and not frame.empty and col in frame:
+            values.update(frame[col].dropna().astype(str).str.extract(r"(\d{6})", expand=False).dropna())
+    return sorted(values)
+
+
+def microcap_first_event_date(trades: pd.DataFrame, flows: pd.DataFrame, adjustments: pd.DataFrame) -> str | None:
+    values = []
+    for frame, col in ((trades, "trade_date"), (flows, "flow_date"), (adjustments, "event_date")):
+        if frame is not None and not frame.empty and col in frame:
+            values.extend(frame[col].dropna().astype(str).tolist())
+    return min(values) if values else None
+
+
 def list_microcap_import_batches() -> pd.DataFrame:
     with closing(_conn()) as conn:
         frame = pd.read_sql_query(

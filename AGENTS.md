@@ -94,6 +94,19 @@ before a larger handoff or commit.
   or higher. Never persist or log
   the SendKey. The Windows scheduled task may invoke the script every minute;
   the script itself must skip non-trading sessions.
+- The `微盘实盘` page fetches only while it is the open page. The Windows task from
+  `scripts/install_microcap_live_closes_task.ps1` (weekdays 15:10, 15:40, 17:10) runs
+  `scripts/update_microcap_live_closes.py`, which calls the same append-only
+  `load_microcap_histories` for every ledger code once today's session is settled; it
+  makes no network request when the cache already covers today and exits non-zero
+  (failure balloon) while any code is still missing.
+  Same-day close sources, in order: TickFlow, EastMoney and Tencent (`qt.gtimg.cn`, only
+  rows with volume today; old pre-920 Beijing codes return zero-volume rows) quotes
+  stamped at or after 15:00, then the local BK1158 constituent snapshot only when it was taken that day at
+  or after 15:00 and the stock is not suspended (its time is the list fetch time, not a
+  trade time); daily bars fill anything else. Intraday quotes use the same
+  TickFlow -> EastMoney -> Tencent order before the AkShare fallbacks; Tencent is the only
+  vendor in that chain that does not depend on EastMoney.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
   a data source becomes unstable. Preserve per-index raw history with
@@ -153,6 +166,13 @@ before a larger handoff or commit.
   Do not use Miaoxiang `861520.EI` as a fallback for `90.BK1158`: their absolute
   levels and daily returns are different despite both resolving to a micro-cap
   label.
+- `桃囍微盘` (`TXWP20`) manual index updates calculate transient intraday points
+  from the 20 confirmed T-1 constituents. Normalize CSV-loaded stock codes to
+  six-digit strings before quote lookup; never persist the intraday result into
+  formal history. Try EastMoney then Tencent batch quotes directly before trying
+  environment proxies. Require all 20 unique members and same-day timestamps for
+  trading stocks; a partial or stale batch must fall back, never reduce the divisor.
+  Surface quote/calculation failures while retaining valid caches.
 - `国证自由现金流` (`980092`) uses AkShare's official CNI history
   endpoint (`index_hist_cni`) so its back-calculated series reaches the
   2012-12-31 base date; generic A-share and TickFlow history are shorter.
@@ -166,13 +186,6 @@ before a larger handoff or commit.
   On an A-share trading day, fetch one ETF quote batch every 10 minutes from
   09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
   lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
-- `桃囍微盘` (`TXWP20`) manual index updates calculate transient intraday points
-  from the 20 confirmed T-1 constituents. Normalize CSV-loaded stock codes to
-  six-digit strings before quote lookup; never persist the intraday result into
-  formal history. Try EastMoney then Tencent batch quotes directly before trying
-  environment proxies. Require all 20 unique members and same-day timestamps for
-  trading stocks; a partial or stale batch must fall back, never reduce the divisor.
-  Surface quote/calculation failures while retaining valid caches.
   from 14:50 through 15:00. Each batch updates all ETF cards and the transient
   timing-table preview for configured timing symbols. Use the same schedule to
   refresh the `I2701` futures card and the two futures-spread cards, retaining
