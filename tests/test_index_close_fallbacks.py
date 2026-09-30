@@ -102,3 +102,44 @@ def test_board_kline_failure_still_raises_without_a_completed_close():
         with pytest.raises(RuntimeError):
             em.get_index_data_from_eastmoney_kline("124.HSTECH", "恒生科技", days=10, fqt="0", akshare_hk_em_symbol="HSTECH")
     trend.assert_not_called()
+
+
+def _cst(text):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromisoformat(text).replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+class _QuoteSession:
+    trust_env = False
+
+    def __init__(self, data):
+        self.data = data
+
+    def get(self, *_args, **_kwargs):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {"data": self.data}
+        return response
+
+
+def test_a_lunch_quote_is_never_the_close_of_a_finished_session():
+    # 2026-09-29: push2delay still served the 11:30 BK1158 value (3826.14) after 15:00.
+    assert em._stale_session_quote("A股", _cst("2026-09-29 11:30:00"))
+    assert not em._stale_session_quote("A股", _cst("2026-09-29 15:00:03"))
+    assert em._stale_session_quote("港股", _cst("2026-09-29 15:59:00"))
+
+    lunch = int(_cst("2026-09-29 11:30:00").timestamp())
+    closed = int(_cst("2026-09-29 15:00:03").timestamp())
+    board = lambda stamp: {"diff": [{"f12": "BK1158", "f2": 3826.14 if stamp == lunch else 3809.04, "f124": stamp}]}
+    with patch("requests.Session", return_value=_QuoteSession(board(lunch))):
+        assert em.fetch_eastmoney_clist_latest_index_row(board_symbol="BK1158") is None
+    with patch("requests.Session", return_value=_QuoteSession(board(closed))):
+        row = em.fetch_eastmoney_clist_latest_index_row(board_symbol="BK1158")
+    assert row.iloc[0]["close"] == 3809.04
+
+    history = pd.DataFrame({"trade_date": pd.to_datetime(["2026-09-28"]), "close": [3743.27]})
+    with patch("requests.Session", return_value=_QuoteSession({"f43": 3826.14, "f86": lunch})), \
+         patch.object(em, "fetch_eastmoney_trend_close", return_value=(pd.Timestamp("2026-09-29"), 3809.04)):
+        result = em.append_eastmoney_quote_row(history, "90.BK1158")
+    assert result.iloc[-1]["close"] == 3809.04  # stale quote dropped, 15:00 minute close used

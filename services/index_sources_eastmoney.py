@@ -75,6 +75,19 @@ def fetch_eastmoney_trend_close(secid: str) -> tuple[pd.Timestamp, float] | None
     return None
 
 
+def _stale_session_quote(market_name: str, quote_dt: datetime) -> bool:
+    """A quote stamped before the close of a session that has already closed is an
+    intraday price, not the close. Seen 2026-09-29: push2delay still served the 11:30
+    lunch value of 90.BK1158 after 15:00 and it was saved as that day's formal close.
+    """
+    market = get_market_window(market_name)
+    if market is None:
+        return False
+    local_dt = quote_dt.astimezone(ZoneInfo(market.timezone))
+    completed = latest_completed_trade_date(market, datetime.now(ZoneInfo(market.timezone)))
+    return local_dt.date() <= completed and local_dt.time() < market.sessions[-1][1]
+
+
 def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -124,14 +137,7 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: b
             if quote:
                 break
         market_name = "港股" if str(secid).startswith(("124.", "125.", "305.")) else "A股"
-        if not quote:
-            if market_name != "A股":
-                return normalized
-            trend_close = fetch_eastmoney_trend_close(secid)
-            if trend_close is None:
-                return normalized
-            quote_date, latest_price = trend_close[0].date(), trend_close[1]
-        else:
+        if quote:
             latest_price = pd.to_numeric(quote.get("f43"), errors="coerce")
             quote_timestamp = pd.to_numeric(quote.get("f86"), errors="coerce")
             if pd.isna(latest_price) or pd.isna(quote_timestamp):
@@ -139,7 +145,17 @@ def append_eastmoney_quote_row(df: pd.DataFrame, secid: str, replace_same_day: b
             quote_timestamp_value = float(quote_timestamp)
             if quote_timestamp_value > 10_000_000_000:
                 quote_timestamp_value = quote_timestamp_value / 1000
-            quote_date = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai")).date()
+            quote_dt = datetime.fromtimestamp(quote_timestamp_value, tz=ZoneInfo("Asia/Shanghai"))
+            quote_date = quote_dt.date()
+            if _stale_session_quote(market_name, quote_dt):
+                quote = None
+        if not quote:
+            if market_name != "A股":
+                return normalized
+            trend_close = fetch_eastmoney_trend_close(secid)
+            if trend_close is None:
+                return normalized
+            quote_date, latest_price = trend_close[0].date(), trend_close[1]
         quote_frame = pd.DataFrame([{"trade_date": pd.Timestamp(quote_date), "close": float(latest_price)}])
         filtered_quote = filter_market_trading_dates(quote_frame, market_name)
         if filtered_quote is None or filtered_quote.empty:
@@ -235,10 +251,10 @@ def fetch_eastmoney_clist_latest_index_row(
                         timestamp_value = float(quote_timestamp)
                         if timestamp_value > 10_000_000_000:
                             timestamp_value = timestamp_value / 1000
-                        quote_date = datetime.fromtimestamp(
-                            timestamp_value,
-                            tz=ZoneInfo(market_timezone),
-                        ).date()
+                        quote_dt = datetime.fromtimestamp(timestamp_value, tz=ZoneInfo(market_timezone))
+                        if _stale_session_quote(market_name, quote_dt):
+                            return None
+                        quote_date = quote_dt.date()
                         market = get_market_window(market_name)
                         quote_noon = datetime.combine(
                             quote_date,
@@ -307,7 +323,19 @@ def append_eastmoney_latest_index_row(
         hk_em_symbol=hk_em_symbol,
     )
     latest_history_date = pd.to_datetime(normalized["trade_date"], errors="coerce").max().date()
-    if latest_history_date >= expected_date or ak is None:
+    if latest_history_date >= expected_date:
+        return normalized
+    if market is not None and latest_completed_trade_date(market, market_now) >= expected_date:
+        # The AkShare spot tables carry no timestamp, so after the close they cannot prove
+        # they are not a stale intraday value; only the 15:00 minute point can.
+        if hk_em_symbol:
+            return normalized
+        trend_close = fetch_eastmoney_trend_close(secid)
+        if trend_close is None or trend_close[0].date() != expected_date:
+            return normalized
+        supplement = pd.DataFrame([{"trade_date": trend_close[0], "close": trend_close[1]}])
+        return pd.concat([normalized, supplement], ignore_index=True)
+    if ak is None:
         return normalized
 
     latest_price = None
