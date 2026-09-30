@@ -171,9 +171,15 @@ before a larger handoff or commit.
   refresh the `I2701` futures card and the two futures-spread cards, retaining
   their last successful transient values when one source fails. These previews
   remain transient and must not affect formal history or recent operation guidance.
-  It should read local cache on first render
-  and fetch after the user clicks the load button. Its timed fragments remain
-  network-disabled until that click within the page session. The save checkbox
+  Automatically load holdings once on first render in each page session,
+  reusing current formal caches, fetching intraday quotes, and backfilling missing
+  completed sessions. Enable timed fragments after this automatic load; ordinary
+  reruns must not repeat the full load. Keep the load button for explicit refreshes.
+  Render local cards before network work and display the ETF quote batch as soon
+  as it returns, before backfilling history or refreshing derivative sources.
+  Clear the early preview only when complete cards are ready; render timed card
+  updates inside the fragment to avoid accumulating external-container elements.
+  The save checkbox
   controls all formal ETF, futures, spread, and option cache writes; every intraday
   preview remains non-persistent regardless of that checkbox. From the A-share open through
   15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
@@ -207,7 +213,7 @@ before a larger handoff or commit.
   intraday card quotes remain in the TickFlow batch when available. If TickFlow
   omits 161128, use its same-day Sina snapshot as an intraday-only fallback.
   Spread and option updates
-  remain tied to the load button. Its bottom summary table contains ETFs/LOFs only and follows the index
+  run on the initial automatic load and explicit load-button refreshes. Its bottom summary table contains ETFs/LOFs only and follows the index
   MA summary style. Beside the current interval return, show the preceding
   transition date and the completed return between that transition and the
   current transition. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;

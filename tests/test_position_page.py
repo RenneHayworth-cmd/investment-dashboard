@@ -93,7 +93,7 @@ def _patch_page(stack: ExitStack, *, cached: bool):
     derivative_refresh = stack.enter_context(
         patch(
             "services.position_analysis.refresh_position_derivative_items",
-            side_effect=AssertionError("点击加载前不应刷新期货或价差"),
+            return_value=([], []),
         )
     )
     stack.enter_context(
@@ -365,7 +365,7 @@ render_position_timing_performance([])
         self.assertIn("realtime_quotes=active_preview_quotes", source)
         self.assertIn("market_now=market_now", source)
 
-    def test_default_render_is_cache_first_and_network_disabled(self):
+    def test_default_render_automatically_loads_holdings(self):
         with ExitStack() as stack:
             etf, futures, spread, realtime_fetch, derivative_refresh = _patch_page(
                 stack,
@@ -379,16 +379,16 @@ render_position_timing_performance([])
         self.assertTrue(etf.call_args_list)
         self.assertTrue(futures.call_args_list)
         self.assertTrue(spread.call_args_list)
-        self.assertTrue(all(not call.kwargs["allow_fetch"] for call in etf.call_args_list))
+        self.assertTrue(any(call.kwargs["allow_fetch"] for call in etf.call_args_list))
         self.assertTrue(
-            all(not call.kwargs["allow_fetch"] for call in futures.call_args_list)
+            any(call.kwargs["allow_fetch"] for call in futures.call_args_list)
         )
         self.assertTrue(
-            all(not call.kwargs["allow_fetch"] for call in spread.call_args_list)
+            any(call.kwargs["allow_fetch"] for call in spread.call_args_list)
         )
         realtime_fetch.assert_not_called()
-        derivative_refresh.assert_not_called()
-        self.assertFalse(app.session_state["position_updates_enabled"])
+        derivative_refresh.assert_called_once()
+        self.assertTrue(app.session_state["position_updates_enabled"])
         subheaders = [item.value for item in app.subheader]
         self.assertNotIn("实盘账户", subheaders)
         self.assertTrue(subheaders[0].startswith("分析数据状态 · "))
@@ -409,7 +409,10 @@ render_position_timing_performance([])
                 stack,
                 cached=True,
             )
-            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            app = AppTest.from_file(str(PAGE), default_timeout=20)
+            app.session_state["position_initial_load_completed"] = True
+            app.session_state["position_updates_enabled"] = True
+            app.run()
 
         self.assertEqual(list(app.exception), [])
         self.assertEqual(
@@ -436,6 +439,8 @@ render_position_timing_performance([])
             derivative_refresh.side_effect = None
             derivative_refresh.return_value = ([], [])
             app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            derivative_refresh.assert_called_once()
+            derivative_refresh.reset_mock()
 
             app.button[0].click().run()
             app.run()
@@ -447,8 +452,73 @@ render_position_timing_performance([])
             [item.category for item in refreshed_items if item.category != "ETF"],
             ["期货", "期货价差", "期货价差"],
         )
-        self.assertEqual(app.session_state["position_derivative_refresh_request"], 1)
-        self.assertEqual(app.session_state["position_derivative_refresh_consumed"], 1)
+        self.assertEqual(app.session_state["position_derivative_refresh_request"], 2)
+        self.assertEqual(app.session_state["position_derivative_refresh_consumed"], 2)
+
+    def test_open_during_trading_loads_quotes_once_and_reruns_reuse_cache(self):
+        with ExitStack() as stack:
+            etf, futures, spread, _, derivative_refresh = _patch_page(stack, cached=True)
+            stack.enter_context(
+                patch("services.position_analysis.etf_intraday_quote_ready", return_value=True)
+            )
+            quote_refresh = stack.enter_context(
+                patch("services.position_analysis.refresh_runtime_etf_quotes", return_value={})
+            )
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(app.exception), [])
+            quote_refresh.assert_called_once()
+            derivative_refresh.assert_called_once()
+            self.assertTrue(all(not call.kwargs.get("force_refresh", False) for call in etf.call_args_list))
+            etf.reset_mock()
+            futures.reset_mock()
+            spread.reset_mock()
+
+            app.run()
+
+        self.assertEqual(list(app.exception), [])
+        quote_refresh.assert_called_once()
+        derivative_refresh.assert_called_once()
+        for loader in (etf, futures, spread):
+            self.assertTrue(loader.call_args_list)
+            self.assertTrue(all(not call.kwargs["allow_fetch"] for call in loader.call_args_list))
+
+    def test_fresh_cards_render_before_history_backfill_on_open_and_manual_load(self):
+        from components.position.cards_tables import render_position_cards
+        from services.position_runtime import apply_etf_realtime_quotes_to_items
+
+        events = []
+        quote = {"159967": {"price": 111.0, "quote_time": "2026-09-30 10:10:00"}}
+
+        def load_etf(code, **kwargs):
+            if kwargs["allow_fetch"]:
+                events.append("history")
+            return _item("ETF", code, cached=True)
+
+        def draw_cards(items):
+            item = next(item for item in items if item.code == "159967")
+            events.append(("cards", item.metrics["最新价"]))
+            render_position_cards(items)
+
+        with ExitStack() as stack:
+            etf, _, _, _, _ = _patch_page(stack, cached=True)
+            etf.side_effect = load_etf
+            stack.enter_context(patch("services.position_analysis.etf_intraday_quote_ready", return_value=True))
+            stack.enter_context(patch("services.position_analysis.refresh_runtime_etf_quotes", return_value=quote))
+            stack.enter_context(patch("services.position_analysis.remember_runtime_etf_quotes"))
+            stack.enter_context(patch("services.position_analysis.filter_current_etf_realtime_quotes", return_value=quote))
+            stack.enter_context(patch("services.position_analysis.apply_etf_realtime_quotes_to_items", side_effect=apply_etf_realtime_quotes_to_items))
+            stack.enter_context(patch("components.position.coordinator.render_position_cards", side_effect=draw_cards))
+            stack.enter_context(patch("components.position.realtime.render_position_cards", side_effect=draw_cards))
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(app.exception), [])
+            self.assertLess(events.index(("cards", 101.0)), events.index("history"))
+            self.assertLess(events.index(("cards", 111.0)), events.index("history"))
+            events.clear()
+
+            app.button[0].click().run()
+
+        self.assertEqual(list(app.exception), [])
+        self.assertLess(events.index(("cards", 111.0)), events.index("history"))
 
     def test_etf_refresh_cadence_also_refreshes_derivatives(self):
         with ExitStack() as stack:
@@ -559,4 +629,3 @@ render_etf_timing_table(df, value_formatter=lambda col, val: str(val))
 
 if __name__ == "__main__":
     unittest.main()
-

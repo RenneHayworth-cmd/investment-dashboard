@@ -100,6 +100,7 @@ def render_etf_timing_section(
     updates_enabled: bool,
     derivative_refresh_request: int,
     save_to_cache: bool,
+    cards_container: object,
 ) -> None:
     """保留单一实时 fragment，实现由组件承载。"""
     render_etf_timing_section_impl(
@@ -117,6 +118,7 @@ def render_etf_timing_section(
         save_to_cache=save_to_cache,
         value_formatter=format_etf_table_value,
         index_value_formatter=format_index_table_value,
+        cards_container=cards_container,
     )
 
 

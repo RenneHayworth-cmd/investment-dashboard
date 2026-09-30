@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from components.position.details import render_position_detail
+from components.position.cards_tables import render_position_cards
 from components.position.formatting import (
     build_overview_table,
     get_query_position_detail,
@@ -36,6 +37,7 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
             "加载持仓信息",
             type="primary",
             width="stretch",
+            help="打开页面时自动加载一次；需要立即更新时可再次点击。",
         )
         force_refresh = st.checkbox(
             "强制重新检查已是最新的ETF缓存",
@@ -104,12 +106,14 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     quote_codes = sorted(set(etf_codes))
     futures_codes = position.parse_position_codes(futures_text)
     spread_groups = position.parse_spread_groups(spread_text)
-    allow_fetch = bool(update_clicked)
-    if "position_updates_enabled" not in st.session_state:
-        st.session_state.position_updates_enabled = False
+    # A first load that a rerun interrupted (it runs symbol by symbol) resumes on the next
+    # run; already-current caches are read locally, so only the unfinished symbols fetch.
+    initial_load = not st.session_state.get("position_initial_load_completed", False)
+    load_requested = bool(initial_load or update_clicked)
+    allow_fetch = load_requested
     if "position_derivative_refresh_request" not in st.session_state:
         st.session_state.position_derivative_refresh_request = 0
-    if update_clicked:
+    if load_requested:
         st.session_state.position_updates_enabled = True
         st.session_state.position_derivative_refresh_request += 1
     updates_enabled = bool(st.session_state.position_updates_enabled)
@@ -119,13 +123,43 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     refresh_existing = bool(update_clicked and force_refresh)
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     intraday_market_active = position.etf_intraday_quote_ready(market_now)
-    intraday_quote_mode = bool(update_clicked and intraday_market_active)
+    intraday_quote_mode = bool(load_requested and intraday_market_active)
+
+    status_container = st.empty()
+    cards_container = st.empty()
+    preview_items: list[position.PositionItem] = []
+    if load_requested:
+        # 卡片先读本地，不等待缺失日线和各期货源；批量报价返回后立即叠加。
+        preview_items = [
+            position.load_or_fetch_etf(
+                code,
+                count=int(etf_count),
+                adjust=adjust_map[adjust_option],
+                allow_fetch=False,
+                market_now=market_now,
+            )
+            for code in etf_codes
+        ]
+        preview_items.extend(
+            position.load_or_fetch_futures_contract(
+                code, count=int(market_count), allow_fetch=False, market_now=market_now,
+            )
+            for code in futures_codes
+        )
+        preview_items.extend(
+            position.load_or_fetch_spread(
+                group, base_contract=group[0], allow_fetch=False, market_now=market_now,
+            )
+            for group in spread_groups
+        )
+        with cards_container.container():
+            render_position_cards(preview_items)
 
     items: list[position.PositionItem] = []
     progress_total = len(etf_codes) + len(futures_codes) + len(spread_groups)
     progress_done = 0
-    progress_bar = st.progress(0) if update_clicked and progress_total else None
-    progress_status = st.empty() if update_clicked and progress_total else None
+    progress_bar = st.progress(0) if load_requested and progress_total else None
+    progress_status = st.empty() if load_requested and progress_total else None
 
     def update_position_progress(label: str) -> None:
         nonlocal progress_done
@@ -177,6 +211,15 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         and "position_etf_realtime_quotes" in st.session_state
     ):
         del st.session_state.position_etf_realtime_quotes
+
+    if preview_items and active_intraday_quotes:
+        cards_container.empty()
+        with cards_container.container():
+            render_position_cards(
+                position.apply_etf_realtime_quotes_to_items(
+                    preview_items, active_intraday_quotes,
+                )
+            )
 
     with st.spinner("正在整理持仓数据…"):
         for code in etf_codes:
@@ -242,6 +285,9 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     if progress_bar is not None and progress_status is not None:
         progress_bar.progress(1.0)
         progress_status.success(f"持仓数据整理完成，共 {progress_total} 个标的。")
+    if load_requested:
+        # 全部标的处理完才标记，普通控件重跑或详情切换不再重复完整加载。
+        st.session_state.position_initial_load_completed = True
     if intraday_quote_error:
         st.warning(
             "ETF盘中实时行情获取失败，卡片继续显示正式日线缓存："
@@ -267,12 +313,13 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         latest_dates.max().strftime("%Y-%m-%d") if not latest_dates.empty else "-"
     )
 
-    st.subheader(f"分析数据状态 · {latest_date_text}")
-    status_cols = st.columns(4)
-    status_cols[0].metric("分析标的", len(items))
-    status_cols[1].metric("可用数据", available_count)
-    status_cols[2].metric("缺失缓存", missing_count)
-    status_cols[3].metric("获取失败", failed_count)
+    with status_container.container():
+        st.subheader(f"分析数据状态 · {latest_date_text}")
+        status_cols = st.columns(4)
+        status_cols[0].metric("分析标的", len(items))
+        status_cols[1].metric("可用数据", available_count)
+        status_cols[2].metric("缺失缓存", missing_count)
+        status_cols[3].metric("获取失败", failed_count)
 
     selected_key = get_query_position_detail(items)
     selected_item = next(
@@ -285,7 +332,7 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         etf_codes,
         quote_codes=quote_codes,
         position_items=items,
-        show_cache_caption=not update_clicked,
+        show_cache_caption=not load_requested,
         api_key=api_key,
         count=int(etf_count),
         market_count=int(market_count),
@@ -294,4 +341,5 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         updates_enabled=updates_enabled,
         derivative_refresh_request=derivative_refresh_request,
         save_to_cache=save_to_cache,
+        cards_container=cards_container,
     )

@@ -41,6 +41,7 @@ def render_etf_timing_section_impl(
     save_to_cache: bool,
     value_formatter: Callable[[str, object], str],
     index_value_formatter: Callable[[str, object], str] | None = None,
+    cards_container: object | None = None,
 ) -> None:
     market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     quote_codes = sorted(set(quote_codes or etf_codes))
@@ -392,7 +393,7 @@ def render_etf_timing_section_impl(
     derivative_realtime_error = ""
     if derivative_refresh_due:
         if derivative_refresh_requested:
-            # fragment 独立重跑会复用入参，先消费请求可避免一次点击被重复执行。
+            # fragment 独立重跑会复用入参，先消费请求可避免同一次加载被重复执行。
             st.session_state[derivative_refresh_consumed_key] = (
                 derivative_refresh_request
             )
@@ -489,12 +490,15 @@ def render_etf_timing_section_impl(
             else "-"
         )
         st.caption(
-            "当前为缓存视图；9:30-10:00每10分钟，10:00-11:30和13:00-14:50每30分钟，"
+            "页面已自动加载，后续按时段更新；9:30-10:00每10分钟，10:00-11:30和13:00-14:50每30分钟，"
             "午间收盘更新一次，14:50-15:00每2分钟更新卡片与择时预判，"
             "交易日15:05后才写入ETF日线并正式更新择时表格。"
             f"本次实时更新时间为：{realtime_update_text}。"
         )
 
+    if cards_container is not None:
+        # 早期预览只保留到完整卡片就绪，定时重绘留在 fragment 内。
+        cards_container.empty()
     render_position_cards(card_items)
     if derivative_realtime_error:
         st.warning(

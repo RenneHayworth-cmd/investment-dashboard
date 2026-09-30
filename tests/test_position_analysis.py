@@ -420,7 +420,7 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertIn(
             "本次实时更新时间为：{realtime_update_text}", realtime_source
         )
-        self.assertIn("show_cache_caption=not update_clicked", coordinator_source)
+        self.assertIn("show_cache_caption=not load_requested", coordinator_source)
         self.assertIn(
             '@st.fragment(run_every=f"{ETF_REALTIME_TIMING_REFRESH_SECONDS}s")',
             page_source,
@@ -1489,7 +1489,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
         save_mock.assert_not_called()
 
-    def test_holdings_page_gates_fragment_network_until_load(self):
+    def test_holdings_page_enables_fragment_network_on_initial_load(self):
         root = Path(__file__).parents[1]
         coordinator_source = (
             root / "components" / "position" / "coordinator.py"
@@ -1498,7 +1498,7 @@ class PositionAnalysisTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            'st.session_state.position_updates_enabled = False', coordinator_source
+            'st.session_state.position_updates_enabled = True', coordinator_source
         )
         self.assertIn(
             'updates_enabled and position.etf_morning_timing_fetch_ready',
