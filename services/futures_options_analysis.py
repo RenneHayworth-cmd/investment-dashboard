@@ -191,10 +191,11 @@ def fetch_from_akshare(symbol: str, period: str, count: int) -> pd.DataFrame:
         raise RuntimeError("AkShare 回退目前只支持日线周期 1d。")
 
     import akshare as ak
+    from services.akshare_sources import futures_daily_sources
+    from services.market_fallback import fetch_market_fallback, normalize_daily_prices
 
-    df = ak.futures_zh_daily_sina(symbol=akshare_symbol(symbol))
-    if df is None or df.empty:
-        raise RuntimeError("TickFlow 和 AkShare 都没有获取到数据，请检查合约代码。")
+    df = fetch_market_fallback(futures_daily_sources(ak, akshare_symbol(symbol)), normalize_daily_prices,
+        date_column="date", price_column="close")
     return df.tail(count).reset_index(drop=True)
 
 
@@ -234,10 +235,13 @@ def fetch_option_from_akshare(
     if is_contract:
         if period != "1d":
             raise RuntimeError("期权历史行情目前只支持日线周期 1d。")
-        df = daily_func(symbol=option_symbol)
-        if df is None or df.empty:
-            raise RuntimeError("AkShare 没有获取到期权日线数据，请检查月份、行权价或合约是否存在。")
-        normalized = normalize_market_dataframe(df)
+        from services.market_fallback import MarketSource, fetch_market_fallback
+
+        # These four products have one compatible AkShare daily endpoint each.
+        # A chain snapshot cannot replace the history of an exact option strike.
+        normalized = fetch_market_fallback([
+            MarketSource(f"AkShare/{daily_func.__name__ if hasattr(daily_func, '__name__') else product}", lambda: daily_func(symbol=option_symbol)),
+        ], normalize_market_dataframe, date_column="date", price_column="close", allow_zero_price=True)
         if prefer_realtime_snapshot:
             normalized = append_option_spot_row(
                 normalized,

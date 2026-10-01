@@ -18,8 +18,10 @@ from components.position.formatting import (
     format_index_table_value,
     position_key,
 )
+from components.position.runtime_state import remember_previews
 from components.position.performance import render_position_timing_performance
 from services import position_analysis as position
+from services.position_runtime import auxiliary_quote_refresh_due, _runtime_quote_refresh_band
 from services.index_realtime import fetch_realtime_index_quotes
 from services.position_timing import build_recent_position_operation_guidance
 from services.position_close_audit import fetch_audited_close, recent_close_attempts
@@ -128,8 +130,18 @@ def render_etf_timing_section_impl(
     derivative_refresh_requested = bool(
         updates_enabled
         and derivative_refresh_request > derivative_refresh_consumed
+        and position.etf_intraday_quote_ready(market_now)
+        and market_now.time() < position.ETF_REALTIME_TIMING_END_TIME
     )
-    derivative_refresh_due = derivative_refresh_requested
+    auxiliary_due = bool(
+        updates_enabled
+        and position.etf_intraday_quote_ready(market_now)
+        and market_now.time() < position.ETF_REALTIME_TIMING_END_TIME
+        and auxiliary_quote_refresh_due(
+            market_now, st.session_state.get("position_auxiliary_quote_refresh_state", {}),
+        )
+    )
+    derivative_refresh_due = derivative_refresh_requested or auxiliary_due
     realtime_timing_error = ""
     missing_realtime_codes: list[str] = []
     morning_preview_key = "position_etf_morning_timing_preview"
@@ -147,11 +159,7 @@ def render_etf_timing_section_impl(
             if market_now.time() < datetime.strptime("10:00", "%H:%M").time()
             else "midmorning"
         )
-        morning_refresh_seconds = (
-            position.ETF_MORNING_TIMING_REFRESH_SECONDS
-            if morning_refresh_band == "early"
-            else position.ETF_MIDSESSION_TIMING_REFRESH_SECONDS
-        )
+        morning_refresh_seconds = position.ETF_REALTIME_TIMING_REFRESH_SECONDS
         last_morning_fetch = pd.to_datetime(
             morning_preview_state.get("fetched_at"), errors="coerce"
         )
@@ -163,7 +171,6 @@ def render_etf_timing_section_impl(
             >= morning_refresh_seconds
         )
         if morning_refresh_due:
-            derivative_refresh_due = True
             if api_key:
                 previous_quotes = morning_quotes
                 try:
@@ -219,7 +226,11 @@ def render_etf_timing_section_impl(
     afternoon_fetch_ready = position.etf_afternoon_timing_fetch_ready(market_now)
     lunch_refresh_due = False
     lunch_refresh_band = ""
-    if updates_enabled and lunch_fetch_ready and not lunch_quotes:
+    required_quote_scope = {position.normalize_etf_base_code(code) for code in quote_codes}
+    lunch_scope_complete = required_quote_scope.issubset(
+        lunch_preview_state.get("received_scope", lunch_quotes)
+    )
+    if updates_enabled and lunch_fetch_ready and not lunch_scope_complete:
         lunch_refresh_band = "lunch"
         last_lunch_attempt = pd.to_datetime(
             lunch_preview_state.get("fetched_at"), errors="coerce"
@@ -238,10 +249,9 @@ def render_etf_timing_section_impl(
             or lunch_preview_state.get("refresh_band") != lunch_refresh_band
             or pd.isna(last_afternoon_fetch)
             or (market_now_naive - last_afternoon_fetch).total_seconds()
-            >= position.ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+            >= position.ETF_REALTIME_TIMING_REFRESH_SECONDS
         )
     if lunch_refresh_due:
-        derivative_refresh_due = True
         if api_key:
             previous_quotes = lunch_quotes
             try:
@@ -251,12 +261,25 @@ def render_etf_timing_section_impl(
                     market_now=market_now,
                 )
                 position.remember_runtime_etf_quotes(lunch_quotes)
+                quote_state = position.load_runtime_etf_quote_state()
+                received_scope = set(lunch_quotes)
+                if (
+                    lunch_refresh_band == "lunch"
+                    and quote_state.get("trade_date") == preview_date
+                ):
+                    received_scope = (
+                        set(quote_state.get("last_success_scope") or [])
+                        if quote_state.get("last_success_trade_date") == preview_date
+                        and quote_state.get("last_success_band") == "午间"
+                        else set()
+                    )
                 lunch_preview_state = {
                     "trade_date": preview_date,
                     "quotes": lunch_quotes,
                     "error": "",
                     "fetched_at": market_now_naive.isoformat(),
                     "refresh_band": lunch_refresh_band,
+                    "received_scope": sorted(received_scope),
                 }
             except Exception as exc:
                 lunch_preview_state = {
@@ -265,6 +288,7 @@ def render_etf_timing_section_impl(
                     "error": str(exc),
                     "fetched_at": market_now_naive.isoformat(),
                     "refresh_band": lunch_refresh_band,
+                    "received_scope": lunch_preview_state.get("received_scope", []),
                 }
             st.session_state[lunch_preview_key] = lunch_preview_state
         else:
@@ -288,7 +312,8 @@ def render_etf_timing_section_impl(
         missing_realtime_codes = [
             position.normalize_etf_base_code(code)
             for code in etf_codes
-            if position.normalize_etf_base_code(code) not in lunch_quotes
+            if position.normalize_etf_base_code(code)
+            not in lunch_preview_state.get("received_scope", lunch_quotes)
         ]
 
     if updates_enabled and position.etf_realtime_timing_ready(market_now):
@@ -305,7 +330,6 @@ def render_etf_timing_section_impl(
             >= position.ETF_REALTIME_TIMING_REFRESH_SECONDS
         )
         if preview_refresh_due:
-            derivative_refresh_due = True
             if api_key:
                 previous_quotes = (
                     preview_state.get("quotes", {}) if same_preview_date else {}
@@ -352,6 +376,11 @@ def render_etf_timing_section_impl(
             for code, item in zip(etf_codes, formal_items)
         ]
 
+    if updates_enabled and position.etf_intraday_quote_ready(market_now):
+        realtime_timing_error = realtime_timing_error or str(
+            position.load_runtime_etf_quote_state().get("error") or ""
+        )
+
     timing_preview_window = bool(
         position.etf_intraday_quote_ready(market_now)
         or (
@@ -383,6 +412,8 @@ def render_etf_timing_section_impl(
     derivative_preview_version = 3
     if (
         timing_preview_active
+        and position.etf_intraday_quote_ready(market_now)
+        and market_now.time() < position.ETF_REALTIME_TIMING_END_TIME
         and derivative_state.get("version") != derivative_preview_version
     ):
         derivative_refresh_due = True
@@ -458,6 +489,11 @@ def render_etf_timing_section_impl(
     card_items = [
         derivative_items.get(position_key(item), item)
         if item.category in {"期货", "期货价差", "期权"}
+        and (
+            position.etf_intraday_quote_ready(market_now)
+            or pd.isna(stamp := pd.to_datetime(item.latest_date, errors="coerce"))
+            or stamp.date() < target_date
+        )
         else item
         for item in card_items
     ]
@@ -490,9 +526,10 @@ def render_etf_timing_section_impl(
             else "-"
         )
         st.caption(
-            "页面已自动加载，后续按时段更新；9:30-10:00每10分钟，10:00-11:30和13:00-14:50每30分钟，"
-            "午间收盘更新一次，14:50-15:00每2分钟更新卡片与择时预判，"
+            "页面已自动加载，ETF在交易日9:30-11:30、13:00-15:00每2分钟更新卡片与择时预判，"
+            "午间收盘成功获取一次后复用；期货、价差和指数参考保持原有分时段频率。"
             "交易日15:05后才写入ETF日线并正式更新择时表格。"
+            "午间获取成功或正式收盘齐全后，重新打开复用已有数据。"
             f"本次实时更新时间为：{realtime_update_text}。"
         )
 
@@ -531,12 +568,12 @@ def render_etf_timing_section_impl(
         if position.etf_morning_timing_preview_ready(market_now):
             if market_now.time() < datetime.strptime("10:00", "%H:%M").time():
                 st.caption(
-                    "交易日9:30-10:00每10分钟更新ETF卡片和择时预判；"
+                    "交易日9:30-10:00每2分钟更新ETF卡片和择时预判；"
                     "实时价格不写入缓存。"
                 )
             else:
                 st.caption(
-                    "交易日10:00-11:30每30分钟更新ETF卡片和择时预判；"
+                    "交易日10:00-11:30每2分钟更新ETF卡片和择时预判；"
                     "实时价格不写入缓存。"
                 )
         elif position.etf_realtime_timing_ready(market_now):
@@ -547,7 +584,7 @@ def render_etf_timing_section_impl(
         else:
             if position.etf_afternoon_timing_fetch_ready(market_now):
                 st.caption(
-                    "交易日13:00-14:50每30分钟更新ETF卡片和择时预判；"
+                    "交易日13:00-14:50每2分钟更新ETF卡片和择时预判；"
                     "实时价格不写入缓存。"
                 )
             else:
@@ -574,10 +611,11 @@ def render_etf_timing_section_impl(
     index_retry_due = bool(
         updates_enabled and index_error and index_missing_names
         and position.etf_intraday_quote_ready(market_now)
+        and market_now.time() < position.ETF_REALTIME_TIMING_END_TIME
         and (
             pd.isna(index_last_attempt)
             or (market_now_naive - index_last_attempt).total_seconds()
-            >= position.ETF_REALTIME_TIMING_REFRESH_SECONDS
+            >= (600 if lunch_fetch_ready else position.ETF_REALTIME_TIMING_REFRESH_SECONDS)
         )
     )
     if (
@@ -627,7 +665,7 @@ def render_etf_timing_section_impl(
         st.warning(f"{index_error}；保留上次有效报价，无报价时显示正式收盘缓存。")
     st.caption(
         "BK1158微盘股使用MA15/2.5%，中证500使用MA15/1%；"
-        "随ETF刷新实时预判，区间内延续上一正式状态；仅买入变化标红、卖出变化标绿，持续持有或空仓不着色。"
+        "按原有分时段频率刷新实时预判，区间内延续上一正式状态；仅买入变化标红、卖出变化标绿，持续持有或空仓不着色。"
         "实时预判不写入正式缓存，"
         "不计入ETF组合权重或50万元策略；正式收盘状态变化计入近一周操作指引。"
     )
@@ -648,3 +686,13 @@ def render_etf_timing_section_impl(
         realtime_quotes=active_preview_quotes,
         market_now=market_now,
     )
+    if derivative_refresh_due:
+        band = _runtime_quote_refresh_band(market_now)
+        if band is not None:
+            st.session_state["position_auxiliary_quote_refresh_state"] = {
+                "trade_date": preview_date,
+                "band": band[0],
+                "last_attempt": market_now_naive.isoformat(),
+                "success": not derivative_realtime_error and not index_error,
+            }
+    remember_previews(st.session_state, market_now)

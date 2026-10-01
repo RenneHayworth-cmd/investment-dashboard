@@ -140,6 +140,8 @@ def test_eastmoney_only_applies_hk_calendar_to_hk_instruments(hong_kong):
     response = SimpleNamespace(raise_for_status=lambda:None,
         json=lambda:{'data':{'klines':[f'{d},100,101' for d in dates]}})
     with patch('requests.Session.get',return_value=response), \
+         patch('services.index_ma20.append_eastmoney_latest_index_row',side_effect=lambda ak,df,*args,**kw:df), \
+         patch('services.index_ma20.build_export_df',side_effect=lambda df,*args,**kw:df), \
          patch.object(source,'append_eastmoney_latest_index_row',side_effect=lambda ak,df,*args,**kw:df), \
          patch.object(source,'build_export_df',side_effect=lambda df,*args,**kw:df):
         result = source.get_index_data_from_eastmoney_kline(

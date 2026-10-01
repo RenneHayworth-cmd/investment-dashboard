@@ -602,6 +602,24 @@ def _tencent_constituent_rows(response, codes: list[str]) -> list[dict]:
     return rows
 
 
+def _wind_constituent_rows(codes: list[str]) -> list[dict]:
+    """Map one Wind snapshot batch to the EastMoney-style fields used below."""
+    from services.wind_source import fetch_wind_quotes, wind_stock_code
+
+    by_wind = {wind_stock_code(code): code for code in codes}
+    frame = fetch_wind_quotes("stock_data", list(by_wind))
+    rows = []
+    for _, row in frame.iterrows():
+        quote_time = row.get("quote_time")
+        stamp = None if pd.isna(quote_time) else pd.Timestamp(quote_time)
+        if stamp is not None and stamp.tzinfo is None:
+            stamp = stamp.tz_localize("Asia/Shanghai")
+        rows.append({"f12": by_wind.get(str(row["wind_code"])), "f2": row.get("price"),
+            "f18": row.get("previous_close"), "f17": row.get("open"), "f5": row.get("volume"),
+            "f6": row.get("amount"), "f124": None if stamp is None else stamp.timestamp()})
+    return rows
+
+
 def _calculate_intraday_quote(
     rows: list[dict], codes: list[str], previous_close: float, current: datetime, source: str,
 ) -> dict[str, object]:
@@ -699,6 +717,16 @@ def fetch_taoxi_intraday_quote(now: datetime | None = None) -> dict[str, object]
                 break
     finally:
         session.close()
+    if result is None:
+        from services.wind_source import wind_api_key
+
+        if wind_api_key():
+            try:
+                result = _calculate_intraday_quote(
+                    _wind_constituent_rows(codes), codes, previous_close, current, "万得Wind20只成分批量实时行情"
+                )
+            except Exception as exc:
+                failures.append(f"万得Wind：{str(exc)[:180]}")
     if result is None:
         raise TaoxiDataError("20只成分实时行情均失败：" + "；".join(failures))
     with _RUNTIME_LOCK:

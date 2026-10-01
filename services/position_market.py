@@ -26,6 +26,7 @@ from services.fund_analysis import (
     normalize_nav_dataframe,
     stamp_fund_history_metadata,
 )
+from services.market_fallback import MarketSource, fetch_market_fallback, normalize_daily_prices
 from services.market_calendar import get_market_window, previous_trading_day
 from services.position_models import (
     ETF_AKSHARE_HISTORY_CODES,
@@ -235,12 +236,24 @@ def _fetch_position_etf_history(
             adjust=adjust,
             market_now=market_now,
         )
-    return fetch_tickflow_fund_close(
-        symbol=symbol,
-        api_key=api_key,
-        count=int(count),
-        adjust=adjust,
+    result = fetch_market_fallback(
+        [
+            MarketSource("TickFlow", lambda: fetch_tickflow_fund_close(
+                symbol=symbol, api_key=api_key, count=int(count), adjust=adjust,
+            )),
+            MarketSource("场内备用源", lambda: _fetch_exchange_fund_close(
+                symbol=symbol, count=int(count), adjust=adjust, market_now=market_now,
+            )),
+        ], lambda frame: frame, date_column="日期", price_column="收盘价",
+        target_date=latest_final_etf_trade_date(market_now or datetime.now(ZoneInfo("Asia/Shanghai"))),
+        # _prepare_fetched_etf_history applies the caller's explicit transient
+        # preview policy; formal cache writes always filter these rows afterward.
+        preserve_unfinished_rows=True,
     )
+    result.attrs.setdefault("position_history_source", result.attrs["market_data_source"])
+    if result.attrs.get("market_source_warning"):
+        result.attrs.setdefault("position_history_warning", result.attrs["market_source_warning"])
+    return result
 
 
 def fetch_backtest_fund_close(
@@ -252,21 +265,22 @@ def fetch_backtest_fund_close(
 ) -> pd.DataFrame:
     """Exchange-fund daily history for backtests.
 
-    TickFlow first; when it has no bars for the symbol (some LOFs such as 161128),
-    use the EastMoney/AkShare exchange history with the Sina fallback. Transient
-    TickFlow errors are re-raised so one cache never mixes sources.
+    TickFlow first; any failed, empty or stale response tries compatible backups.
     """
     base_code = normalize_etf_base_code(symbol)
     if base_code in ETF_AKSHARE_HISTORY_CODES:
         return _fetch_exchange_fund_close(symbol=symbol, count=int(count), adjust=adjust)
     try:
-        result = fetch_tickflow_fund_close(symbol=symbol, api_key=api_key, count=int(count), adjust=adjust)
-    except TickFlowNoDataError as tickflow_exc:
-        try:
-            return _fetch_exchange_fund_close(symbol=symbol, count=int(count), adjust=adjust)
-        except Exception as fallback_exc:
-            raise ValueError(f"{tickflow_exc} 场内备用源也失败：{fallback_exc}") from fallback_exc
-    result.attrs["position_history_source"] = "TickFlow"
+        result = fetch_market_fallback(
+            [
+                MarketSource("TickFlow", lambda: fetch_tickflow_fund_close(symbol=symbol, api_key=api_key, count=int(count), adjust=adjust)),
+                MarketSource("场内备用源", lambda: _fetch_exchange_fund_close(symbol=symbol, count=int(count), adjust=adjust)),
+            ], lambda frame: frame, date_column="日期", price_column="收盘价",
+            target_date=latest_final_etf_trade_date(datetime.now(ZoneInfo("Asia/Shanghai"))),
+        )
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    result.attrs.setdefault("position_history_source", result.attrs["market_data_source"])
     return result
 
 
@@ -641,6 +655,24 @@ def _append_sina_final_close(
     return result
 
 
+def _fetch_wind_exchange_fund_close(
+    *,
+    symbol: str,
+    count: int,
+    start,
+    target,
+) -> pd.DataFrame:
+    from services.wind_source import fetch_wind_daily_bars
+
+    base_code = normalize_etf_base_code(symbol)
+    bars = fetch_wind_daily_bars("fund_data", infer_tickflow_symbol(symbol).upper(), start, target, aftype="2")
+    result = bars.rename(columns={"date": "日期", "open": "开盘价", "close": "收盘价"})[["日期", "开盘价", "收盘价"]]
+    result = result.tail(int(count)).reset_index(drop=True)
+    result["symbol"] = symbol
+    result["name"] = display_etf_name(base_code, symbol)
+    return stamp_fund_history_metadata(result, FUND_ADJUST_NONE)
+
+
 def _fetch_exchange_fund_close(
     *,
     symbol: str,
@@ -653,41 +685,57 @@ def _fetch_exchange_fund_close(
         raise ValueError(
             f"{normalize_etf_base_code(symbol)}的东方财富/新浪场内历史不支持比例复权，请改用差值复权。"
         )
-    eastmoney_error = ""
-    try:
-        result = _fetch_eastmoney_exchange_fund_close(
-            symbol=symbol,
-            count=count,
-            adjust=adjustment,
-        )
-        result.attrs["position_history_source"] = "东方财富/AkShare"
-        return _append_sina_final_close(
-            result,
-            symbol=symbol,
-            adjust=adjustment,
-            market_now=market_now,
-        )
-    except Exception as exc:
-        eastmoney_error = str(exc)
-        logger.warning("%s 东方财富场内日线获取失败，尝试新浪备用源：%s", symbol, exc)
+    import akshare as ak
+    from services.akshare_sources import raw_security_sources
 
-    try:
-        result = _fetch_sina_exchange_fund_close(
-            symbol=symbol,
-            count=count,
-            adjust=adjustment,
-        )
-        result.attrs["position_history_source"] = "新浪财经备用源"
-        return _append_sina_final_close(
-            result,
-            symbol=symbol,
-            adjust=adjustment,
-            market_now=market_now,
-        )
-    except Exception as sina_exc:
-        raise RuntimeError(
-            f"东方财富场内日线获取失败：{eastmoney_error}；新浪备用源也失败：{sina_exc}"
-        ) from sina_exc
+    current = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    target = latest_final_etf_trade_date(current)
+    start = pd.Timestamp(target) - pd.Timedelta(days=max(int(count) * 2, 365))
+    code = normalize_etf_base_code(symbol)
+    adjust_value = {FUND_ADJUST_NONE: "", FUND_ADJUST_FORWARD_ADDITIVE: "qfq", FUND_ADJUST_BACKWARD_ADDITIVE: "hfq"}[adjustment]
+
+    def convert(raw):
+        frame = normalize_daily_prices(raw).tail(int(count)).rename(columns={"date": "日期", "open": "开盘价", "close": "收盘价"})
+        frame["symbol"] = symbol
+        frame["name"] = display_etf_name(code, symbol)
+        return stamp_fund_history_metadata(frame, adjustment)
+
+    primary_checked_close = False
+
+    def primary():
+        nonlocal primary_checked_close
+        frame = _fetch_eastmoney_exchange_fund_close(symbol=symbol, count=count, adjust=adjustment)
+        frame.attrs["position_history_source"] = "东方财富/AkShare"
+        primary_checked_close = True
+        return _append_sina_final_close(frame, symbol=symbol, adjust=adjustment, market_now=current)
+
+    sources = [MarketSource("东方财富/AkShare", primary)]
+    if adjustment == FUND_ADJUST_NONE:
+        # Primary ETF adapter above is retained for facade callers; remaining raw APIs share the registry.
+        for source in raw_security_sources(ak, symbol, start.strftime("%Y%m%d"), target.strftime("%Y%m%d"), fund=True)[1:]:
+            sources.append(MarketSource(source.name, lambda source=source: convert(source.fetch())))
+    else:
+        # EastMoney ETF/LOF/stock wrappers use the same additive adjustment basis.
+        for api in ("fund_lof_hist_em", "stock_zh_a_hist"):
+            sources.append(MarketSource(api, lambda api=api: convert(getattr(ak, api)(
+                symbol=code, period="daily", start_date=start.strftime("%Y%m%d"), end_date=target.strftime("%Y%m%d"), adjust=adjust_value,
+            ))))
+    sources.append(MarketSource("新浪财经备用源", lambda: _fetch_sina_exchange_fund_close(symbol=symbol, count=count, adjust=adjustment)))
+    from services.wind_source import wind_api_key
+
+    if adjustment == FUND_ADJUST_NONE and wind_api_key():
+        # Wind's forward adjustment is not this app's additive basis, so it backs
+        # up unadjusted closes only.
+        sources.append(MarketSource("万得Wind", lambda: _fetch_wind_exchange_fund_close(
+            symbol=symbol, count=count, start=start, target=target,
+        )))
+    result = fetch_market_fallback(
+        sources, lambda frame: frame, date_column="日期", price_column="收盘价", target_date=target,
+    )
+    result.attrs.setdefault("position_history_source", result.attrs["market_data_source"])
+    if result.attrs.get("market_source_warning"):
+        result.attrs["position_history_warning"] = result.attrs["market_source_warning"]
+    return result if primary_checked_close else _append_sina_final_close(result, symbol=symbol, adjust=adjustment, market_now=current)
 
 
 def load_or_fetch_etf(
@@ -772,9 +820,8 @@ def load_or_fetch_etf(
                     adjust=adjustment,
                     market_now=market_now,
                 )
-                if use_akshare_history:
-                    source = str(latest_df.attrs.get("position_history_source") or fetch_source)
-                    error = str(latest_df.attrs.get("position_history_warning") or "")
+                source = str(latest_df.attrs.get("position_history_source") or fetch_source)
+                error = str(latest_df.attrs.get("position_history_warning") or "")
                 latest_df = _prepare_fetched_etf_history(
                     latest_df,
                     adjust=adjustment,
@@ -795,14 +842,8 @@ def load_or_fetch_etf(
                             adjust=adjustment,
                             market_now=market_now,
                         )
-                        if use_akshare_history:
-                            source = str(
-                                rebuilt_df.attrs.get("position_history_source") or fetch_source
-                            )
-                            error = _append_position_error(
-                                error,
-                                str(rebuilt_df.attrs.get("position_history_warning") or ""),
-                            )
+                        source = str(rebuilt_df.attrs.get("position_history_source") or fetch_source)
+                        error = _append_position_error(error, str(rebuilt_df.attrs.get("position_history_warning") or ""))
                         source_df = _prepare_fetched_etf_history(
                             rebuilt_df,
                             adjust=adjustment,
@@ -854,9 +895,8 @@ def load_or_fetch_etf(
                     adjust=adjustment,
                     market_now=market_now,
                 )
-                if use_akshare_history:
-                    source = str(source_df.attrs.get("position_history_source") or fetch_source)
-                    error = str(source_df.attrs.get("position_history_warning") or "")
+                source = str(source_df.attrs.get("position_history_source") or fetch_source)
+                error = str(source_df.attrs.get("position_history_warning") or "")
                 source_df = _prepare_fetched_etf_history(
                     source_df,
                     adjust=adjustment,

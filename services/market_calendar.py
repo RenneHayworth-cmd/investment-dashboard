@@ -72,6 +72,19 @@ def _date_set(*values: str) -> set[date]:
     return {date.fromisoformat(value) for value in values}
 
 
+# Published 2026 shortened cash sessions (auction confirmation uses the usual delay).
+# https://www.hkex.com.hk/-/media/HKEX-Market/Services/Circulars-and-Notices/Participant-and-Members-Circulars/SEHK/2025/ce_SEHK_CT_075_2025.pdf
+# https://www.nyse.com/trade/hours-calendars
+STATIC_MARKET_EARLY_CLOSES = {
+    "港股": {
+        day: datetime_time(12) for day in _date_set("2026-02-16", "2026-12-24", "2026-12-31")
+    },
+    "美股": {
+        day: datetime_time(13) for day in _date_set("2026-11-27", "2026-12-24")
+    },
+}
+
+
 # Published cash-market closures. Weekends are handled separately.
 # A-share historical sources (SSE annual notices):
 # https://www.sse.com.cn/disclosure/announcement/general/c/c_20211220_5662606.shtml
@@ -266,6 +279,14 @@ def get_market_window(name: str) -> MarketWindow | None:
     return next((market for market in MARKET_WINDOWS if market.name == name), None)
 
 
+def market_sessions_for_date(market: MarketWindow, day: date) -> tuple:
+    """Regular sessions shortened by the published half-day schedule."""
+    early_close = STATIC_MARKET_EARLY_CLOSES.get(market.name, {}).get(day)
+    if early_close is None:
+        return market.sessions
+    return tuple((start, min(end, early_close)) for start, end in market.sessions if start < early_close)
+
+
 def uncovered_calendar_years(market: MarketWindow, start: date, end: date) -> list[int]:
     """Years whose holiday coverage cannot support a historical gap assertion."""
     static_years = {day.year for day in STATIC_MARKET_HOLIDAYS.get(market.name, set())}
@@ -345,7 +366,7 @@ def latest_completed_trade_date(market: MarketWindow, market_now: datetime) -> d
     """Return the latest session whose regular market close has passed."""
     if not is_market_trading_day(market, market_now):
         return previous_trading_day(market, market_now.date())
-    if market_now.time() <= market.sessions[-1][1]:
+    if market_now.time() < market_sessions_for_date(market, market_now.date())[-1][1]:
         return previous_trading_day(market, market_now.date())
     return market_now.date()
 
@@ -361,7 +382,7 @@ def latest_settled_trade_date(
         return previous_trading_day(market, market_now.date())
     close_at = datetime.combine(
         market_now.date(),
-        market.sessions[-1][1],
+        market_sessions_for_date(market, market_now.date())[-1][1],
         tzinfo=market_now.tzinfo,
     )
     if market_now < close_at + settlement_delay:

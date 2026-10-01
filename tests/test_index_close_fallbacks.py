@@ -77,7 +77,8 @@ def test_h30269_keeps_official_rows_when_eastmoney_has_no_same_day_value():
         export = akshare_sources.get_index_data_from_akshare_csindex("H30269", "中证红利低波", days=30)
     dates = pd.to_datetime(export["日期"] if "日期" in export.columns else export.iloc[:, 0]).dt.strftime("%Y-%m-%d").tolist()
     assert "2026-09-28" in dates  # previously the whole batch was discarded and 09-28 never saved
-    ak.stock_zh_index_daily.assert_not_called()
+    # Stale official history is retained after all compatible daily adapters run.
+    ak.stock_zh_index_daily.assert_called_once()
 
 
 def test_board_kline_failure_uses_the_1500_close_as_one_row():

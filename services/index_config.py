@@ -205,6 +205,44 @@ INDEX_CONFIG = {
 }
 
 
+# Wind backup codes, each checked against the formal close cache. BK1158 has no
+# Wind equivalent (868008.WI is a different index) and TXWP20 is self-built.
+INDEX_WIND_CODES = {
+    "上证指数": "000001.SH",
+    "创业板指": "399006.SZ",
+    "沪深300": "000300.SH",
+    "中证500": "000905.SH",
+    "中证1000": "000852.SH",
+    "中证2000": "932000.CSI",
+    "科创50": "000688.SH",
+    "中证红利低波": "H30269.CSI",
+    "国证自由现金流": "980092.CNI",
+    "恒生科技": "HSTECH.HI",
+    "恒生港股通高息低波": "HSHYLV.HI",
+    "标普500": "SPX.GI",
+    "纳斯达克综合": "IXIC.GI",
+    "纳斯达克100": "NDX.GI",
+    "VIX恐慌指数": "VIX.GI",
+    "日经225": "N225.GI",
+    "韩国KOSPI": "KS11.GI",
+    "中证500期货主连": "IC.CFE",
+    "中证1000期货主连": "IM.CFE",
+    "铁矿石主连": "I.DCE",
+    "沪金主连": "AU.SHF",
+    "沪银主连": "AG.SHF",
+    "原油主连": "SC.INE",
+}
+# Main-continuous futures roll on vendor-specific dates, so Wind's continuous
+# codes back up transient card quotes only, never the formal main-continuous
+# daily series (concrete-contract caches may still use Wind contract bars).
+INDEX_WIND_QUOTE_ONLY = {
+    "中证500期货主连", "中证1000期货主连", "铁矿石主连", "沪金主连", "沪银主连", "原油主连",
+}
+for _index_name, _wind_code in INDEX_WIND_CODES.items():
+    INDEX_CONFIG[_index_name]["wind_code"] = _wind_code
+    INDEX_CONFIG[_index_name]["wind_formal_daily"] = _index_name not in INDEX_WIND_QUOTE_ONLY
+
+
 INDEX_LONG_HISTORY_SOURCE = "index_long_history"
 INDEX_FINAL_HISTORY_SOURCE = "index_final_history"
 INDEX_SOURCE_CORRECTION_SOURCE = "index_source_correction_history"
@@ -217,7 +255,7 @@ CFFEX_FUTURES_MAIN_PRODUCTS = {
 }
 
 __all__ = [
-    "YAHOO_CHART_HOSTS", "YAHOO_REQUEST_GATE", "INDEX_CONFIG",
+    "YAHOO_CHART_HOSTS", "YAHOO_REQUEST_GATE", "INDEX_CONFIG", "INDEX_WIND_CODES", "INDEX_WIND_QUOTE_ONLY",
     "INDEX_LONG_HISTORY_SOURCE", "INDEX_FINAL_HISTORY_SOURCE",
     "INDEX_SOURCE_CORRECTION_SOURCE", "INDEX_LONG_HISTORY_BARS",
     "INDEX_REPORT_DISPLAY_DAYS", "INDEX_RECENT_GAP_LOOKBACK_SESSIONS",

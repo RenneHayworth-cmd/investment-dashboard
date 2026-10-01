@@ -12,6 +12,8 @@ import requests
 
 from core.cache import load_dataset, save_dataset
 from services.fund_analysis import infer_tickflow_symbol
+from services.akshare_sources import raw_security_sources
+from services.market_fallback import MarketSource, fetch_market_fallback
 from services.market_calendar import get_market_window, latest_settled_trade_date, previous_trading_day
 
 DATA_TYPE = "microcap_live_close_v1"
@@ -21,9 +23,9 @@ TZ = ZoneInfo("Asia/Shanghai")
 SETTLEMENT_DELAY = timedelta(minutes=5)
 # Merge priority: official daily bars win over post-close snapshots for the same date.
 HISTORY_SOURCES = (
-    "tickflow", "akshare", "akshare_tx",
+    "tickflow", "akshare", "akshare_tx", "akshare_sina", "wind",
     "tickflow_close_snapshot", "eastmoney_close_snapshot", "tencent_close_snapshot",
-    "bk1158_close_snapshot",
+    "wind_close_snapshot", "bk1158_close_snapshot",
 )
 
 
@@ -38,7 +40,7 @@ def _normalize_history(frame: pd.DataFrame | None) -> pd.DataFrame:
     if frame is None or frame.empty:
         return pd.DataFrame(columns=["date", "close"])
     date_col = next((c for c in ("date", "日期", "trade_date") if c in frame.columns), None)
-    price_col = next((c for c in ("close", "收盘价", "price") if c in frame.columns), None)
+    price_col = next((c for c in ("close", "收盘", "收盘价", "price") if c in frame.columns), None)
     if date_col is None or price_col is None:
         raise ValueError(f"行情字段无法识别：{list(frame.columns)}")
     result = pd.DataFrame({
@@ -74,47 +76,24 @@ def _tickflow_history(symbol: str, api_key: str, count: int) -> pd.DataFrame:
 
 def _akshare_history(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     import akshare as ak
-    try:
-        frame = ak.stock_zh_a_hist(
-            symbol=symbol, period="daily", start_date=start_date.replace("-", ""),
-            end_date=end_date.replace("-", ""), adjust="",
-        )
-    except requests.exceptions.ProxyError as proxy_error:
-        # AkShare's A-share history wrapper uses the same EastMoney endpoint,
-        # but requests inherits the system proxy by default. If that proxy
-        # drops the connection, try AkShare's Tencent-backed daily history,
-        # then retry the EastMoney kline query on alternate routes.
-        tencent_error = None
-        try:
-            code = str(symbol).zfill(6)
-            market_prefix = "sh" if code.startswith(("6", "9")) else (
-                "bj" if code.startswith(("4", "8")) else "sz"
-            )
-            tencent_frame = ak.stock_zh_a_hist_tx(
-                symbol=f"{market_prefix}{code}",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                adjust="",
-                timeout=12,
-            )
-            tencent_history = _normalize_history(tencent_frame)
-            if not tencent_history.empty:
-                tencent_history.attrs["source"] = "akshare_tx"
-                return tencent_history
-            tencent_error = ValueError("AkShare腾讯日线未返回有效记录")
-        except Exception as exc:
-            tencent_error = exc
-        try:
-            fallback_history = _akshare_history_fallback(symbol, start_date, end_date)
-            fallback_history.attrs["source"] = "akshare"
-            return fallback_history
-        except Exception as route_error:
-            raise RuntimeError(
-                f"AkShare东方财富主源失败（{proxy_error}）；"
-                f"AkShare腾讯日线失败（{tencent_error}）；"
-                f"东方财富备用线路失败（{route_error}）"
-            ) from route_error
-    return _normalize_history(frame)
+    sources = raw_security_sources(ak, symbol, start_date, end_date)
+    sources.append(MarketSource(
+        "东方财富备用线路", lambda: _akshare_history_fallback(symbol, start_date, end_date), "akshare",
+    ))
+    from services.wind_source import wind_api_key
+
+    if wind_api_key():
+        sources.append(MarketSource("万得Wind", lambda: _wind_history(symbol, start_date, end_date), "wind"))
+    return fetch_market_fallback(
+        sources, _normalize_history, date_column="date", price_column="close", target_date=end_date,
+    )
+
+
+def _wind_history(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Unadjusted Wind daily bars, the last formal-close backup."""
+    from services.wind_source import fetch_wind_daily_bars, wind_stock_code
+
+    return _normalize_history(fetch_wind_daily_bars("stock_data", wind_stock_code(symbol), start_date, end_date, aftype="2"))
 
 
 def _akshare_history_fallback(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -223,7 +202,7 @@ def load_microcap_histories(
             return
         try:
             fresh_ak = _akshare_history(code, requested, target_date)
-            source = "akshare_tx" if fresh_ak.attrs.get("source") == "akshare_tx" else "akshare"
+            source = fresh_ak.attrs.get("source", "akshare")
             own[source] = _append_only(own[source], fresh_ak, target_date)
             if not own[source].empty:
                 save_dataset(cache_symbol, code, source, DATA_TYPE, own[source], period="1d")
@@ -275,13 +254,14 @@ def load_microcap_histories(
 def _close_snapshots(
     codes: list[str], api_key: str, current: datetime, close_at: datetime,
 ) -> tuple[dict[str, dict], str]:
-    """Post-close quotes stamped at or after today's close: TickFlow, EastMoney, Tencent, then the local BK1158 snapshot."""
+    """Post-close quotes stamped at or after today's close: TickFlow, EastMoney, Tencent, Wind, then the local BK1158 snapshot."""
     result: dict[str, dict] = {}
     errors = []
     for label, cache_source, fetch in (
         ("TickFlow收盘快照", "tickflow_close_snapshot", lambda missing: _tickflow_quotes(missing, api_key.strip(), current)),
         ("东方财富收盘快照", "eastmoney_close_snapshot", lambda missing: _eastmoney_quotes(missing, current)),
         ("腾讯收盘快照", "tencent_close_snapshot", lambda missing: _tencent_quotes(missing, current)),
+        ("万得Wind收盘快照", "wind_close_snapshot", lambda missing: _wind_quotes(missing, current)),
     ):
         missing = [code for code in codes if code not in result]
         if not missing:
@@ -532,6 +512,30 @@ def _tencent_quotes(codes: list[str], current: datetime) -> dict[str, dict]:
     return result
 
 
+def _wind_quotes(codes: list[str], current: datetime) -> dict[str, dict]:
+    """Batched Wind snapshots; like Tencent, keep only stocks that traded today."""
+    from services.wind_source import fetch_wind_quotes, wind_api_key, wind_stock_code
+
+    if not codes or not wind_api_key():
+        return {}
+    by_wind = {wind_stock_code(code): code for code in codes}
+    frame = fetch_wind_quotes("stock_data", list(by_wind))
+    result = {}
+    for _, row in frame.iterrows():
+        code = by_wind.get(str(row["wind_code"]))
+        price, volume = (pd.to_numeric(row.get(key), errors="coerce") for key in ("price", "volume"))
+        quote_time = row.get("quote_time")
+        if (code is None or pd.isna(price) or not math.isfinite(float(price)) or float(price) <= 0
+                or pd.isna(volume) or float(volume) <= 0 or pd.isna(quote_time)
+                or row.get("trade_date") != current.date()):
+            continue
+        stamp = pd.Timestamp(quote_time)
+        stamp = stamp.tz_localize(TZ) if stamp.tzinfo is None else stamp.tz_convert(TZ)
+        result[code] = {"price": float(price), "quote_time": stamp.to_pydatetime(),
+                        "source": "万得Wind实时行情", "status": "实时"}
+    return result
+
+
 def _akshare_quote(code: str, current: datetime) -> dict | None:
     import akshare as ak
     frame = ak.stock_bid_ask_em(symbol=code)
@@ -593,6 +597,14 @@ def fetch_microcap_realtime_quotes(
             quotes.update(_tencent_quotes(missing, current))
         except Exception as exc:
             errors.append(_brief("腾讯", exc))
+    missing = [code for code in codes if code not in quotes]
+    if missing:
+        # Before the AkShare fallbacks, which hit EastMoney (the all-market
+        # snapshot is dozens of requests) when EastMoney is already failing.
+        try:
+            quotes.update(_wind_quotes(missing, current))
+        except Exception as exc:
+            errors.append(_brief("万得Wind", exc))
     tickflow_error = "; ".join(errors)
     missing = [code for code in codes if code not in quotes]
     bj_missing = [code for code in missing if code.startswith(("4", "8", "9"))]

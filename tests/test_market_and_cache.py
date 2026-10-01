@@ -443,11 +443,13 @@ class MarketAndCacheTests(unittest.TestCase):
 
     @patch("services.index_ma20.get_index_data_from_yahoo")
     @patch("services.index_ma20.fetch_eastmoney_completed_global_row")
+    @patch("akshare.index_global_hist_sina", side_effect=RuntimeError("Sina history unavailable"))
     @patch("akshare.index_global_hist_em")
     @patch("services.index_ma20.datetime", AugustFixtureDateTime)
     def test_global_index_keeps_yahoo_history_when_eastmoney_history_fails(
         self,
         akshare_mock,
+        sina_mock,
         eastmoney_mock,
         yahoo_mock,
     ):
@@ -477,6 +479,7 @@ class MarketAndCacheTests(unittest.TestCase):
 
         self.assertEqual(result["日期"].astype(str).tolist(), ["2026-08-05", "2026-08-06", "2026-08-07"])
         self.assertEqual(result.iloc[-1]["韩国KOSPI_收盘价"], 104.0)
+        sina_mock.assert_called_once_with(symbol="首尔综合指数")
 
     @patch("requests.Session")
     @patch("services.index_ma20.datetime", AugustFixtureDateTime)
@@ -719,9 +722,12 @@ class MarketAndCacheTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    # Offline: on a holiday the latest session is complete, which would otherwise
+    # reach EastMoney's live minute series.
+    @patch("services.index_sources_eastmoney.fetch_eastmoney_trend_close", return_value=None)
     @patch("services.index_ma20.append_eastmoney_clist_latest_index_row", side_effect=lambda df, **kwargs: df)
     @patch("services.index_ma20.append_eastmoney_quote_row")
-    def test_eastmoney_history_drops_non_trading_dates(self, quote_row, _clist_row):
+    def test_eastmoney_history_drops_non_trading_dates(self, quote_row, _clist_row, _trend_close):
         quote_row.return_value = pd.DataFrame(
             {
                 "trade_date": pd.to_datetime(["2026-07-03", "2026-07-04"]),

@@ -224,6 +224,51 @@ def run_index_ma20_update(
         finish_job(job_id, "failed", str(exc))
         return UpdateResult("failed", f"更新失败：{exc}", errors=errors, timings=timings)
 
+def supplement_index_raw_from_wind(
+    index_config: dict,
+    latest_raw: pd.DataFrame | None,
+    finalized_raw: pd.DataFrame | None,
+    *,
+    market_name: str,
+    target_date: date | None,
+    source_days: int,
+) -> tuple[pd.DataFrame | None, int, str]:
+    """Fill completed sessions the primary sources missed with Wind daily closes.
+
+    Returns (raw, added_row_count, wind_error). Wind is contacted only when a
+    recent completed session is still missing after the primary fetch; its rows
+    only add unseen dates, so primary rows and cached rows always win.
+    """
+    wind_code = str(index_config.get("wind_code") or "").strip()
+    if not wind_code or not index_config.get("wind_formal_daily") or target_date is None:
+        return latest_raw, 0, ""
+    has_latest = latest_raw is not None and not latest_raw.empty
+    combined = append_cached_index_rows(finalized_raw, latest_raw) if has_latest else finalized_raw
+    if not missing_recent_market_trade_dates(combined, market_name, target_date):
+        return latest_raw, 0, ""
+    from services.wind_source import fetch_wind_daily_bars, wind_api_key
+
+    if not wind_api_key():
+        return latest_raw, 0, ""
+    begin = target_date - timedelta(days=max(int(source_days), 14))
+    try:
+        bars = fetch_wind_daily_bars("index_data", wind_code, begin, target_date, aftype="2")
+    except Exception as exc:
+        return latest_raw, 0, f"万得Wind备用源失败：{str(exc).strip() or type(exc).__name__}"
+    wind_raw = bars.rename(columns={"date": "trade_date"})[["trade_date", "close"]]
+    wind_raw = filter_completed_market_dates(wind_raw, market_name)
+    if wind_raw is None or wind_raw.empty:
+        return latest_raw, 0, f"万得Wind未返回截至{target_date:%Y-%m-%d}的已完成交易日"
+    wind_raw = wind_raw.loc[pd.to_datetime(wind_raw["trade_date"]).dt.date <= target_date]
+    merged = append_cached_index_rows(latest_raw, wind_raw) if has_latest else append_cached_index_rows(None, wind_raw)
+    known = append_cached_index_rows(finalized_raw, latest_raw) if has_latest else finalized_raw
+    known_dates = set() if known is None or known.empty else set(pd.to_datetime(known["trade_date"]).dt.date)
+    added = sum(1 for day in pd.to_datetime(wind_raw["trade_date"]).dt.date if day not in known_dates)
+    if not added:
+        return latest_raw, 0, ""
+    return merged, added, ""
+
+
 def fetch_index_report(
     index_name: str,
     index_config: dict,
@@ -343,15 +388,37 @@ def fetch_index_report(
         except Exception:
             df = None
 
+    primary_error: Exception | None = None
     if df is None or missing_recent_dates:
-        df = fetch_one_index(index_name, index_config, api_key=api_key, days=source_days)
+        try:
+            df = fetch_one_index(index_name, index_config, api_key=api_key, days=source_days)
+        except Exception as exc:
+            primary_error = exc
+            df = None
 
     latest_raw = extract_raw_from_export_df(df, index_name)
     latest_raw = filter_completed_market_dates(latest_raw, market_name)
+    # Source-correction overlays hold only the configured source's own rows.
+    latest_correction_raw = (
+        extract_source_correction_rows(latest_raw, index_config)
+        if latest_raw is not None and not latest_raw.empty
+        else None
+    )
+    latest_raw, wind_added, wind_error = supplement_index_raw_from_wind(
+        index_config,
+        latest_raw,
+        finalized_raw,
+        market_name=market_name,
+        target_date=target_date,
+        source_days=source_days,
+    )
+    if primary_error is not None and not wind_added:
+        if wind_error:
+            raise RuntimeError(f"{primary_error}；{wind_error}") from primary_error
+        raise primary_error
     if latest_raw is None or latest_raw.empty:
         return build_export_df(effective_history_raw, index_name, days=days)
 
-    latest_correction_raw = extract_source_correction_rows(latest_raw, index_config)
     if latest_correction_raw is not None and not latest_correction_raw.empty:
         previous_correction_count = 0 if correction_storage_raw is None else len(correction_storage_raw)
         correction_storage_raw = append_cached_index_rows(correction_storage_raw, latest_correction_raw)

@@ -54,16 +54,40 @@ def _runtime_quote_refresh_band(market_now: datetime) -> tuple[str, int] | None:
         return None
     current_time = market_now.time()
     if ETF_MORNING_TIMING_START_TIME <= current_time < ETF_MORNING_FAST_REFRESH_END_TIME:
-        return "早盘", ETF_MORNING_TIMING_REFRESH_SECONDS
+        return "早盘", ETF_REALTIME_TIMING_REFRESH_SECONDS
     if ETF_MORNING_FAST_REFRESH_END_TIME <= current_time < ETF_MORNING_TIMING_PREVIEW_END_TIME:
-        return "上午", ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+        return "上午", ETF_REALTIME_TIMING_REFRESH_SECONDS
     if ETF_LUNCH_TIMING_START_TIME <= current_time < ETF_LUNCH_TIMING_FETCH_END_TIME:
         return "午间", 600
     if ETF_AFTERNOON_TIMING_START_TIME <= current_time < ETF_REALTIME_TIMING_START_TIME:
-        return "下午", ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+        return "下午", ETF_REALTIME_TIMING_REFRESH_SECONDS
     if ETF_REALTIME_TIMING_START_TIME <= current_time < ETF_REALTIME_TIMING_END_TIME:
         return "尾盘", ETF_REALTIME_TIMING_REFRESH_SECONDS
     return None
+
+
+def auxiliary_quote_refresh_due(market_now: datetime, state: dict) -> bool:
+    """Keep public-source futures/index quotes on their existing slower cadence.
+
+    TickFlow's documented quote quota supports ETF polling every two minutes;
+    that permission does not establish a quota for the other quote vendors.
+    """
+    band = _runtime_quote_refresh_band(market_now)
+    if band is None:
+        return False
+    band_name, refresh_seconds = band
+    if band_name == "早盘":
+        refresh_seconds = ETF_MORNING_TIMING_REFRESH_SECONDS
+    elif band_name in {"上午", "下午"}:
+        refresh_seconds = ETF_MIDSESSION_TIMING_REFRESH_SECONDS
+    if state.get("trade_date") != market_now.date().isoformat() or state.get("band") != band_name:
+        return True
+    if band_name == "午间" and state.get("success"):
+        return False
+    last_attempt = pd.to_datetime(state.get("last_attempt"), errors="coerce")
+    return pd.isna(last_attempt) or (
+        market_now.replace(tzinfo=None) - last_attempt
+    ).total_seconds() >= refresh_seconds
 
 
 def refresh_runtime_etf_quotes(
@@ -104,9 +128,15 @@ def refresh_runtime_etf_quotes(
             _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_attempt"), errors="coerce"
         )
         same_band = _RUNTIME_ETF_QUOTE_FETCH_STATE.get("band") == band_name
+        if same_date and same_band and _RUNTIME_ETF_QUOTE_FETCH_STATE.get("error"):
+            refresh_seconds = max(refresh_seconds, 600)
         scope_covered = requested_scope.issubset(existing_scope)
         successful_scope = set(
             _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_scope") or []
+        )
+        same_success_band = bool(
+            _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_trade_date") == trade_date
+            and _RUNTIME_ETF_QUOTE_FETCH_STATE.get("last_success_band") == band_name
         )
         lunch_already_succeeded = bool(
             band_name == "午间"
@@ -161,7 +191,9 @@ def refresh_runtime_etf_quotes(
                 "last_success": market_now_naive.isoformat(),
                 "last_success_trade_date": trade_date,
                 "last_success_band": band_name,
-                "last_success_scope": fetch_scope,
+                "last_success_scope": sorted(
+                    (successful_scope if same_success_band else set()) | set(quotes)
+                ),
                 "error": "",
             }
         )
@@ -207,16 +239,22 @@ def fetch_tickflow_etf_quotes(
     symbols = [infer_tickflow_symbol(code) for code in codes]
     client = _tickflow_quote_client(api_key)
     quote_frames = []
-    for start in range(0, len(symbols), 5):
-        batch = symbols[start:start + 5]
-        batch_df = client.quotes.get(symbols=batch, as_dataframe=True)
-        if batch_df is not None and not batch_df.empty:
-            quote_frames.append(batch_df)
-    if not quote_frames:
-        raise ValueError("TickFlow未返回ETF实时行情。")
-    quote_df = pd.concat(quote_frames, ignore_index=True)
-    if "symbol" not in quote_df.columns:
-        quote_df = quote_df.reset_index()
+    tickflow_error: Exception | None = None
+    try:
+        for start in range(0, len(symbols), 5):
+            batch = symbols[start:start + 5]
+            batch_df = client.quotes.get(symbols=batch, as_dataframe=True)
+            if batch_df is not None and not batch_df.empty:
+                quote_frames.append(batch_df)
+    except Exception as exc:
+        # Keep batches already returned; Sina/Wind below cover the rest.
+        tickflow_error = exc
+    if quote_frames:
+        quote_df = pd.concat(quote_frames, ignore_index=True)
+        if "symbol" not in quote_df.columns:
+            quote_df = quote_df.reset_index()
+    else:
+        quote_df = pd.DataFrame()
 
     quotes: dict[str, dict[str, object]] = {}
     for _, row in quote_df.iterrows():
@@ -252,9 +290,56 @@ def fetch_tickflow_etf_quotes(
         except Exception as exc:
             logger.warning("%s TickFlow实时行情缺失，新浪备用源也失败：%s", symbol, exc)
 
+    wind_error = ""
+    missing = [symbol for symbol in symbols if normalize_etf_base_code(symbol) not in quotes]
+    if missing:
+        wind_quotes, wind_error = _fetch_wind_etf_quotes(missing, market_now=market_now)
+        quotes.update(wind_quotes)
+
     if not quotes:
-        raise ValueError("TickFlow未返回当天ETF实时行情。")
+        details = [
+            f"TickFlow：{tickflow_error}" if tickflow_error is not None else "TickFlow未返回当天ETF实时行情",
+            wind_error,
+        ]
+        raise ValueError("；".join(part for part in details if part) + "。")
     return quotes
+
+
+def _fetch_wind_etf_quotes(
+    symbols: list[str],
+    *,
+    market_now: datetime,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """One Wind snapshot batch for ETFs TickFlow and Sina left without a same-day quote."""
+    from services.wind_source import WIND_SOURCE_LABEL, fetch_wind_quotes, wind_api_key
+
+    if not symbols or not wind_api_key():
+        return {}, ""
+    try:
+        frame = fetch_wind_quotes("fund_data", [str(symbol).upper() for symbol in symbols])
+    except Exception as exc:
+        logger.warning("ETF实时行情%s备用源失败：%s", WIND_SOURCE_LABEL, exc)
+        return {}, f"{WIND_SOURCE_LABEL}：{exc}"
+    quotes: dict[str, dict[str, object]] = {}
+    for _, row in frame.iterrows():
+        price = pd.to_numeric(row.get("price"), errors="coerce")
+        quote_time = row.get("quote_time")
+        if pd.isna(price) or float(price) <= 0 or pd.isna(quote_time) or row.get("trade_date") != market_now.date():
+            continue
+        stamp = pd.Timestamp(quote_time)
+        stamp = stamp.tz_localize("Asia/Shanghai") if stamp.tzinfo is None else stamp.tz_convert("Asia/Shanghai")
+        previous_close = pd.to_numeric(row.get("previous_close"), errors="coerce")
+        has_previous = pd.notna(previous_close) and float(previous_close) > 0
+        symbol = str(row["wind_code"]).upper()
+        quotes[normalize_etf_base_code(symbol)] = {
+            "symbol": symbol,
+            "price": float(price),
+            "previous_close": float(previous_close) if has_previous else None,
+            "change_pct": (float(price) / float(previous_close) - 1) * 100 if has_previous else None,
+            "quote_time": stamp.to_pydatetime(),
+            "source": WIND_SOURCE_LABEL,
+        }
+    return quotes, ""
 
 
 def remember_runtime_etf_quotes(quotes: dict[str, dict[str, object]]) -> None:

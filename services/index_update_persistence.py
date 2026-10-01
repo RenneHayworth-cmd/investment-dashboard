@@ -103,7 +103,8 @@ def _fetch_and_cache_futures_contract_history(
         if pd.notna(latest_cached) and latest_cached.date() >= target_date:
             return normalized_cached
 
-    fetched = fetch_futures_daily_from_akshare(contract).rename(columns={"date": "trade_date"})
+    # With a target, a lagging Sina bar moves on to the other compatible sources.
+    fetched = fetch_futures_daily_from_akshare(contract, target_date=target_date).rename(columns={"date": "trade_date"})
     fetched = filter_completed_market_dates(fetched, "A股")
     if fetched is not None and not fetched.empty and target_date is not None:
         fetched_dates = pd.to_datetime(fetched["trade_date"], errors="coerce")

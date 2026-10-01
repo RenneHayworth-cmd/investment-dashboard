@@ -45,6 +45,54 @@ def _to_float(value) -> float | None:
 
 
 def fetch_microcap_stocks(page_size: int = 500, retries: int = 3) -> pd.DataFrame:
+    """Exact BK1158 snapshot: direct routes, then compatible AkShare tables."""
+    from services.market_fallback import MarketSource, fetch_market_fallback
+
+    return fetch_market_fallback([
+        MarketSource("东方财富BK1158多线路", lambda: _fetch_microcap_stocks_eastmoney(page_size, retries)),
+        MarketSource("AkShare BK1158成分及市值", lambda: _fetch_microcap_stocks_akshare(page_size)),
+    ], lambda frame: frame, date_column="日期", price_column="总市值(亿元)")
+
+
+def _fetch_microcap_stocks_akshare(page_size: int) -> pd.DataFrame:
+    import akshare as ak
+
+    # The constituent endpoint discards total market cap. Join by exact code;
+    # neither a same-name board nor an all-market bottom-400 list is BK1158.
+    members = ak.stock_board_concept_cons_em(symbol="BK1158")
+    quotes = ak.stock_zh_a_spot_em()
+    required_members = {"代码", "名称"}
+    required_quotes = {"代码", "总市值", "最新价", "涨跌幅", "成交量", "成交额"}
+    if members is None or quotes is None or not required_members.issubset(members.columns) or not required_quotes.issubset(quotes.columns):
+        raise ValueError("AkShare BK1158成分或全市场行情缺少必要字段")
+    members, quotes = members.copy(), quotes.copy()
+    for frame in (members, quotes):
+        frame["代码"] = frame["代码"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+        if frame["代码"].duplicated().any():
+            raise ValueError("AkShare成分或行情代码重复")
+    joined = members[["代码", "名称"]].merge(quotes.drop(columns=["名称"], errors="ignore"), on="代码", how="left", validate="one_to_one")
+    if joined.empty:
+        raise ValueError("AkShare未返回BK1158成分")
+    joined["总市值(亿元)"] = pd.to_numeric(joined["总市值"], errors="coerce") / 1e8
+    if not joined["总市值(亿元)"].map(lambda value: pd.notna(value) and 0 < value < float("inf")).all():
+        raise ValueError("AkShare BK1158成分的市值不完整，无法确认最小市值排序")
+    for column in ("最新价", "涨跌幅", "成交量", "成交额"):
+        joined[column] = pd.to_numeric(joined[column], errors="coerce")
+    if joined[["成交量", "成交额"]].isna().any().any():
+        raise ValueError("AkShare BK1158成分的成交量或成交额缺失，无法确认停牌状态")
+    joined = joined.rename(columns={"涨跌幅": "涨跌幅(%)"})
+    joined["是否停牌"] = joined["成交量"].le(0) | joined["成交额"].le(0)
+    fetched_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+    joined["日期"] = fetched_at.strftime("%Y-%m-%d")
+    joined["更新时间"] = fetched_at.strftime("%Y-%m-%d %H:%M:%S")
+    result = joined.sort_values("总市值(亿元)").head(max(1, min(int(page_size), 1000))).reset_index(drop=True)
+    result.insert(0, "排名", range(1, len(result) + 1))
+    result = result[["排名", "代码", "名称", "最新价", "涨跌幅(%)", "成交量", "成交额", "总市值(亿元)", "是否停牌", "日期", "更新时间"]]
+    result.attrs.update(source_hosts=["AkShare/stock_board_concept_cons_em", "AkShare/stock_zh_a_spot_em"], delayed=False, quote_time=None)
+    return result
+
+
+def _fetch_microcap_stocks_eastmoney(page_size: int = 500, retries: int = 3) -> pd.DataFrame:
     """Fetch EastMoney BK1158 constituents sorted by ascending total market cap."""
     requested_count = max(1, min(int(page_size), 1000))
     api_page_size = min(100, requested_count)

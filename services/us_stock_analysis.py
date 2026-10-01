@@ -36,6 +36,49 @@ def fetch_tickflow_us_daily(
     count: int = 1500,
     adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
 ) -> pd.DataFrame:
+    """TickFlow with compatible unadjusted AkShare backups (legacy entry point)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from services.market_calendar import get_market_window, latest_settled_trade_date
+    from services.market_fallback import MarketSource, fetch_market_fallback, normalize_daily_prices
+
+    adjustment = normalize_fund_adjustment(adjust)
+    sources = [MarketSource("TickFlow", lambda: _fetch_tickflow_us_daily(symbol, api_key, count, adjustment))]
+    if adjustment == "none":
+        ticker = symbol.removesuffix(".US")
+
+        def convert(raw):
+            frame = normalize_daily_prices(raw).tail(count).rename(columns={
+                "date": "日期", "close": "收盘价", "open": "开盘价", "high": "最高价", "low": "最低价", "volume": "成交量", "amount": "成交额",
+            })
+            frame["symbol"] = symbol
+            frame["name"] = symbol
+            return frame
+
+        def sina():
+            import akshare as ak
+            return convert(ak.stock_us_daily(symbol=ticker, adjust=""))
+
+        def eastmoney():
+            import akshare as ak
+            spot = ak.stock_us_spot_em()
+            codes = spot["代码"].astype(str)
+            matched = codes[codes.str.split(".", n=1).str[-1].str.upper().eq(ticker.upper())]
+            if len(matched) != 1:
+                raise ValueError(f"无法唯一确认 {ticker} 的东方财富证券代码")
+            return convert(ak.stock_us_hist(symbol=matched.iloc[0], period="daily", adjust=""))
+
+        sources += [MarketSource("stock_us_daily/新浪", sina), MarketSource("stock_us_hist/东方财富", eastmoney)]
+    target = latest_settled_trade_date(get_market_window("美股"), datetime.now(ZoneInfo("America/New_York")))
+    return fetch_market_fallback(sources, lambda frame: frame, date_column="日期", price_column="收盘价", target_date=target)
+
+
+def _fetch_tickflow_us_daily(
+    symbol: str,
+    api_key: str = "",
+    count: int = 1500,
+    adjust: str | None = FUND_ADJUST_FORWARD_ADDITIVE,
+) -> pd.DataFrame:
     from tickflow import TickFlow
 
     adjustment = normalize_fund_adjustment(adjust)

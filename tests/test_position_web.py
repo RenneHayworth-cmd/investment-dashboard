@@ -221,6 +221,16 @@ def test_retry_target_change_and_cooldown():
     assert state._due('159501','2026-08-10')
 
 
+def test_quote_error_is_retained_when_runtime_reuses_quotes_during_cooldown():
+    state = Coordinator(api_key='test-only', clock=lambda: NOW)
+    with patch.object(state, '_publish'), patch.object(state, '_due', return_value=False), \
+         patch.object(runtime, 'refresh_runtime_etf_quotes', return_value={}), \
+         patch.object(runtime, 'load_runtime_etf_quote_state', return_value={'error': 'TickFlow限流'}), \
+         patch.object(runtime, 'auxiliary_quote_refresh_due', return_value=False):
+        state._cycle()
+    assert 'TickFlow限流' in state.source_errors['quotes']
+
+
 def test_shared_runtime_reuses_quote_batch_and_lunch_success():
     with runtime._RUNTIME_ETF_QUOTE_CACHE_LOCK:
         old_quotes = dict(runtime._RUNTIME_ETF_QUOTE_CACHE)

@@ -43,6 +43,7 @@ class Coordinator:
         self.derivative_preview_date = ""
         self.index_quotes = {}
         self.index_quote_date = ""
+        self.auxiliary_quote_state = {}
         self.attempts = {}
         self.source_errors = {}
         self.formal_errors = {}
@@ -141,7 +142,6 @@ class Coordinator:
         band = runtime._runtime_quote_refresh_band(now)
         if band:
             self.stage = "刷新共享行情"
-            before = runtime.load_runtime_etf_quote_state().get("last_attempt")
             try:
                 runtime.refresh_runtime_etf_quotes(
                     models.DEFAULT_ETF_CODES,
@@ -152,10 +152,13 @@ class Coordinator:
             except Exception as exc:
                 self.source_errors["quotes"] = f"TickFlow实时行情：{redact(str(exc))}"
             else:
-                self.source_errors.pop("quotes", None)
+                cached_error = runtime.load_runtime_etf_quote_state().get("error")
+                if cached_error:
+                    self.source_errors["quotes"] = f"TickFlow实时行情：{redact(str(cached_error))}"
+                else:
+                    self.source_errors.pop("quotes", None)
             self._publish(self.clock())
-            after = runtime.load_runtime_etf_quote_state().get("last_attempt")
-            if before != after:
+            if manual_refresh or runtime.auxiliary_quote_refresh_due(now, self.auxiliary_quote_state):
                 refreshed, failures = derivatives.refresh_position_derivative_items(self.derivatives, api_key=self.api_key, market_now=now)
                 if self.derivative_preview_date != str(now.date()):
                     self.derivative_preview = {}
@@ -175,6 +178,11 @@ class Coordinator:
                     self.source_errors["index_quotes"] = "指数实时报价缺失：" + "、".join(sorted(missing)) if missing else ""
                 except Exception as exc:
                     self.source_errors["index_quotes"] = "指数实时源：" + redact(str(exc))
+                self.auxiliary_quote_state = {
+                    "trade_date": now.date().isoformat(), "band": band[0],
+                    "last_attempt": now.replace(tzinfo=None).isoformat(),
+                    "success": not failures and not self.source_errors.get("index_quotes"),
+                }
                 self._publish(self.clock())
         target = latest_final_etf_trade_date(now)
         for index, item in enumerate(self.items):

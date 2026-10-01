@@ -18,7 +18,8 @@ class TaoxiIndexPageTests(unittest.TestCase):
         with (
             patch("services.index_realtime.manual_quote_request_names", return_value=({"桃囍微盘"}, {})),
             patch("services.index_realtime.fetch_realtime_index_quotes", side_effect=failed_quote),
-            patch("services.index_realtime.find_pending_post_close_index_names", return_value=[]),
+            patch("services.index_realtime.find_pending_post_close_index_names", return_value=set()),
+            patch("services.update_tasks.find_pending_futures_current_contract_index_names", return_value=set()),
         ):
             app = AppTest.from_file(str(PAGE), default_timeout=30).run()
             app.button[0].click().run()

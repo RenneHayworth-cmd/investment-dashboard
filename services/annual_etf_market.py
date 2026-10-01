@@ -177,18 +177,23 @@ def fetch_annual_etf_raw_history(
 ) -> pd.DataFrame:
     """联网抓取未复权正式日线；调用方负责二次确认和原子缓存。"""
     import akshare as ak
+    from datetime import datetime, time
+    from zoneinfo import ZoneInfo
+    from services.akshare_sources import raw_security_sources
+    from services.market_fallback import fetch_market_fallback, normalize_daily_prices
+    from services.market_calendar import get_market_window, latest_settled_trade_date
 
-    frame = ak.stock_zh_a_hist_tx(
-        symbol=exchange_prefixed_symbol(record.symbol),
-        start_date=start_date,
-        end_date=end_date,
-        adjust="",
+    market = get_market_window("A股")
+    completed = latest_settled_trade_date(market, datetime.now(ZoneInfo("Asia/Shanghai")))
+    requested = latest_settled_trade_date(market, datetime.combine(pd.Timestamp(end_date).date(), time(23, 59), tzinfo=ZoneInfo("Asia/Shanghai")))
+    target = min(requested, completed)
+    frame = fetch_market_fallback(
+        raw_security_sources(ak, record.symbol, start_date, target.strftime("%Y%m%d"), fund=True, tencent_first=True),
+        normalize_daily_prices, date_column="date", price_column="close", target_date=target,
     )
-    if frame is None or frame.empty:
-        raise RuntimeError(f"{record.symbol} 未获取到未复权正式日线。")
-    normalized = normalize_annual_market_data(frame)
-    if normalized.empty:
-        raise RuntimeError(f"{record.symbol} 未复权正式日线无法标准化。")
+    # Annual inputs contain completed sessions only, including the default future end date.
+    frame = frame[pd.to_datetime(frame["date"]).dt.date.between(pd.Timestamp(start_date).date(), target)].copy()
+    normalize_annual_market_data(frame)
     return frame
 
 

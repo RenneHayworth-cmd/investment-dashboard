@@ -31,14 +31,14 @@ class BacktestFundHistoryTests(unittest.TestCase):
             position_market.fetch_backtest_fund_close(symbol="161128.SZ", count=100, adjust="forward_additive")
         tickflow.assert_not_called()
 
-    def test_transient_tickflow_error_does_not_switch_source(self):
+    def test_transient_tickflow_error_switches_to_compatible_source(self):
         with (
             patch.object(position_market, "fetch_tickflow_fund_close", side_effect=RuntimeError("rate limited")),
-            patch.object(position_market, "_fetch_exchange_fund_close") as exchange,
+            patch.object(position_market, "_fetch_exchange_fund_close", return_value=_history("东方财富/AkShare")) as exchange,
         ):
-            with self.assertRaises(RuntimeError):
-                position_market.fetch_backtest_fund_close(symbol="512890.SH", count=100, adjust="forward_additive")
-        exchange.assert_not_called()
+            result = position_market.fetch_backtest_fund_close(symbol="512890.SH", count=100, adjust="forward_additive")
+        exchange.assert_called_once()
+        self.assertEqual(result.attrs["position_history_source"], "东方财富/AkShare")
 
     def test_both_sources_failing_reports_each(self):
         with (

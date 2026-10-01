@@ -226,12 +226,12 @@ def _update_position_settlements(
                     settlement = _number(rows.iloc[-1].get("settle"))
                     source = "中金所日行情结算价"
             elif asset_type == "期货":
-                raw = ak.futures_zh_daily_sina(symbol=contract.lower())
+                raw, history_source = _fetch_futures_settlement_history(contract, start_date=target_date, end_date=target_date)
                 raw_dates = pd.to_datetime(raw.get("date"), errors="coerce")
                 rows = raw[raw_dates.dt.strftime("%Y-%m-%d").eq(target_date)]
                 if not rows.empty:
-                    settlement = _number(rows.iloc[-1].get("settle"))
-                    source = "新浪期货日线结算价"
+                    settlement = _number(rows.iloc[-1].get("settlement"))
+                    source = history_source
             else:
                 matched = re.match(r"^([A-Z]+\d{4})[CP]\d+$", contract)
                 if not matched or not contract.startswith("I"):
@@ -281,22 +281,34 @@ def _fetch_futures_settlement_history(
     end_date: str | None = None,
 ) -> tuple[pd.DataFrame, str]:
     import akshare as ak
+    from services.futures_spread import FUTURES_EXCHANGES
+    from services.market_fallback import MarketSource, fetch_market_fallback
 
-    raw = ak.futures_zh_daily_sina(symbol=contract.lower())
-    source = "新浪期货日线结算价"
-    if raw is None or raw.empty:
-        raise RuntimeError(f"{source}未返回数据。")
-    required = {"date", "close", "settle"}
-    if not required.issubset(raw.columns):
-        raise RuntimeError("新浪期货日线缺少日期、收盘价或结算价字段。")
-    result = pd.DataFrame(
-        {
+    def normalize(raw):
+        required = {"date", "close", "settle"}
+        if not required.issubset(raw.columns):
+            raise RuntimeError("期货日线缺少日期、收盘价或结算价字段。")
+        return pd.DataFrame({
             "date": pd.to_datetime(raw["date"], errors="coerce"),
             "close": pd.to_numeric(raw["close"], errors="coerce"),
             "settlement": pd.to_numeric(raw["settle"], errors="coerce"),
-        }
-    ).dropna(subset=["date", "settlement"])
-    return result, source
+        }).dropna(subset=["date", "close", "settlement"])
+
+    sources = [MarketSource("新浪期货日线结算价", lambda: ak.futures_zh_daily_sina(symbol=contract.lower()))]
+    product = re.match(r"[A-Za-z]+", contract).group().upper()
+    exchange = {"SHF": "SHFE", "ZCE": "CZCE", "CFX": "CFFEX", "GFE": "GFEX", "DCE": "DCE"}.get(FUTURES_EXCHANGES.get(product))
+    if product in {"SC", "LU", "NR", "BC", "EC"}:
+        exchange = "INE"
+    if exchange and start_date and end_date:
+        def official():
+            raw = ak.get_futures_daily(start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), market=exchange)
+            if raw is None or raw.empty or "symbol" not in raw:
+                raise ValueError("交易所未返回合约日行情")
+            return raw.loc[raw["symbol"].astype(str).str.upper().eq(contract.upper())]
+
+        sources.append(MarketSource(f"AkShare/{exchange}交易所结算价", official))
+    result = fetch_market_fallback(sources, normalize, date_column="date", price_column="settlement", target_date=end_date)
+    return result, result.attrs["market_data_source"]
 
 
 def _fetch_cffex_settlement_history(

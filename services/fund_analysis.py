@@ -132,6 +132,32 @@ def fetch_eastmoney_fund_nav(
     page_size: int = 20,
     max_workers: int = 8,
 ) -> pd.DataFrame:
+    from services.market_fallback import MarketSource, fetch_market_fallback
+
+    fund_code = fund_code.strip()
+    if not fund_code.isdigit() or len(fund_code) != 6:
+        raise ValueError("东方财富基金净值接口需要 6 位数字基金代码，例如 512890。")
+
+    def akshare_nav():
+        import akshare as ak
+
+        frame = ak.fund_open_fund_info_em(symbol=fund_code, indicator="累计净值走势")
+        frame = frame.rename(columns={"净值日期": "日期"})
+        result = _finalize_eastmoney_nav(frame, fund_code)
+        return result if full_history else result.tail(page_size)
+
+    return fetch_market_fallback([
+        MarketSource("东方财富累计净值", lambda: _fetch_eastmoney_fund_nav(fund_code, full_history, page_size, max_workers)),
+        MarketSource("fund_open_fund_info_em/累计净值", akshare_nav),
+    ], lambda frame: frame, date_column="日期", price_column="累计净值")
+
+
+def _fetch_eastmoney_fund_nav(
+    fund_code: str,
+    full_history: bool = True,
+    page_size: int = 20,
+    max_workers: int = 8,
+) -> pd.DataFrame:
     fund_code = fund_code.strip()
     if not fund_code:
         raise ValueError("基金代码不能为空。")

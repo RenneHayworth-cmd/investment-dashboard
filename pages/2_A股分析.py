@@ -24,12 +24,12 @@ from services.fund_analysis import (
     build_fund_cache_symbol,
     calculate_current_drawdown_info,
     fetch_eastmoney_fund_nav,
-    fetch_tickflow_fund_close,
     infer_tickflow_symbol,
     normalize_nav_dataframe,
     read_uploaded_table,
     resolve_price_axis_type,
 )
+from services.position_market import fetch_backtest_fund_close
 
 
 def _format_metric(value, suffix: str = "") -> str:
@@ -303,7 +303,7 @@ elif input_mode == "场内基金/股票":
             if cached_df is not None and adjust_value == FUND_ADJUST_NONE:
                 incremental_count = min(max(120, int(count) // 20), int(count))
                 with st.spinner(f"正在增量更新 {symbol} 最近 {incremental_count} 条日线…"):
-                    latest_df = fetch_tickflow_fund_close(
+                    latest_df = fetch_backtest_fund_close(
                         symbol=symbol,
                         api_key=api_key,
                         count=incremental_count,
@@ -319,8 +319,8 @@ elif input_mode == "场内基金/股票":
                 )
             else:
                 action_text = "重建" if cached_df is not None else "拉取"
-                with st.spinner(f"正在通过 TickFlow 全量{action_text} {symbol} 的日线收盘价…"):
-                    source_df = fetch_tickflow_fund_close(
+                with st.spinner(f"正在全量{action_text} {symbol} 的日线收盘价（TickFlow 优先，失败尝试备用源）…"):
+                    source_df = fetch_backtest_fund_close(
                         symbol=symbol,
                         api_key=api_key,
                         count=int(count),

@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from components.position.details import render_position_detail
+from components.position.runtime_state import restore_previews
 from components.position.cards_tables import render_position_cards
 from components.position.formatting import (
     build_overview_table,
@@ -106,6 +107,16 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
     quote_codes = sorted(set(etf_codes))
     futures_codes = position.parse_position_codes(futures_text)
     spread_groups = position.parse_spread_groups(spread_text)
+    market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    restore_previews(
+        st.session_state,
+        (
+            tuple(etf_codes), tuple(futures_codes),
+            tuple(tuple(group) for group in spread_groups),
+            int(etf_count), int(market_count), adjust_map[adjust_option],
+        ),
+        market_now,
+    )
     # A first load that a rerun interrupted (it runs symbol by symbol) resumes on the next
     # run; already-current caches are read locally, so only the unfinished symbols fetch.
     initial_load = not st.session_state.get("position_initial_load_completed", False)
@@ -115,14 +126,17 @@ def render_position_page(timing_renderer: TimingRenderer) -> None:
         st.session_state.position_derivative_refresh_request = 0
     if load_requested:
         st.session_state.position_updates_enabled = True
+    intraday_market_active = bool(
+        position.etf_intraday_quote_ready(market_now)
+        and market_now.time() < position.ETF_REALTIME_TIMING_END_TIME
+    )
+    if update_clicked and intraday_market_active:
         st.session_state.position_derivative_refresh_request += 1
     updates_enabled = bool(st.session_state.position_updates_enabled)
     derivative_refresh_request = int(
         st.session_state.position_derivative_refresh_request
     )
     refresh_existing = bool(update_clicked and force_refresh)
-    market_now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    intraday_market_active = position.etf_intraday_quote_ready(market_now)
     intraday_quote_mode = bool(load_requested and intraday_market_active)
 
     status_container = st.empty()

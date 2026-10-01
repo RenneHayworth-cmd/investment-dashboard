@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -60,6 +60,19 @@ def _item(
 
 
 def _patch_page(stack: ExitStack, *, cached: bool):
+    from components.position.runtime_state import _PREVIEWS
+    from services import position_runtime
+    _PREVIEWS.clear()
+    position_runtime._RUNTIME_ETF_QUOTE_CACHE.clear()
+    position_runtime._RUNTIME_ETF_QUOTE_FETCH_STATE.clear()
+
+    class PageDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 21, 10, 30, tzinfo=tz)
+
+    stack.enter_context(patch("components.position.coordinator.datetime", PageDateTime))
+    stack.enter_context(patch("components.position.realtime.datetime", PageDateTime))
     stack.enter_context(patch("components.position.realtime.fetch_realtime_index_quotes", return_value={}))
     stack.enter_context(patch("core.db.init_db"))
     etf = stack.enter_context(
@@ -168,6 +181,191 @@ def _patch_page(stack: ExitStack, *, cached: bool):
 
 
 class PositionPageSmokeTests(unittest.TestCase):
+    def test_quote_error_stays_visible_while_failed_batch_is_in_cooldown(self):
+        class TradingDateTime(datetime):
+            current = datetime(2026, 8, 21, 10, 30)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.replace(tzinfo=tz)
+
+        with ExitStack() as stack:
+            _, _, _, quotes, _ = _patch_page(stack, cached=True)
+            stack.enter_context(patch.dict("os.environ", {"TICKFLOW_API_KEY": "test-only"}))
+            for module in ("coordinator", "realtime"):
+                stack.enter_context(patch(f"components.position.{module}.datetime", TradingDateTime))
+            for name in ("etf_intraday_quote_ready", "etf_morning_timing_fetch_ready", "etf_morning_timing_preview_ready"):
+                stack.enter_context(patch(f"services.position_analysis.{name}", return_value=True))
+            quotes.side_effect = lambda codes, **kwargs: {
+                code: {"price": 102.0, "quote_time": kwargs["market_now"]} for code in codes
+            }
+            app = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(app.exception), [])
+            quotes.side_effect = RuntimeError("TickFlow限流")
+            TradingDateTime.current = datetime(2026, 8, 21, 10, 32)
+            app.run()
+            TradingDateTime.current = datetime(2026, 8, 21, 10, 34)
+            app.run()
+            self.assertEqual(list(app.exception), [])
+            self.assertTrue(any("TickFlow限流" in warning.value for warning in app.warning))
+            self.assertEqual(quotes.call_count, 2)
+
+    def test_reopening_during_lunch_reuses_successful_quote_batches(self):
+        from services import position_analysis as position
+
+        class LunchDateTime(datetime):
+            current = datetime(2026, 8, 21, 11, 35)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.replace(tzinfo=tz)
+
+        with ExitStack() as stack:
+            _, _, _, quotes, derivatives = _patch_page(stack, cached=True)
+            stack.enter_context(patch.dict("os.environ", {"TICKFLOW_API_KEY": "test-only"}))
+            for module in ("coordinator", "realtime"):
+                stack.enter_context(patch(f"components.position.{module}.datetime", LunchDateTime))
+            for name in ("etf_intraday_quote_ready", "etf_lunch_timing_fetch_ready", "etf_lunch_timing_preview_ready"):
+                stack.enter_context(patch(f"services.position_analysis.{name}", return_value=True))
+            quotes.side_effect = lambda codes, **kwargs: {
+                code: {"symbol": code, "price": 102.0, "quote_time": kwargs["market_now"]}
+                for code in codes
+            }
+            derivatives.side_effect = lambda items, **kwargs: (
+                [item for item in items if item.category != "ETF"], []
+            )
+            indices = stack.enter_context(patch(
+                "components.position.realtime.fetch_realtime_index_quotes",
+                side_effect=lambda **kwargs: {
+                    name: {"price": 100.0, "quote_time": kwargs["now"]}
+                    for name in position.POSITION_INDEX_TIMING_STRATEGIES
+                },
+            ))
+            first = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(first.exception), [])
+            LunchDateTime.current = datetime(2026, 8, 21, 12, 15)
+            reopened = AppTest.from_file(str(PAGE), default_timeout=20).run()
+
+        self.assertEqual(list(reopened.exception), [])
+        quotes.assert_called_once()
+        derivatives.assert_called_once()
+        indices.assert_called_once()
+        self.assertEqual(
+            reopened.session_state["position_etf_lunch_timing_preview"]["fetched_at"],
+            "2026-08-21T11:35:00",
+        )
+
+    def test_reopening_outside_quote_hours_never_forces_realtime_refresh(self):
+        for hour, minute, intraday in ((8, 30, False), (15, 2, True), (16, 0, False)):
+            with self.subTest(hour=hour, minute=minute), ExitStack() as stack:
+                etf, futures, spreads, quotes, derivatives = _patch_page(stack, cached=True)
+
+                class ClosedDateTime(datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return datetime(2026, 8, 21, hour, minute, tzinfo=tz)
+
+                for module in ("coordinator", "realtime"):
+                    stack.enter_context(patch(f"components.position.{module}.datetime", ClosedDateTime))
+                stack.enter_context(patch("services.position_analysis.etf_intraday_quote_ready", return_value=intraday))
+                stack.enter_context(patch("services.position_analysis.etf_final_close_ready", return_value=hour >= 16))
+                quote_refresh = stack.enter_context(patch("services.position_analysis.refresh_runtime_etf_quotes"))
+                close_fetch = stack.enter_context(patch("components.position.realtime.fetch_audited_close"))
+                first = AppTest.from_file(str(PAGE), default_timeout=20).run()
+                second = AppTest.from_file(str(PAGE), default_timeout=20).run()
+
+                self.assertEqual(list(first.exception), [])
+                self.assertEqual(list(second.exception), [])
+                quotes.assert_not_called()
+                quote_refresh.assert_not_called()
+                derivatives.assert_not_called()
+                close_fetch.assert_not_called()
+                for loader in (etf, futures, spreads):
+                    self.assertTrue(all(not call.kwargs.get("force_refresh", False) for call in loader.call_args_list))
+
+    def test_reopened_partial_lunch_batch_retries_after_ten_minutes(self):
+        class LunchDateTime(datetime):
+            current = datetime(2026, 8, 21, 11, 35)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.replace(tzinfo=tz)
+
+        batches = []
+
+        def fetch_quotes(codes, **kwargs):
+            batches.append(list(codes))
+            selected = codes[:-1] if len(batches) == 1 else codes
+            return {
+                code: {"price": 102.0, "quote_time": kwargs["market_now"]}
+                for code in selected
+            }
+
+        with ExitStack() as stack:
+            _, _, _, quotes, _ = _patch_page(stack, cached=True)
+            quotes.side_effect = fetch_quotes
+            stack.enter_context(patch.dict("os.environ", {"TICKFLOW_API_KEY": "test-only"}))
+            for module in ("coordinator", "realtime"):
+                stack.enter_context(patch(f"components.position.{module}.datetime", LunchDateTime))
+            for name in ("etf_intraday_quote_ready", "etf_lunch_timing_fetch_ready", "etf_lunch_timing_preview_ready"):
+                stack.enter_context(patch(f"services.position_analysis.{name}", return_value=True))
+            first = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(first.exception), [])
+            self.assertEqual(quotes.call_count, 1)
+            self.assertLess(
+                len(first.session_state["position_etf_lunch_timing_preview"]["received_scope"]),
+                len(batches[0]),
+            )
+            LunchDateTime.current = datetime(2026, 8, 21, 11, 40)
+            reopened = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(reopened.exception), [])
+            self.assertEqual(quotes.call_count, 1)
+            LunchDateTime.current = datetime(2026, 8, 21, 11, 45)
+            retry = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(retry.exception), [])
+            self.assertEqual(quotes.call_count, 2)
+            self.assertEqual(
+                set(retry.session_state["position_etf_lunch_timing_preview"]["received_scope"]),
+                set(batches[0]),
+            )
+
+    def test_missing_formal_close_still_backfills_once_and_reopen_reuses_it(self):
+        from dataclasses import replace
+
+        class ClosedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 21, 16, 0, tzinfo=tz)
+
+        completed = set()
+
+        def load_etf(code, **kwargs):
+            item = _item("ETF", code, cached=True)
+            return item if code in completed else replace(item, latest_date="2026-08-20")
+
+        def fetch_close(code, **kwargs):
+            completed.add(code)
+            return _item("ETF", code, cached=True)
+
+        with ExitStack() as stack:
+            etf, _, _, quotes, derivatives = _patch_page(stack, cached=True)
+            etf.side_effect = load_etf
+            for module in ("coordinator", "realtime"):
+                stack.enter_context(patch(f"components.position.{module}.datetime", ClosedDateTime))
+            stack.enter_context(patch("services.position_analysis.etf_final_close_ready", return_value=True))
+            close_fetch = stack.enter_context(patch("components.position.realtime.fetch_audited_close", side_effect=fetch_close))
+            first = AppTest.from_file(str(PAGE), default_timeout=20).run()
+            self.assertEqual(list(first.exception), [])
+            self.assertGreater(close_fetch.call_count, 0)
+            self.assertEqual(close_fetch.call_count, len(completed))
+            close_fetch.reset_mock()
+            reopened = AppTest.from_file(str(PAGE), default_timeout=20).run()
+
+        self.assertEqual(list(reopened.exception), [])
+        close_fetch.assert_not_called()
+        quotes.assert_not_called()
+        derivatives.assert_not_called()
+
     def test_timing_performance_component_renders_metrics_chart_and_detail(self):
         daily = pd.DataFrame(
             {
@@ -387,7 +585,7 @@ render_position_timing_performance([])
             any(call.kwargs["allow_fetch"] for call in spread.call_args_list)
         )
         realtime_fetch.assert_not_called()
-        derivative_refresh.assert_called_once()
+        derivative_refresh.assert_not_called()
         self.assertTrue(app.session_state["position_updates_enabled"])
         subheaders = [item.value for item in app.subheader]
         self.assertNotIn("实盘账户", subheaders)
@@ -436,6 +634,8 @@ render_position_timing_performance([])
     def test_load_click_refreshes_derivatives_once_when_formal_cache_is_current(self):
         with ExitStack() as stack:
             _, _, _, _, derivative_refresh = _patch_page(stack, cached=True)
+            stack.enter_context(patch("services.position_analysis.etf_intraday_quote_ready", return_value=True))
+            stack.enter_context(patch("services.position_analysis.refresh_runtime_etf_quotes", return_value={}))
             derivative_refresh.side_effect = None
             derivative_refresh.return_value = ([], [])
             app = AppTest.from_file(str(PAGE), default_timeout=20).run()
@@ -452,8 +652,8 @@ render_position_timing_performance([])
             [item.category for item in refreshed_items if item.category != "ETF"],
             ["期货", "期货价差", "期货价差"],
         )
-        self.assertEqual(app.session_state["position_derivative_refresh_request"], 2)
-        self.assertEqual(app.session_state["position_derivative_refresh_consumed"], 2)
+        self.assertEqual(app.session_state["position_derivative_refresh_request"], 1)
+        self.assertEqual(app.session_state["position_derivative_refresh_consumed"], 1)
 
     def test_open_during_trading_loads_quotes_once_and_reruns_reuse_cache(self):
         with ExitStack() as stack:
@@ -520,9 +720,20 @@ render_position_timing_performance([])
         self.assertEqual(list(app.exception), [])
         self.assertLess(events.index(("cards", 111.0)), events.index("history"))
 
-    def test_etf_refresh_cadence_also_refreshes_derivatives(self):
+    def test_etf_two_minute_refresh_preserves_derivative_cadence(self):
+        class TradingDateTime(datetime):
+            current = datetime(2026, 8, 21, 10, 30)
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current.replace(tzinfo=tz)
+
         with ExitStack() as stack:
             _, _, _, _, derivative_refresh = _patch_page(stack, cached=True)
+            for module in ("coordinator", "realtime"):
+                stack.enter_context(patch(f"components.position.{module}.datetime", TradingDateTime))
+            stack.enter_context(patch("services.position_analysis.etf_intraday_quote_ready", return_value=True))
+            stack.enter_context(patch.dict("os.environ", {"TICKFLOW_API_KEY": "test-only"}))
             derivative_refresh.side_effect = None
             derivative_refresh.return_value = ([], [])
             stack.enter_context(
@@ -531,7 +742,7 @@ render_position_timing_performance([])
                     return_value=True,
                 )
             )
-            stack.enter_context(
+            quotes = stack.enter_context(
                 patch(
                     "services.position_analysis.refresh_runtime_etf_quotes",
                     return_value={},
@@ -539,21 +750,23 @@ render_position_timing_performance([])
             )
             stack.enter_context(
                 patch(
-                    "services.position_analysis.ETF_MORNING_TIMING_REFRESH_SECONDS",
-                    0,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "services.position_analysis.ETF_MIDSESSION_TIMING_REFRESH_SECONDS",
-                    0,
+                    "components.position.realtime.fetch_realtime_index_quotes",
+                    side_effect=lambda **kwargs: {
+                        name: {"price": 100.0, "quote_time": kwargs["now"]}
+                        for name in kwargs["force_index_names"]
+                    },
                 )
             )
             app = AppTest.from_file(str(PAGE), default_timeout=20).run()
-            app.text_input[0].set_value("test-key")
-            app.button[0].click().run()
+            self.assertEqual(list(app.exception), [])
+            quotes.reset_mock()
             derivative_refresh.reset_mock()
-
+            TradingDateTime.current = datetime(2026, 8, 21, 10, 32)
+            app.run()
+            self.assertEqual(list(app.exception), [])
+            derivative_refresh.assert_not_called()
+            quotes.assert_called_once()
+            TradingDateTime.current = datetime(2026, 8, 21, 11, 0)
             app.run()
 
         self.assertEqual(list(app.exception), [])

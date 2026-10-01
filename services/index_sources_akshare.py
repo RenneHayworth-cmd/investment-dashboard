@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from services.market_fallback import MarketSource, fetch_market_fallback
 
 from services.index_config import (
     CFFEX_FUTURES_MAIN_PRODUCTS, INDEX_CONFIG, INDEX_REPORT_DISPLAY_DAYS,
@@ -25,6 +26,12 @@ from services.index_sources_eastmoney import (
 from services.index_sources_yahoo import (
     fetch_yahoo_latest_index_row, get_index_data_from_yahoo,
 )
+
+
+def _daily_target(market_name="A股"):
+    market = get_market_window(market_name)
+    now = datetime.now(ZoneInfo(market.timezone if market else "Asia/Shanghai"))
+    return latest_settled_trade_date(market, now) if market else now.date()
 
 def append_akshare_latest_index_row(ak, df: pd.DataFrame, index_code: str) -> pd.DataFrame:
     if df is None or df.empty:
@@ -193,34 +200,20 @@ def get_index_data_from_akshare_csindex(index_code: str, index_name: str, days: 
     start_date = (datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
     attempts = [
-        lambda: ak.stock_zh_index_hist_csindex(
+        MarketSource("stock_zh_index_hist_csindex/中证", lambda: ak.stock_zh_index_hist_csindex(
             symbol=index_code,
             start_date=start_date,
             end_date=end_date,
-        ),
-        lambda: ak.stock_zh_index_daily(symbol=index_code.lower()),
-        lambda: ak.stock_zh_index_daily_em(symbol=f"csi{index_code}"),
-        lambda: ak.stock_zh_index_daily_em(symbol=index_code.lower()),
+        )),
+        MarketSource("stock_zh_index_daily/新浪", lambda: ak.stock_zh_index_daily(symbol=index_code.lower())),
+        MarketSource("stock_zh_index_daily_em/东方财富CSI", lambda: ak.stock_zh_index_daily_em(symbol=f"csi{index_code}")),
+        MarketSource("stock_zh_index_daily_em/东方财富", lambda: ak.stock_zh_index_daily_em(symbol=index_code.lower())),
     ]
-
-    last_error = None
-    for fetcher in attempts:
-        try:
-            raw_df = fetcher()
-            if raw_df is None or raw_df.empty:
-                continue
-            df = normalize_akshare_index_df(raw_df)
-            if index_code.upper() == "H30269":
-                # CSIndex publishes the day's official close in the evening, after the
-                # 15:10/16:10 runs; EastMoney supplies that close earlier (quote, else the
-                # 15:00 minute point). If neither has it yet, still return the official
-                # rows so completed dates are kept; the caller reports today's gap and
-                # retries. Discarding the whole batch here once lost 09-28 entirely.
-                df = append_eastmoney_quote_row(df, "2.H30269")
-            return build_export_df(df, index_name, days=days)
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"{index_name} AkShare 获取失败：{last_error}")
+    df = fetch_market_fallback(attempts, normalize_akshare_index_df,
+        date_column="trade_date", price_column="close", target_date=_daily_target())
+    if index_code.upper() == "H30269":
+        df = append_eastmoney_quote_row(df, "2.H30269")
+    return build_export_df(df, index_name, days=days)
 
 def get_index_data_from_akshare_cn(
     index_code: str,
@@ -235,30 +228,24 @@ def get_index_data_from_akshare_cn(
     end_date = datetime.now().strftime("%Y%m%d")
     market_symbol = f"{market}{index_code}".lower()
     attempts = [
-        lambda: ak.index_zh_a_hist(
+        MarketSource("index_zh_a_hist/东方财富", lambda: ak.index_zh_a_hist(
             symbol=index_code,
             period="daily",
             start_date=start_date,
             end_date=end_date,
-        ),
-        lambda: ak.stock_zh_index_daily_em(symbol=market_symbol),
-        lambda: ak.stock_zh_index_daily(symbol=market_symbol),
+        )),
+        MarketSource("stock_zh_index_daily_em/东方财富", lambda: ak.stock_zh_index_daily_em(symbol=market_symbol)),
+        MarketSource("stock_zh_index_daily/新浪", lambda: ak.stock_zh_index_daily(symbol=market_symbol)),
+        MarketSource("stock_zh_index_daily_tx/腾讯", lambda: ak.stock_zh_index_daily_tx(symbol=market_symbol, start_date=start_date, end_date=end_date)),
+        MarketSource("stock_zh_index_hist_csindex/中证", lambda: ak.stock_zh_index_hist_csindex(symbol=index_code, start_date=start_date, end_date=end_date)),
+        MarketSource("index_hist_cni/国证", lambda: ak.index_hist_cni(symbol=index_code, start_date=start_date, end_date=end_date)),
     ]
-
-    last_error = None
-    for fetcher in attempts:
-        try:
-            raw_df = fetcher()
-            if raw_df is None or raw_df.empty:
-                continue
-            df = normalize_akshare_index_df(raw_df)
-            df = append_akshare_latest_index_row(ak, df, index_code)
-            if eastmoney_quote_secid:
-                df = append_eastmoney_quote_row(df, eastmoney_quote_secid)
-            return build_export_df(df, index_name, days=days)
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"{index_name} AkShare 获取失败：{last_error}")
+    df = fetch_market_fallback(attempts, normalize_akshare_index_df,
+        date_column="trade_date", price_column="close", target_date=_daily_target())
+    df = append_akshare_latest_index_row(ak, df, index_code)
+    if eastmoney_quote_secid:
+        df = append_eastmoney_quote_row(df, eastmoney_quote_secid)
+    return build_export_df(df, index_name, days=days)
 
 def get_index_data_from_akshare_cni(index_code: str, index_name: str, days: int = 30):
     import akshare as ak
@@ -266,12 +253,9 @@ def get_index_data_from_akshare_cni(index_code: str, index_name: str, days: int 
     lookback_days = max(int(days) + 30, 120)
     start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y%m%d")
     end_date = datetime.now().strftime("%Y%m%d")
-    raw_df = ak.index_hist_cni(
-        symbol=index_code,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    df = normalize_akshare_index_df(raw_df)
+    df = fetch_market_fallback([
+        MarketSource("index_hist_cni/国证官方", lambda: ak.index_hist_cni(symbol=index_code, start_date=start_date, end_date=end_date)),
+    ], normalize_akshare_index_df, date_column="trade_date", price_column="close", target_date=_daily_target())
     return build_export_df(df, index_name, days=days)
 
 def get_index_data_from_akshare_us(
@@ -311,8 +295,10 @@ def get_index_data_from_akshare_hk(
 ):
     import akshare as ak
 
-    raw_df = ak.stock_hk_index_daily_sina(symbol=index_code)
-    df = normalize_akshare_index_df(raw_df)
+    df = fetch_market_fallback([
+        MarketSource("stock_hk_index_daily_sina/新浪", lambda: ak.stock_hk_index_daily_sina(symbol=index_code)),
+        MarketSource("stock_hk_index_daily_em/东方财富", lambda: ak.stock_hk_index_daily_em(symbol=index_code)),
+    ], normalize_akshare_index_df, date_column="trade_date", price_column="close", target_date=_daily_target("港股"))
     if index_code.upper() == "HSTECH":
         df = append_hk_index_spot_row(
             ak,
@@ -361,12 +347,23 @@ def get_index_data_from_akshare_global(
     import akshare as ak
 
     try:
-        raw_df = ak.index_global_hist_em(symbol=index_code)
-        df = normalize_akshare_index_df(raw_df)
-        latest_history_date = pd.to_datetime(df["trade_date"], errors="coerce").max().date()
         market = get_market_window(market_name)
         market_now = datetime.now(ZoneInfo(market.timezone)) if market is not None else datetime.now(ZoneInfo("Asia/Shanghai"))
         target_date = latest_settled_trade_date(market, market_now) if market is not None else market_now.date()
+
+        def primary():
+            raw = normalize_akshare_index_df(ak.index_global_hist_em(symbol=index_code))
+            if eastmoney_quote_secid and pd.to_datetime(raw["trade_date"]).max().date() < target_date:
+                raw = merge_newer_index_rows(raw, fetch_eastmoney_completed_global_row(eastmoney_quote_secid, market_name, now=market_now))
+            return raw
+
+        sources = [MarketSource("index_global_hist_em/东方财富", primary)]
+        sina_name = {"日经225": "日经225指数", "韩国KOSPI": "首尔综合指数"}.get(index_code)
+        if sina_name:
+            sources.append(MarketSource("index_global_hist_sina/新浪", lambda: ak.index_global_hist_sina(symbol=sina_name)))
+        df = fetch_market_fallback(sources, normalize_akshare_index_df,
+            date_column="trade_date", price_column="close", target_date=_daily_target(market_name))
+        latest_history_date = pd.to_datetime(df["trade_date"], errors="coerce").max().date()
         if eastmoney_quote_secid and latest_history_date < target_date:
             completed_row = fetch_eastmoney_completed_global_row(
                 eastmoney_quote_secid,
@@ -412,9 +409,16 @@ def get_index_data_from_akshare_global(
 def get_index_data_from_akshare_futures_main(index_code: str, index_name: str, days: int = 30):
     import akshare as ak
 
-    raw_df = ak.futures_zh_daily_sina(symbol=index_code)
-    df = normalize_akshare_index_df(raw_df)
-    df = append_futures_spot_row(ak, df, index_code)
+    def primary():
+        return append_futures_spot_row(ak, normalize_akshare_index_df(ak.futures_zh_daily_sina(symbol=index_code)), index_code)
+
+    df = fetch_market_fallback([
+        MarketSource("futures_zh_daily_sina/新浪", primary),
+        MarketSource("futures_main_sina/新浪", lambda: ak.futures_main_sina(symbol=index_code,
+            start_date=(datetime.now() - timedelta(days=max(days * 2, 365))).strftime("%Y%m%d"), end_date=datetime.now().strftime("%Y%m%d"))),
+    ], normalize_akshare_index_df, date_column="trade_date", price_column="close", target_date=_daily_target())
+    if df.attrs.get("market_data_source") != "futures_zh_daily_sina/新浪":
+        df = append_futures_spot_row(ak, df, index_code)
     return build_export_df(df, index_name, days=days)
 
 __all__ = ['append_akshare_latest_index_row', 'append_hk_index_spot_row', 'append_futures_spot_row', 'get_index_data_from_akshare_csindex', 'get_index_data_from_akshare_cn', 'get_index_data_from_akshare_cni', 'get_index_data_from_akshare_us', 'get_index_data_from_akshare_hk', 'get_index_data_from_cboe_vix', 'get_index_data_from_akshare_global', 'get_index_data_from_akshare_futures_main']

@@ -386,13 +386,24 @@ def append_futures_spot_row(
         try:
             spot_df = _fetch_futures_spot_from_sina_direct(contract)
         except Exception as direct_exc:
-            logger.warning(
-                "期货实时行情获取失败，合约=%s，AkShare=%s，新浪直连=%s",
-                contract,
-                akshare_exc,
-                direct_exc,
-            )
-            return result
+            from services.wind_source import wind_api_key
+
+            wind_exc: Exception | None = None
+            spot_df = None
+            if wind_api_key() and not re.fullmatch(r"[a-zA-Z]+0", contract.strip()):
+                try:
+                    spot_df = _fetch_futures_spot_from_wind(contract)
+                except Exception as exc:
+                    wind_exc = exc
+            if spot_df is None:
+                logger.warning(
+                    "期货实时行情获取失败，合约=%s，AkShare=%s，新浪直连=%s，万得Wind=%s",
+                    contract,
+                    akshare_exc,
+                    direct_exc,
+                    wind_exc,
+                )
+                return result
 
     if spot_df is None or spot_df.empty:
         return result
@@ -456,22 +467,48 @@ def fetch_futures_daily_from_tickflow(contract: str, api_key: str = "") -> pd.Da
     return normalize_futures_daily(df)
 
 
-def fetch_futures_daily_from_akshare(contract: str) -> pd.DataFrame:
-    # Production uses the same Sina source with an explicit HTTP timeout.
-    if os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS"):
-        return _fetch_futures_daily_from_sina_direct(contract)
-    import akshare as ak
+def _fetch_futures_daily_from_wind(wind_code: str) -> pd.DataFrame:
+    from services.wind_source import fetch_wind_daily_bars
 
-    try:
-        df = ak.futures_zh_daily_sina(symbol=contract)
-        return normalize_futures_daily(df)
-    except Exception as akshare_exc:
-        try:
-            return _fetch_futures_daily_from_sina_direct(contract)
-        except Exception as direct_exc:
-            raise RuntimeError(
-                f"AkShare期货日线失败：{akshare_exc}；新浪直连失败：{direct_exc}"
-            ) from direct_exc
+    end = _today_china()
+    # A concrete contract lists for at most about two years.
+    bars = fetch_wind_daily_bars("index_data", wind_code, end - pd.Timedelta(days=800), end)
+    return normalize_futures_daily(bars)
+
+
+def _fetch_futures_spot_from_wind(contract: str) -> pd.DataFrame:
+    """Wind snapshot in the same shape as the Sina spot frame (price, quote date)."""
+    from services.wind_source import fetch_wind_quotes, wind_futures_contract_code
+
+    wind_code = wind_futures_contract_code(contract)
+    if wind_code is None:
+        raise ValueError(f"无法推断 {contract} 的万得Wind代码")
+    frame = fetch_wind_quotes("index_data", [wind_code])
+    if frame.empty:
+        raise ValueError(f"万得Wind未返回 {contract} 的实时行情")
+    row = frame.iloc[0]
+    return pd.DataFrame([{"current_price": row["price"], "quote_date": row["trade_date"]}])
+
+
+def fetch_futures_daily_from_akshare(contract: str, *, target_date=None) -> pd.DataFrame:
+    import akshare as ak
+    from services.akshare_sources import futures_daily_sources
+    from services.market_fallback import MarketSource, fetch_market_fallback, normalize_daily_prices
+
+    sources = futures_daily_sources(ak, contract)
+    direct = MarketSource("新浪直连", lambda: _fetch_futures_daily_from_sina_direct(contract))
+    if os.environ.get("INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS"):
+        sources.insert(0, direct)
+    else:
+        sources.append(direct)
+        from services.wind_source import wind_api_key, wind_futures_contract_code
+
+        # Exact contracts only: main-continuous series roll on vendor-specific dates.
+        wind_code = wind_futures_contract_code(contract) if wind_api_key() else None
+        if wind_code and not re.fullmatch(r"[a-zA-Z]+0", contract.strip()):
+            sources.append(MarketSource("万得Wind", lambda: _fetch_futures_daily_from_wind(wind_code)))
+    return fetch_market_fallback(sources, lambda frame: normalize_futures_daily(normalize_daily_prices(frame)),
+        date_column="date", price_column="close", target_date=target_date)
 
 
 def fetch_futures_daily(
@@ -489,7 +526,12 @@ def fetch_futures_daily(
         tickflow_error = exc
 
     try:
-        akshare_df = fetch_futures_daily_from_akshare(contract)
+        # Expired histories have no current-session target. Active contracts
+        # must continue to another API when Sina has not published the close.
+        cutoff = completed_futures_daily_cutoff(market_now)
+        month = re.search(r"(\d{4})$", contract)
+        active = month is None or int(month.group(1)) >= int(cutoff.strftime("%y%m"))
+        akshare_df = fetch_futures_daily_from_akshare(contract, target_date=cutoff if active else None)
     except Exception:
         if tickflow_df is not None:
             selected = tickflow_df

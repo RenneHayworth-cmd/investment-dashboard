@@ -1,6 +1,7 @@
 from datetime import datetime
 import html
 import os
+import re
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -26,9 +27,11 @@ from services.index_realtime import (
     find_pending_post_close_index_names,
     format_index_display_name,
     load_futures_main_contract_names,
+    load_index_formal_trade_dates,
     load_runtime_realtime_quotes,
     manual_quote_request_names,
     quote_is_visible_for_manual_display,
+    remember_runtime_lunch_quotes,
     remember_runtime_realtime_quotes,
     save_futures_main_contract_names,
 )
@@ -36,6 +39,7 @@ from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, late
 from services.taoxi_microcap_index import load_taoxi_constituents, load_taoxi_history, load_taoxi_quality
 from services.update_tasks import (
     enrich_index_report_indicators,
+    find_pending_futures_current_contract_index_names,
     run_index_ma20_update,
     refresh_futures_current_contract_histories,
     trim_index_report,
@@ -299,6 +303,21 @@ def render_detail_summary(
     st.dataframe(summary_df, width="stretch", hide_index=True)
 
 
+def render_detail_csv_download(display_df: pd.DataFrame, index_name: str, range_label: str) -> None:
+    if display_df.empty:
+        return
+    dates = display_df["日期"].astype(str)
+    safe_name = re.sub(r'[\\/:*?"<>|\s]+', "_", display_index_name(index_name)).strip("_") or "index"
+    file_name = f"{safe_name}_{range_label or '全部'}_{dates.min()}_{dates.max()}.csv"
+    st.download_button(
+        "下载表格 CSV",
+        data=display_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=file_name,
+        mime="text/csv",
+        key=f"index_detail_download_{index_name}",
+    )
+
+
 def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
     st.divider()
     title_col, action_col = st.columns([5, 1])
@@ -434,6 +453,7 @@ def render_index_detail(report_df: pd.DataFrame, index_name: str) -> None:
             hide_index=True,
             column_config={column: st.column_config.NumberColumn(format="%.2f") for column in numeric_columns},
         )
+        render_detail_csv_download(display_df, index_name, range_label)
 
 
 def render_taoxi_detail() -> None:
@@ -567,12 +587,14 @@ def render_taoxi_detail() -> None:
             "偏离率(%)", "RSI(14)", "回撤(%)",
         ]
         display_df[numeric_columns] = display_df[numeric_columns].round(2)
+        display_df = display_df.sort_values("日期", ascending=False)
         st.dataframe(
-            display_df.sort_values("日期", ascending=False),
+            display_df,
             width="stretch",
             hide_index=True,
             column_config={column: st.column_config.NumberColumn(format="%.2f") for column in numeric_columns},
         )
+        render_detail_csv_download(display_df, "桃囍微盘", range_label)
 
     with members_tab:
         if constituents is None or constituents.empty:
@@ -689,12 +711,15 @@ def render_index_card(row: pd.Series) -> None:
 
 
 def build_manual_realtime_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
-    stored_quotes = load_runtime_realtime_quotes()
-    stored_quotes.update(st.session_state.get("index_realtime_quote_cache", {}))
+    display_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    stored_quotes = load_runtime_realtime_quotes(st.session_state.get("index_realtime_quote_cache", {}))
+    formal_dates = load_index_formal_trade_dates(stored_quotes)
     display_quotes = {
         index_name: quote
         for index_name, quote in stored_quotes.items()
-        if quote_is_visible_for_manual_display(index_name, quote)
+        if quote_is_visible_for_manual_display(
+            index_name, quote, now=display_now, formal_trade_date=formal_dates.get(index_name),
+        )
     }
     return apply_realtime_quotes_to_summary(summary_df, display_quotes)
 
@@ -839,7 +864,7 @@ with st.sidebar:
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
     update_clicked = st.button("更新指数数据", type="primary")
-    st.caption("每天15:10、16:10自动补齐正式日线；本页只监听本地缓存并自动重绘。")
+    st.caption("每天15:10、16:10自动补齐正式日线；本页只监听本地缓存并自动重绘。手动更新按各市场交易时段获取报价，午休成功后复用，收盘后仅补正式数据缺口。")
 
 notice = st.session_state.pop("index_update_notice", None)
 if notice:
@@ -847,23 +872,29 @@ if notice:
     getattr(st, level)(message)
 
 if update_clicked:
+    update_now = datetime.now(ZoneInfo("Asia/Shanghai"))
     contract_history_errors = []
     completed_lunch_keys = set(st.session_state.get("index_lunch_quote_keys", []))
-    quote_names, lunch_keys = manual_quote_request_names(completed_lunch_keys)
+    quote_names, lunch_keys = manual_quote_request_names(completed_lunch_keys, now=update_now)
     quote_errors: dict[str, str] = {}
-    quotes = fetch_realtime_index_quotes(
+    fetched_quotes = fetch_realtime_index_quotes(
+        now=update_now,
         max_workers=INDEX_UPDATE_WORKERS,
         force_index_names=quote_names,
         errors=quote_errors,
-    )
+    ) if quote_names else {}
+    quotes = {
+        name: quote for name, quote in fetched_quotes.items()
+        if name in quote_names and quote_is_visible_for_manual_display(name, quote, now=update_now)
+    }
+    for name in quote_names - quotes.keys():
+        quote_errors.setdefault(name, "未取得当前市场交易日的有效报价，保留上次有效数据")
     if quotes:
         remember_runtime_realtime_quotes(quotes)
         stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
         stored_quotes.update(quotes)
         st.session_state.index_realtime_quote_cache = stored_quotes
-        completed_lunch_keys.update(
-            key for index_name, key in lunch_keys.items() if index_name in quotes
-        )
+        completed_lunch_keys.update(remember_runtime_lunch_quotes(quotes, lunch_keys, now=update_now))
         st.session_state.index_lunch_quote_keys = sorted(completed_lunch_keys)
         resolved_contracts = fetch_futures_main_contract_names(quotes)
         if resolved_contracts:
@@ -873,9 +904,13 @@ if update_clicked:
             contract_history_errors = refresh_futures_current_contract_histories(
                 resolved_contracts,
                 max_workers=INDEX_UPDATE_WORKERS,
+                market_now=update_now,
             )
 
-    pending_indexes = find_pending_post_close_index_names()
+    pending_indexes = (
+        find_pending_post_close_index_names(now=update_now)
+        | find_pending_futures_current_contract_index_names(market_now=update_now)
+    )
     result = None
     if pending_indexes:
         progress = st.progress(0)

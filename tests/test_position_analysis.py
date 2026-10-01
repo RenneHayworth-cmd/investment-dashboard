@@ -1133,12 +1133,14 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result.iloc[-1]["date"], pd.Timestamp("2026-08-24"))
 
+    @patch("akshare.futures_hist_table_em", side_effect=ConnectionError("eastmoney unavailable"))
     @patch("services.futures_spread._fetch_futures_daily_from_sina_direct")
     @patch("akshare.futures_zh_daily_sina")
     def test_futures_daily_falls_back_to_direct_sina_after_proxy_failure(
         self,
         daily_mock,
         direct_mock,
+        _eastmoney_table_mock,
     ):
         daily_mock.side_effect = requests.exceptions.ProxyError("dead proxy")
         direct_mock.return_value = pd.DataFrame(
@@ -1948,6 +1950,8 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(item.latest_date, "2026-07-31")
         self.assertEqual(item.metrics["策略参数"], "MA25 / 1.5%")
 
+    @patch("akshare.stock_zh_a_hist", side_effect=ConnectionError("eastmoney unavailable"))
+    @patch("akshare.fund_lof_hist_em", side_effect=ConnectionError("eastmoney unavailable"))
     @patch("services.position_analysis.save_dataset")
     @patch("services.position_analysis.fetch_tickflow_fund_close")
     @patch("services.position_analysis._fetch_sina_exchange_fund_close")
@@ -1963,6 +1967,8 @@ class PositionAnalysisTests(unittest.TestCase):
         sina_mock,
         tickflow_mock,
         save_mock,
+        _lof_hist_mock,
+        _stock_hist_mock,
     ):
         dates = pd.bdate_range(end="2026-07-31", periods=300)
         sina_mock.return_value = pd.DataFrame(
@@ -2056,6 +2062,10 @@ class PositionAnalysisTests(unittest.TestCase):
             float(cached.loc[cached["日期"] == first_date, "收盘价"].iloc[0]) - 0.014,
         )
 
+    @patch(
+        "services.position_analysis._fetch_exchange_fund_close",
+        side_effect=RuntimeError("backup unavailable"),
+    )
     @patch("services.position_analysis.save_dataset")
     @patch("services.position_analysis.fetch_tickflow_fund_close")
     @patch("services.position_analysis._load_dataset_if_ready")
@@ -2064,6 +2074,7 @@ class PositionAnalysisTests(unittest.TestCase):
         load_mock,
         fetch_mock,
         save_mock,
+        _backup_mock,
     ):
         dates = pd.bdate_range(end="2026-08-11", periods=40)
         cached = _v2_adjusted_history(
@@ -2126,6 +2137,10 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIn("不能追加到后复权正式历史", result.attrs["position_history_warning"])
 
+    @patch(
+        "services.position_analysis._fetch_exchange_fund_close",
+        side_effect=RuntimeError("backup unavailable"),
+    )
     @patch("services.position_analysis.save_dataset")
     @patch("services.position_analysis.fetch_tickflow_fund_close")
     @patch("services.position_analysis._load_dataset_if_ready", return_value=(None, None))
@@ -2134,6 +2149,7 @@ class PositionAnalysisTests(unittest.TestCase):
         _load_mock,
         fetch_mock,
         save_mock,
+        _backup_mock,
     ):
         dates = pd.bdate_range(end="2026-08-11", periods=40)
         fetch_mock.return_value = pd.DataFrame(

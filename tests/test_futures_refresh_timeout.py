@@ -10,12 +10,16 @@ from services import futures_spread as source
 ENV = {"INVESTMENT_DASHBOARD_ALERT_TICKFLOW_TIMEOUT_SECONDS": "12"}
 
 
-def test_production_daily_never_enters_unbounded_akshare():
+def test_production_daily_tries_bounded_backups_and_reports_all_errors():
     with patch.dict("os.environ", ENV), patch(
-        "akshare.futures_zh_daily_sina", side_effect=AssertionError("unbounded")
-    ), patch.object(source, "_fetch_futures_daily_from_sina_direct", side_effect=TimeoutError):
-        with pytest.raises(TimeoutError):
+        "akshare.futures_zh_daily_sina", side_effect=TimeoutError("新浪超时")
+    ) as sina, patch("akshare.futures_hist_table_em", return_value=pd.DataFrame({"合约代码": ["i2701"]})), \
+         patch("akshare.futures_hist_em", side_effect=TimeoutError("东方财富超时")) as em, \
+         patch.object(source, "_fetch_futures_daily_from_sina_direct", side_effect=TimeoutError("直连超时")):
+        with pytest.raises(RuntimeError, match="直连超时.*新浪超时.*东方财富超时"):
             source.fetch_futures_daily_from_akshare("I2701")
+    sina.assert_called_once()
+    em.assert_called_once()
 
 
 def test_production_spot_timeout_retains_history():

@@ -22,6 +22,21 @@ print(frame.to_json(orient='records',date_format='iso',force_ascii=False))
         raise DataGap(name+" 数据源暂不可用")
     return json.loads(r.stdout)
 
+
+def ak_raw_history(code, day):
+    """Run the common registry with a process deadline for each interface."""
+    from services.akshare_sources import raw_security_sources
+    from services.market_fallback import fetch_market_fallback, normalize_daily_prices
+
+    class BoundedAkShare:
+        def __getattr__(self, name):
+            return lambda **kwargs: pd.DataFrame(ak_call(name, kwargs))
+
+    return fetch_market_fallback(
+        raw_security_sources(BoundedAkShare(), infer_tickflow_symbol(code), day, day, fund=code == ETF),
+        normalize_daily_prices, date_column="date", price_column="close", target_date=day, allow_partial=False,
+    )
+
 def raw_snapshot(day):
     from services.microcap import load_microcap_constituent_snapshots
     f,_=load_microcap_constituent_snapshots()
@@ -135,12 +150,12 @@ class AutomaticProvider(CacheProvider):
                     source="TickFlow当日15点后收盘快照"
             if close is None:
                 try:
-                    name="fund_etf_hist_em" if code==ETF else "stock_zh_a_hist"
-                    data=ak_call(name,dict(symbol=code,period="daily",start_date=day.replace("-",""),end_date=day.replace("-",""),adjust=""))
-                    matched=[r for r in data if str(r.get("日期",""))[:10]==day]
+                    data=ak_raw_history(code,day)
+                    matched=data.loc[data["date"].dt.strftime("%Y-%m-%d").eq(day)].to_dict("records")
                     if len(matched)==1:
-                        close=float(matched[0]["收盘"]); volume=float(matched[0]["成交量"])
-                        source="AkShare东方财富未复权日线"
+                        close=float(matched[0]["close"])
+                        volume=float(matched[0]["volume"]) if "volume" in matched[0] else None
+                        source=data.attrs["market_data_source"]+"未复权日线"
                 except Exception as exc:
                     errors.append("AkShare日线："+type(exc).__name__)
             import math

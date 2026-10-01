@@ -21,7 +21,10 @@ from services.index_ma20 import (
 from services.market_calendar import (
     get_market_window,
     is_market_trading_day,
+    is_market_holiday,
+    latest_completed_trade_date,
     latest_settled_trade_date,
+    market_sessions_for_date,
     previous_trading_day,
 )
 from services.index_sources_sina import fetch_sina_hk_realtime_quote
@@ -135,10 +138,21 @@ INDEX_SOURCE_LABELS = {
 }
 _RUNTIME_QUOTE_CACHE: dict[str, dict[str, object]] = {}
 _RUNTIME_QUOTE_CACHE_LOCK = Lock()
+_RUNTIME_LUNCH_QUOTE_KEYS: set[str] = set()
 
 
 def _supported_realtime_index_names() -> set[str]:
     return set(EASTMONEY_QUOTE_SECIDS) | set(YAHOO_QUOTE_SYMBOLS) | set(FUTURES_QUOTE_SYMBOLS) | {"桃囍微盘"}
+
+
+def _runtime_quote_stamp(index_name: str, quote: dict) -> pd.Timestamp:
+    stamp = pd.to_datetime(quote.get("quote_time"), errors="coerce")
+    if pd.isna(stamp):
+        return pd.NaT
+    if stamp.tzinfo is None:
+        market = get_market_window(str(INDEX_CONFIG.get(index_name, {}).get("market_group") or ""))
+        stamp = stamp.tz_localize(market.timezone if market is not None else "Asia/Shanghai")
+    return stamp.tz_convert("UTC")
 
 
 def remember_runtime_realtime_quotes(quotes: dict[str, dict[str, object]]) -> None:
@@ -147,16 +161,75 @@ def remember_runtime_realtime_quotes(quotes: dict[str, dict[str, object]]) -> No
         return
     with _RUNTIME_QUOTE_CACHE_LOCK:
         for index_name, quote in quotes.items():
-            _RUNTIME_QUOTE_CACHE[str(index_name)] = dict(quote)
+            cached = _RUNTIME_QUOTE_CACHE.get(str(index_name), {})
+            cached_stamp = _runtime_quote_stamp(index_name, cached)
+            if pd.isna(cached_stamp) or _runtime_quote_stamp(index_name, quote) >= cached_stamp:
+                _RUNTIME_QUOTE_CACHE[str(index_name)] = dict(quote)
 
 
-def load_runtime_realtime_quotes() -> dict[str, dict[str, object]]:
-    """Return an isolated copy of the transient card quote cache."""
+def load_runtime_realtime_quotes(
+    session_quotes: dict[str, dict[str, object]] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Merge transient snapshots, keeping another browser's newer successful quote."""
     with _RUNTIME_QUOTE_CACHE_LOCK:
-        return {
+        quotes = {
             index_name: dict(quote)
             for index_name, quote in _RUNTIME_QUOTE_CACHE.items()
         }
+    for name, quote in (session_quotes or {}).items():
+        current_stamp = _runtime_quote_stamp(name, quotes.get(name, {}))
+        session_stamp = _runtime_quote_stamp(name, quote)
+        if name not in quotes or (pd.notna(session_stamp) and (pd.isna(current_stamp) or session_stamp > current_stamp)):
+            quotes[name] = dict(quote)
+    return quotes
+
+
+def load_index_formal_trade_dates(index_names) -> dict[str, object]:
+    """Read confirmed closes only; old raw intraday rows cannot end quote retention."""
+    from services.index_update_persistence import load_futures_current_contract_history
+
+    dates = {}
+    for name in index_names:
+        config = INDEX_CONFIG.get(name)
+        if config is None:
+            continue
+        contract, raw = load_futures_current_contract_history(name) if name in FUTURES_QUOTE_SYMBOLS else (None, None)
+        if contract is None:
+            raw, _ = load_dataset(raw_cache_symbol(name, config), INDEX_FINAL_HISTORY_SOURCE, "index_daily_raw")
+        if raw is not None and not raw.empty and "trade_date" in raw.columns:
+            latest = pd.to_datetime(raw["trade_date"], errors="coerce").max()
+            correction_start = source_correction_start(config)
+            if contract is None and correction_start is not None and pd.notna(latest) and latest >= correction_start:
+                correction, _ = load_dataset(raw_cache_symbol(name, config), INDEX_SOURCE_CORRECTION_SOURCE, "index_daily_raw")
+                corrected_date = (
+                    pd.to_datetime(correction["trade_date"], errors="coerce").max()
+                    if correction is not None and not correction.empty and "trade_date" in correction.columns
+                    else pd.NaT
+                )
+                latest = min(latest, corrected_date) if pd.notna(corrected_date) else pd.NaT
+            dates[name] = latest
+    return dates
+
+
+def remember_runtime_lunch_quotes(
+    quotes: dict[str, dict[str, object]],
+    lunch_keys: dict[str, str],
+    *,
+    now: datetime | None = None,
+) -> set[str]:
+    """Mark only valid lunch responses as complete across browser sessions."""
+    completed = {
+        key for name, key in lunch_keys.items()
+        if name in quotes and quote_is_visible_for_manual_display(name, quotes[name], now=now)
+    }
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    cutoff = (current.date() - timedelta(days=2)).isoformat()
+    with _RUNTIME_QUOTE_CACHE_LOCK:
+        _RUNTIME_LUNCH_QUOTE_KEYS.difference_update({
+            key for key in _RUNTIME_LUNCH_QUOTE_KEYS if key.rsplit(":", 2)[-2] < cutoff
+        })
+        _RUNTIME_LUNCH_QUOTE_KEYS.update(completed)
+    return completed
 
 
 def _is_supported_market_lunch(index_name: str, *, now: datetime | None = None) -> bool:
@@ -177,12 +250,13 @@ def _is_supported_market_lunch(index_name: str, *, now: datetime | None = None) 
             (time(11, 30), time(13, 30)),
         )
         return lunch_start <= market_now.time() < lunch_end
-    if len(market.sessions) < 2:
+    sessions = market_sessions_for_date(market, market_now.date())
+    if len(sessions) < 2:
         return False
     return bool(
         any(
             previous_end <= market_now.time() < next_start
-            for (_, previous_end), (next_start, _) in zip(market.sessions, market.sessions[1:])
+            for (_, previous_end), (next_start, _) in zip(sessions, sessions[1:])
         )
     )
 
@@ -192,8 +266,9 @@ def manual_quote_request_names(
     *,
     now: datetime | None = None,
 ) -> tuple[set[str], dict[str, str]]:
-    """Select quotes for one manual refresh and deduplicate the mainland lunch close."""
-    completed = completed_lunch_keys or set()
+    """Request active instruments or missing lunch quotes using each market's clock."""
+    with _RUNTIME_QUOTE_CACHE_LOCK:
+        completed = set(completed_lunch_keys or ()) | _RUNTIME_LUNCH_QUOTE_KEYS
     names: set[str] = set()
     lunch_keys: dict[str, str] = {}
     for index_name in _supported_realtime_index_names():
@@ -216,20 +291,68 @@ def quote_is_visible_for_manual_display(
     quote: dict[str, object],
     *,
     now: datetime | None = None,
+    formal_trade_date: object = None,
 ) -> bool:
-    if not (
-        quote_is_active_for_display(index_name, now=now)
-        or _is_supported_market_lunch(index_name, now=now)
-    ):
-        return False
     quote_time = quote.get("quote_time")
     if not isinstance(quote_time, datetime):
         return False
     market_name = str(INDEX_CONFIG.get(index_name, {}).get("market_group") or "")
     market = get_market_window(market_name)
+    if market is None:
+        return False
     market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
     quote_market = quote_time.astimezone(ZoneInfo(market.timezone)) if quote_time.tzinfo else quote_time
-    return quote_market.date() == market_now.date()
+    price = pd.to_numeric(quote.get("price"), errors="coerce")
+    if (
+        pd.isna(price) or price <= 0
+        or quote_market.replace(tzinfo=None) > market_now.replace(tzinfo=None) + timedelta(minutes=5)
+    ):
+        return False
+    futures_symbol = str(INDEX_CONFIG[index_name].get("futures_symbol") or INDEX_CONFIG[index_name].get("code") or "").upper()
+    quote_day = _quote_trade_date(futures_symbol, quote_market, market)
+    if quote_is_active_for_display(index_name, now=now):
+        return quote_day == _quote_trade_date(futures_symbol, market_now, market)
+    if _is_supported_market_lunch(index_name, now=now):
+        sessions = market_sessions_for_date(market, market_now.date())
+        lunch_start = (
+            FUTURES_LUNCH_WINDOWS.get(futures_symbol, (time(11, 30),))[0]
+            if futures_symbol in FUTURES_TRADING_SESSIONS else sessions[0][1]
+        )
+        return bool(
+            quote_day == market_now.date()
+            and quote_market.replace(tzinfo=None)
+            >= datetime.combine(market_now.date(), lunch_start) - timedelta(minutes=1)
+        )
+    latest_completed = latest_completed_trade_date(market, market_now)
+    if quote_day is None or quote_day < latest_completed:
+        return False
+    if futures_symbol not in FUTURES_TRADING_SESSIONS and quote_day != latest_completed:
+        return False
+    formal_day = pd.to_datetime(formal_trade_date, errors="coerce")
+    return pd.isna(formal_day) or formal_day.date() < quote_day
+
+
+def _next_weekday(day: date) -> date:
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def _night_session_enabled(market, evening_day: date) -> bool:
+    evening = datetime.combine(evening_day, time(21))
+    return is_market_trading_day(market, evening) and not is_market_holiday(market, _next_weekday(evening_day))
+
+
+def _quote_trade_date(symbol: str, stamp: datetime, market) -> date | None:
+    """Night quotes belong to the following futures trading day, even on Saturday."""
+    if symbol in FUTURES_TRADING_SESSIONS and symbol not in {"IC0", "IM0"}:
+        if stamp.time() >= time(21) or stamp.time() <= time(2, 30):
+            evening_day = stamp.date() if stamp.time() >= time(21) else stamp.date() - timedelta(days=1)
+            if not _night_session_enabled(market, evening_day):
+                return None
+            return _next_weekday(evening_day)
+    return stamp.date() if is_market_trading_day(market, stamp) else None
 
 
 def format_index_display_name(index_name: str, contract_names: dict[str, str] | None = None) -> str:
@@ -371,7 +494,7 @@ def _market_is_open(market_name: str, now: datetime | None = None) -> bool:
     market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
     if not is_market_trading_day(market, market_now):
         return False
-    return any(start <= market_now.time() <= end for start, end in market.sessions)
+    return any(start <= market_now.time() < end for start, end in market_sessions_for_date(market, market_now.date()))
 
 
 def _futures_market_is_open(symbol: str, now: datetime | None = None) -> bool:
@@ -383,13 +506,15 @@ def _futures_market_is_open(symbol: str, now: datetime | None = None) -> bool:
     sessions = FUTURES_TRADING_SESSIONS.get(symbol.upper(), ())
     if not sessions:
         return False
-    if current <= time(2, 30):
-        previous_night = market_now - timedelta(days=1)
-        if not is_market_trading_day(market, previous_night):
+    if current < time(2, 30):
+        if not _night_session_enabled(market, market_now.date() - timedelta(days=1)):
+            return False
+    elif current >= time(21):
+        if not _night_session_enabled(market, market_now.date()):
             return False
     elif not is_market_trading_day(market, market_now):
         return False
-    return any(start <= current <= end for start, end in sessions)
+    return any(start <= current and (current < end or end == time(23, 59, 59)) for start, end in sessions)
 
 
 def _daily_update_target(
@@ -932,7 +1057,72 @@ def fetch_realtime_index_quotes(
                 quote = None
             if quote is not None:
                 quotes[index_name] = quote
+    missing = [index_name for index_name, _, _ in tasks if index_name not in quotes]
+    if missing:
+        wind_quotes, wind_error = _fetch_wind_index_quotes(missing, now=now)
+        quotes.update(wind_quotes)
+        if errors is not None and wind_error:
+            for index_name in missing:
+                if index_name not in wind_quotes and INDEX_CONFIG.get(index_name, {}).get("wind_code"):
+                    previous = errors.get(index_name)
+                    errors[index_name] = f"{previous}；{wind_error}" if previous else wind_error
     return quotes
+
+
+def _fetch_wind_index_quotes(
+    index_names: list[str],
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """One batched Wind snapshot for indexes whose primary quote sources all failed.
+
+    Quotes stay transient like every other card quote. On a trading day a quote
+    must carry that market's current session date, so a stale snapshot is never
+    shown as today's price.
+    """
+    from services.wind_source import WIND_SOURCE_LABEL, fetch_wind_quotes, wind_api_key
+
+    wanted = {
+        str(INDEX_CONFIG[name]["wind_code"]).upper(): name
+        for name in index_names
+        if INDEX_CONFIG.get(name, {}).get("wind_code")
+    }
+    if not wanted or not wind_api_key():
+        return {}, ""
+    try:
+        frame = fetch_wind_quotes("index_data", list(wanted))
+    except Exception as exc:
+        return {}, f"{WIND_SOURCE_LABEL}备用行情失败：{str(exc).strip() or type(exc).__name__}"
+    quotes: dict[str, dict[str, object]] = {}
+    for _, row in frame.iterrows():
+        index_name = wanted.get(str(row["wind_code"]))
+        price = pd.to_numeric(row.get("price"), errors="coerce")
+        quote_time = row.get("quote_time")
+        if index_name is None or pd.isna(price) or float(price) <= 0 or pd.isna(quote_time):
+            continue
+        market = get_market_window(str(INDEX_CONFIG[index_name].get("market_group") or ""))
+        timezone_name = market.timezone if market is not None else "Asia/Shanghai"
+        market_now = now.astimezone(ZoneInfo(timezone_name)) if now else datetime.now(ZoneInfo(timezone_name))
+        trade_date = row.get("trade_date")
+        if market is not None and is_market_trading_day(market, market_now) and trade_date != market_now.date():
+            continue
+        stamp = pd.Timestamp(quote_time)
+        stamp = stamp.tz_localize(timezone_name) if stamp.tzinfo is None else stamp.tz_convert(timezone_name)
+        is_futures = index_name in FUTURES_QUOTE_SYMBOLS
+        previous_close = pd.to_numeric(row.get("previous_close"), errors="coerce")
+        # Futures "前收盘价" semantics differ by vendor; the summary uses the
+        # previous formal daily close instead, as with the Sina futures snapshot.
+        has_previous = not is_futures and pd.notna(previous_close) and float(previous_close) > 0
+        quotes[index_name] = {
+            "price": float(price),
+            "previous_close": float(previous_close) if has_previous else None,
+            "change_pct": (float(price) / float(previous_close) - 1) * 100 if has_previous else None,
+            "volume": None,
+            "position": None,
+            "quote_time": stamp.to_pydatetime(),
+            "source": WIND_SOURCE_LABEL,
+        }
+    return quotes, ""
 
 
 def find_final_close_quote_names(
@@ -957,7 +1147,7 @@ def find_final_close_quote_names(
         market_now = now.astimezone(ZoneInfo(market.timezone)) if now else datetime.now(ZoneInfo(market.timezone))
         if not is_market_trading_day(market, market_now):
             continue
-        if market_now.time() <= market.sessions[-1][1]:
+        if market_now.time() < market_sessions_for_date(market, market_now.date())[-1][1]:
             continue
         attempt_key = f"{index_name}:{market_now.date().isoformat()}"
         if attempt_key in attempted_keys:

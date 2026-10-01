@@ -54,13 +54,22 @@ before a larger handoff or commit.
   rerender the page after the standalone scheduled updater changes the formal
   report cache. The `更新指数数据` button is the manual network trigger: fetch one read-only quote for
   instruments currently trading, fetch mainland, Hong Kong, Japan, and domestic
-  futures lunch closes only once per page session during their respective
+  futures lunch closes only once per market trading date across browser sessions
+  in the same process during their respective
   breaks, and
   update formal daily data only for indexes missing their latest completed
   session. If `index_final_history` already contains the target session, do not
   request that index again. Intraday and lunch card quotes stay in session and
   process-local transient memory so browser refreshes can restore them; they
   must never overwrite or persist into append-only daily history.
+  Only valid, current lunch responses mark that instrument complete; failed,
+  partial, or stale responses remain retryable. Keep the last successful quote
+  after a market closes until its confirmed formal cache covers that trading date,
+  using `index_final_history` (or the mapped futures contract's formal history),
+  never treating an old raw intraday row as confirmation. Use local market dates,
+  US daylight saving time, futures overnight trading dates, and holiday-eve night
+  suspensions. Reopening remains cache-only; the update button refreshes only
+  instruments currently trading or still missing their lunch/formal data.
   The split-column report has no user-selectable display window: retain the
   latest 120 calendar days. For every displayed trading day, show that day's
   latest MA20 state-transition date and the return accumulated from the
@@ -100,13 +109,15 @@ before a larger handoff or commit.
   `load_microcap_histories` for every ledger code once today's session is settled; it
   makes no network request when the cache already covers today and exits non-zero
   (failure balloon) while any code is still missing.
-  Same-day close sources, in order: TickFlow, EastMoney and Tencent (`qt.gtimg.cn`, only
-  rows with volume today; old pre-920 Beijing codes return zero-volume rows) quotes
-  stamped at or after 15:00, then the local BK1158 constituent snapshot only when it was taken that day at
+  Same-day close sources, in order: TickFlow, EastMoney, Tencent (`qt.gtimg.cn`, only
+  rows with volume today; old pre-920 Beijing codes return zero-volume rows) and Wind
+  (also volume today) quotes stamped at or after 15:00, then the local BK1158 constituent
+  snapshot only when it was taken that day at
   or after 15:00 and the stock is not suspended (its time is the list fetch time, not a
-  trade time); daily bars fill anything else. Intraday quotes use the same
-  TickFlow -> EastMoney -> Tencent order before the AkShare fallbacks; Tencent is the only
-  vendor in that chain that does not depend on EastMoney.
+  trade time); daily bars fill anything else, with unadjusted Wind bars as the last
+  daily candidate. Intraday quotes use the same
+  TickFlow -> EastMoney -> Tencent -> Wind order before the AkShare fallbacks; Tencent
+  and Wind are the vendors in that chain that do not depend on EastMoney.
 - Index MA20 updates use controlled concurrency through
   `run_index_ma20_update(..., max_workers=...)`; keep the default at 4 unless
   a data source becomes unstable. Preserve per-index raw history with
@@ -132,6 +143,9 @@ before a larger handoff or commit.
   closures for mainland China, Hong Kong, Japan, and Korea; update that table
   when exchanges publish a new annual schedule. The US fallback is generated
   by holiday rules and also handles cross-year observed New Year's Day.
+  `STATIC_MARKET_EARLY_CLOSES` and `market_sessions_for_date` supply the published
+  2026 Hong Kong and US half-day closes for quote selection and formal-close
+  eligibility; update shortened sessions alongside annual holidays.
   Real-time supplement rows must use the market's expected latest trade date;
   never write weekend or holiday spot values under the current calendar date.
 - The `指数监控` latest summary uses dashboard-style index cards: four columns
@@ -183,18 +197,28 @@ before a larger handoff or commit.
   contracts, futures spreads, and reusable futures-option data. Its default
   futures contract is `I2701`; its default spreads are `I2701 - I2705` and
   `IM2610 - IM2703`, calculated independently with the futures-spread service.
-  On an A-share trading day, fetch one ETF quote batch every 10 minutes from
-  09:30 through 10:00, every 30 minutes from 10:00 through 11:30, once for the
-  lunch close, every 30 minutes from 13:00 through 14:50, and every two minutes
-  from 14:50 through 15:00. Each batch updates all ETF cards and the transient
-  timing-table preview for configured timing symbols. Use the same schedule to
-  refresh the `I2701` futures card and the two futures-spread cards, retaining
+  On an A-share trading day, fetch one ETF quote batch every two minutes during
+  09:30-11:30 and 13:00-15:00, and once for the lunch close (user decision
+  2026-09-30, enable only where current API capability has been confirmed).
+  TickFlow's registered Free plan permits 10 requests/minute and five symbols
+  per request: the fixed 15-ETF list requires three requests per refresh.
+  Each batch updates all ETF cards and the transient timing-table preview.
+  Retry failed ETF batches no more often than every ten minutes.
+  Public-source index quotas are unconfirmed, so keep the index monitoring
+  page manual and retain the existing auxiliary quote cadence: every ten minutes
+  09:30-10:00, every thirty minutes 10:00-11:30 and 13:00-14:50, once at lunch,
+  and every two minutes 14:50-15:00. Apply that separate cadence to the holdings
+  index reference, the `I2701` futures card and the two futures-spread cards, retaining
   their last successful transient values when one source fails. These previews
   remain transient and must not affect formal history or recent operation guidance.
   Automatically load holdings once on first render in each page session,
   reusing current formal caches, fetching intraday quotes, and backfilling missing
   completed sessions. Enable timed fragments after this automatic load; ordinary
   reruns must not repeat the full load. Keep the load button for explicit refreshes.
+  Reopening the page must reuse same-day successful lunch quotes and derivative/index
+  previews from process-local memory. Outside A-share quote hours, do not force a
+  derivative realtime refresh on initial load; fetch only missing completed-session
+  formal data. Once formal closes are current, reopening remains local.
   Render local cards before network work and display the ETF quote batch as soon
   as it returns, before backfilling history or refreshing derivative sources.
   Clear the early preview only when complete cards are ready; render timed card
@@ -202,12 +226,13 @@ before a larger handoff or commit.
   The save checkbox
   controls all formal ETF, futures, spread, and option cache writes; every intraday
   preview remains non-persistent regardless of that checkbox. From the A-share open through
-  15:05, an ETF refresh should batch TickFlow real-time quotes and update cards;
+  15:00, an ETF refresh should batch TickFlow real-time quotes and update cards;
   it may also incrementally backfill missing completed sessions, but must not
   save the current unfinished quote. During the A-share lunch break, fetch the
   lunch close once and use it as a transient timing-table preview through
-  14:50. After a successful lunch fetch, do not request it again in the same
-  page session; retry a failed fetch no more often than every 10 minutes. From
+  14:50. After a successful lunch fetch, do not request it again when reopening
+  the page in the same process; retry failed or partial fetches no more often
+  than every 10 minutes. From
   14:50 through 15:00 on an A-share
   trading day, the two-minute page fragment should batch real-time quotes every
   two minutes and use them as a transient timing-table preview. Reruns inside
@@ -233,7 +258,8 @@ before a larger handoff or commit.
   intraday card quotes remain in the TickFlow batch when available. If TickFlow
   omits 161128, use its same-day Sina snapshot as an intraday-only fallback.
   Spread and option updates
-  run on the initial automatic load and explicit load-button refreshes. Its bottom summary table contains ETFs/LOFs only and follows the index
+  reuse current formal caches on initial automatic loads and explicit load-button
+  refreshes; force realtime previews only during A-share quote hours. Its bottom summary table contains ETFs/LOFs only and follows the index
   MA summary style. Beside the current interval return, show the preceding
   transition date and the completed return between that transition and the
   current transition. Use MA20/1% for 513260, 159915, and 588000; MA15/1% for 510500;
@@ -456,6 +482,37 @@ provided. It reads the API key only from `TICKFLOW_API_KEY` and migrates symbols
 sequentially. Keep generated cache and adjustment-audit outputs uncommitted.
 
 ## Market Data Notes
+
+- Use `services.market_fallback.fetch_market_fallback` for ordered compatible
+  history failover. Exception, empty/invalid data, and a missing requested latest
+  completed date must continue to the next candidate. A successful current
+  response stops further requests. When all sources lag, return the newest
+  valid partial history with `market_source_warning`; callers must still report
+  gaps. Never treat a partial result as a confirmed current close or replace a
+  cached history with it. Source adapters must enforce exact instrument identity
+  and adjustment basis; quote/chain/settlement data are separate capabilities.
+- `services.akshare_sources` lists compatible unadjusted security and futures
+  daily candidates. Tencent/Sina adjusted prices must not silently replace
+  TickFlow additive or EastMoney additive histories. An API with no compatible
+  alternative retains its explicit failure. `core.network` supplies default
+  HTTP timeouts to page and scheduled fallback calls as well as Web requests.
+- `services.wind_source` is the last-resort Wind (万得) backup, enabled only when
+  `WIND_API_KEY` is set (never commit, log, or deploy the key; tests clear it in
+  `tests/conftest.py`). It sends plain JSON-RPC `tools/call` requests to
+  `mcp.wind.com.cn`, needs no cache of its own, and pauses itself for five
+  minutes after a network/auth/quota failure. Wind fuzzily resolves unknown
+  codes (`SA2701.CZC` returned the US stock `SA.N`), so keep only rows whose
+  `Wind代码` equals the requested code; an unrecognised code is dropped from its
+  batch. Wind is tried only after every other compatible source failed or
+  lagged: index formal daily gaps (`INDEX_WIND_CODES`, append-only, never into
+  the source-correction overlay), transient index/ETF/stock/futures quotes,
+  unadjusted ETF and microcap closes, microcap post-close snapshots (stamped at
+  or after 15:00), TXWP20 intraday constituents, and exact futures contracts.
+  Main-continuous futures use Wind for transient card quotes only
+  (`INDEX_WIND_QUOTE_ONLY`) because vendors roll on different dates. Wind's
+  forward adjustment is not the additive basis, so adjusted ETF histories never
+  use it. BK1158 has no Wind equivalent; `868008.WI` is a different index.
+  Independent verification sources must not be replaced by Wind.
 
 The project currently uses:
 

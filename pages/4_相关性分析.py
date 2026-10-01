@@ -18,10 +18,10 @@ from services.fund_analysis import (
     FUND_ADJUSTMENT_OPTIONS,
     FUND_ADJUSTMENT_VALUES,
     build_fund_cache_symbol,
-    fetch_tickflow_fund_close,
     infer_tickflow_symbol,
     read_uploaded_table,
 )
+from services.position_market import fetch_backtest_fund_close
 from services.futures_options_analysis import DATA_TYPE_FUTURES, fetch_futures_option_data
 from services.futures_spread import CONTRACT_PREFIXES
 from services.us_stock_analysis import fetch_tickflow_us_daily, infer_us_symbol, parse_us_symbols
@@ -481,8 +481,8 @@ try:
                     f"{format_cache_time(cache_meta.get('last_update_time') if cache_meta else None)}"
                 )
             else:
-                with st.spinner(f"正在通过 TickFlow 拉取 {symbol} 日线…"):
-                    raw_df = fetch_tickflow_fund_close(
+                with st.spinner(f"正在拉取 {symbol} 日线（TickFlow 优先，失败尝试备用源）…"):
+                    raw_df = fetch_backtest_fund_close(
                         symbol=symbol,
                         api_key=api_key,
                         count=int(count),
