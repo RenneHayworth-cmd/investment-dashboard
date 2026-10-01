@@ -144,3 +144,44 @@ def test_a_lunch_quote_is_never_the_close_of_a_finished_session():
          patch.object(em, "fetch_eastmoney_trend_close", return_value=(pd.Timestamp("2026-09-29"), 3809.04)):
         result = em.append_eastmoney_quote_row(history, "90.BK1158")
     assert result.iloc[-1]["close"] == 3809.04  # stale quote dropped, 15:00 minute close used
+
+
+def _export(index_name, days):
+    return pd.DataFrame({"日期": [f"2026-09-{day:02d}" for day in days], f"{index_name}_收盘价": [3800.0 + day for day in days]})
+
+
+@patch("services.index_history._latest_completed_date_for_market", return_value=date(2026, 9, 30))
+def test_lagging_tickflow_history_continues_to_akshare(_target):
+    from services import index_history
+
+    with patch.object(index_history, "get_index_data_from_tickflow", return_value=_export("上证指数", [28, 29])), \
+            patch.object(index_history, "fetch_index_from_source", return_value=_export("上证指数", [29, 30])) as source:
+        result = index_history.fetch_one_index("上证指数", {"tickflow_symbol": "000001.SH", "market_group": "A股"}, api_key="k")
+
+    source.assert_called_once()
+    assert result["日期"].tolist()[-1] == "2026-09-30"
+    assert result.attrs["market_data_source"] == "AkShare"
+
+
+@patch("services.index_history._latest_completed_date_for_market", return_value=date(2026, 9, 30))
+def test_current_tickflow_history_skips_akshare(_target):
+    from services import index_history
+
+    with patch.object(index_history, "get_index_data_from_tickflow", return_value=_export("上证指数", [29, 30])), \
+            patch.object(index_history, "fetch_index_from_source") as source:
+        result = index_history.fetch_one_index("上证指数", {"tickflow_symbol": "000001.SH", "market_group": "A股"}, api_key="k")
+
+    source.assert_not_called()
+    assert result["日期"].tolist()[-1] == "2026-09-30"
+
+
+@patch("services.index_history._latest_completed_date_for_market", return_value=date(2026, 9, 30))
+def test_all_lagging_index_sources_keep_newest_history_with_warning(_target):
+    from services import index_history
+
+    with patch.object(index_history, "get_index_data_from_tickflow", return_value=_export("上证指数", [28, 29])), \
+            patch.object(index_history, "fetch_index_from_source", side_effect=RuntimeError("akshare down")):
+        result = index_history.fetch_one_index("上证指数", {"tickflow_symbol": "000001.SH", "market_group": "A股"}, api_key="k")
+
+    assert result["日期"].tolist()[-1] == "2026-09-29"
+    assert "所有接口均未覆盖目标日期" in result.attrs["market_source_warning"]

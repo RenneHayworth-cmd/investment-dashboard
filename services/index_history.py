@@ -252,34 +252,35 @@ def generate_index_ma20_report(
 def fetch_one_index(index_name: str, index_config, api_key: str, days: int = 30) -> pd.DataFrame | None:
     if isinstance(index_config, dict):
         tickflow_symbol = index_config.get("tickflow_symbol")
-        tickflow_error = None
-        if tickflow_symbol:
-            try:
-                df = get_index_data_from_tickflow(
-                    api_key,
-                    tickflow_symbol,
-                    index_name,
-                    days=days,
-                )
-                if df is not None and not df.empty:
-                    eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
-                    if eastmoney_quote_secid:
-                        close_col = f"{index_name}_收盘价"
-                        raw_df = df[["日期", close_col]].rename(
-                            columns={"日期": "trade_date", close_col: "close"}
-                        )
-                        raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
-                        return build_export_df(raw_df, index_name, days=days)
-                    return df
-            except Exception as exc:
-                tickflow_error = exc
-
-        try:
+        if not tickflow_symbol:
             return fetch_index_from_source(index_name, index_config, days=days)
-        except Exception as exc:
-            if tickflow_error:
-                raise RuntimeError(f"TickFlow失败：{tickflow_error}；AkShare失败：{exc}") from exc
-            raise
+
+        from services.market_fallback import MarketSource, fetch_market_fallback
+
+        close_col = f"{index_name}_收盘价"
+
+        def tickflow() -> pd.DataFrame | None:
+            df = get_index_data_from_tickflow(api_key, tickflow_symbol, index_name, days=days)
+            eastmoney_quote_secid = index_config.get("eastmoney_quote_secid")
+            if df is None or df.empty or not eastmoney_quote_secid:
+                return df
+            raw_df = df[["日期", close_col]].rename(columns={"日期": "trade_date", close_col: "close"})
+            raw_df = append_eastmoney_quote_row(raw_df, eastmoney_quote_secid)
+            return build_export_df(raw_df, index_name, days=days)
+
+        # A lagging TickFlow history must continue to the AkShare sources, just
+        # like the detail view; unfinished rows are filtered by the caller.
+        return fetch_market_fallback(
+            [
+                MarketSource("TickFlow", tickflow),
+                MarketSource("AkShare", lambda: fetch_index_from_source(index_name, index_config, days=days)),
+            ],
+            lambda frame: frame,
+            date_column="日期",
+            price_column=close_col,
+            target_date=_latest_completed_date_for_market(str(index_config.get("market_group") or "")),
+            preserve_unfinished_rows=True,
+        )
 
     return get_index_data_from_tickflow(api_key, index_config, index_name, days=days)
 
