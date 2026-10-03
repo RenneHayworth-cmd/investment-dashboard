@@ -235,7 +235,8 @@ def build_huabao_import(trades_frame: pd.DataFrame, cash_frame: pd.DataFrame) ->
             code = (re.findall(r"\d{6}", summary) or [""])[0]
             result.flows.append(_flow("hb", keys("dividend", day, code), day, time, "现金分红", amount, code, "华宝分红到账"))
         elif op in {"债券兑息", "债券兑息扣税"}:
-            code = (re.findall(r"\d{6}", summary) or [""])[0]
+            # 摘要形如“A696836245领110081兑息60张”，开头是资金账号，取“兑息”前的代码。
+            code = (re.findall(r"(\d{6})兑息", summary) or re.findall(r"\d{6}", summary) or [""])[0]
             result.flows.append(
                 _flow("hb", keys("coupon", day, code, op), day, time,
                       "其他收入" if amount > 0 else "其他支出", amount, code, f"可转债{op}")

@@ -45,6 +45,8 @@ HB_TRADES = [
 ]
 HB_CASH_ROWS = [
     # 资金明细按时间倒序，余额为该行之后的余额
+    ["20260320", "123282兑息扣税:本金0.00元,利息10.00元", "债券兑息扣税", 3943.79, -2.0, 3943.79, "人民币", "20:03:13"],
+    ["20260320", "A123456789领123282兑息10张*1.0000", "债券兑息", 3945.79, 10.0, 3945.79, "人民币", "20:03:13"],
     ["20260318", "159501红利到帐", "股票分红", 3935.79, 50.0, 3935.79, "人民币", "19:00:00"],
     ["20260303", "申购中签款(370953) 10股*100.000", "发行中签扣款", 3885.79, -1000.0, 3885.79, "人民币", "18:49:01"],
     ["20260303", "融券", "逆回购融券", 4885.79, -3000.03, 4885.79, "人民币", "18:48:00"],
@@ -99,7 +101,9 @@ def test_huabao_import_covers_trades_lof_bonds_repo_and_reconciles_cash():
     repo = {flow["flow_date"]: flow for flow in huabao.flows if "逆回购" in flow["notes"]}
     assert repo["2026-03-03"]["amount"] == round(0.75 - 0.03, 2)
     assert huabao.open_repo_principal == 3000.0
-    assert huabao.broker_end_cash == 3935.79
+    assert huabao.broker_end_cash == 3943.79
+    coupons = {flow["symbol"] for flow in huabao.flows if "兑息" in flow["notes"]}
+    assert coupons == {"123282"}
     assert abs(huabao.cash_difference()) < 0.005
 
 
