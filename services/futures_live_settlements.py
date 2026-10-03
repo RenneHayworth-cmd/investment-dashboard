@@ -15,7 +15,7 @@ from services.futures_live_positions import (
     _option_contract_parts,
     build_estimated_positions,
 )
-from services.futures_live_repository import load_daily_closes
+from services.futures_live_repository import latest_monthly_account, load_daily_closes
 from services.futures_live_statement_parser import _date_text, _number
 
 
@@ -450,6 +450,32 @@ def _fetch_dce_option_settlements_for_date(
     raise RuntimeError(f"大商所期权日行情不可用：{detail}")
 
 
+def _statement_covered_closed_options(requirements: pd.DataFrame) -> set[str]:
+    """Closed options whose whole holding period a monthly statement already covers.
+
+    The statement is authoritative for those dates, so their exchange settlement
+    prices are not required (DCE option settlements need registered API access).
+    """
+    account = latest_monthly_account() or {}
+    statement_end = str(account.get("statement_end_date") or "")
+    if not statement_end:
+        return set()
+    positions = build_estimated_positions()
+    held = set()
+    if not positions.empty:
+        open_options = positions["asset_type"].eq("期权") & pd.to_numeric(
+            positions["estimated_quantity"], errors="coerce"
+        ).fillna(0).ne(0)
+        held = set(positions.loc[open_options, "contract"].astype(str))
+    return {
+        str(row["contract"])
+        for row in requirements.to_dict("records")
+        if row["asset_type"] == "期权"
+        and str(row["contract"]) not in held
+        and str(row["target_date"]) <= statement_end
+    }
+
+
 def update_traded_contract_daily_settlements(
     *,
     force: bool = False,
@@ -482,11 +508,15 @@ def update_traded_contract_daily_settlements(
 
     option_requirements: list[dict[str, object]] = []
     cffex_requirements: list[dict[str, object]] = []
+    statement_covered_options = _statement_covered_closed_options(requirements)
     for requirement in requirements.to_dict("records"):
         asset_type = str(requirement["asset_type"])
         contract = str(requirement["contract"])
         first_date = str(requirement["first_date"])
         target_date = str(requirement["target_date"])
+        if asset_type == "期权" and contract in statement_covered_options:
+            skipped += 1
+            continue
         if asset_type == "期权" and re.match(r"^(IO|HO|MO)\d", contract):
             cffex_requirements.append(requirement)
             continue

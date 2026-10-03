@@ -51,6 +51,25 @@ def test_tencent_rejects_a_different_symbol_or_bad_payload():
     assert realtime._fetch_tencent_index_quote("124.HSTECH", "Asia/Shanghai") is None
 
 
+def test_us_eastmoney_quote_rejects_composite_for_nasdaq100():
+    wrong = _response(payload={"data": {"f57": "NDX", "f58": "纳斯达克", "f43": 26800}})
+    session = Mock()
+    session.get.return_value = wrong
+    with patch("requests.Session", return_value=session):
+        assert realtime._fetch_eastmoney_quote("纳斯达克100", realtime.EASTMONEY_QUOTE_SECIDS["纳斯达克100"]) is None
+
+
+def test_us_eastmoney_quote_uses_exact_nasdaq100_identity():
+    right = _response(payload={"data": {"f57": "NDX100", "f58": "纳斯达克100", "f43": 30350,
+                                         "f60": 30408.5, "f86": 1790866800}})
+    session = Mock()
+    session.get.return_value = right
+    with patch("requests.Session", return_value=session):
+        quote = realtime._fetch_eastmoney_quote("纳斯达克100", realtime.EASTMONEY_QUOTE_SECIDS["纳斯达克100"])
+    assert session.get.call_args.kwargs["params"]["secid"] == "100.NDX100"
+    assert quote["price"] == 30350
+
+
 @patch("requests.Session", return_value=_DeadSession())
 def test_board_falls_back_to_eastmoney_minute_trend_rotating_hosts(_session):
     ok = _response(payload={"data": {"preClose": 3743.27, "trends": ["2026-09-29 11:28,3824.10", "2026-09-29 11:29,3825.79"]}})

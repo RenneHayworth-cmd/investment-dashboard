@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from threading import Lock
 from zoneinfo import ZoneInfo
@@ -14,6 +14,7 @@ import requests
 
 from core.cache import load_dataset, save_dataset
 from core.paths import RAW_DIR
+from services.market_calendar import get_market_window, is_market_holiday, uncovered_calendar_years
 
 
 INDEX_NAME = "桃囍微盘"
@@ -159,6 +160,26 @@ def load_v3_inputs(v3_dir: Path = DEFAULT_V3_DIR) -> tuple[pd.DataFrame, pd.Data
         calendar.loc[calendar["is_trading_day"].eq("1"), "calendar_date"], errors="coerce"
     ).dropna().sort_values().tolist()
     return top, _normalize_bars(pd.concat(frames, ignore_index=True)), sessions
+
+
+def extend_sessions(sessions: list[pd.Timestamp], anchor: date) -> list[pd.Timestamp]:
+    """Extend the frozen v3 calendar until at least one session follows ``anchor``.
+
+    The v3 export stops 14 days after its end date; later sessions come from the
+    maintained A-share holiday table so the latest T-1 selection keeps an effective date.
+    """
+    market = get_market_window("A股")
+    extended = sorted({pd.Timestamp(day).normalize() for day in sessions})
+    if not extended:
+        raise TaoxiDataError("v3交易日历为空")
+    day = extended[-1].date()
+    while extended[-1].date() <= anchor:
+        day += timedelta(days=1)
+        if uncovered_calendar_years(market, day, day):
+            raise TaoxiDataError(f"A股休市表未覆盖{day.year}年，无法确定{anchor}之后的生效交易日")
+        if day.weekday() < 5 and not is_market_holiday(market, day):
+            extended.append(pd.Timestamp(day))
+    return extended
 
 
 def _required_formal_bar_codes_by_day(
@@ -558,6 +579,11 @@ def publish_taoxi_datasets(history: pd.DataFrame, constituents: pd.DataFrame, in
 def rebuild_taoxi_index(v3_dir: Path = DEFAULT_V3_DIR, snapshot_path: Path = SNAPSHOT_PATH):
     top, bars, sessions = load_v3_inputs(v3_dir)
     snapshots = pd.read_csv(snapshot_path, dtype={"代码": str})
+    latest_snapshot = pd.to_datetime(snapshots["快照日期"], errors="coerce").max()
+    anchor = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    if not pd.isna(latest_snapshot):
+        anchor = max(anchor, latest_snapshot.date())
+    sessions = extend_sessions(sessions, anchor)
     bars = refresh_incremental_formal_bars(bars, snapshots, sessions)
     result = build_taoxi_series(top, snapshots, bars, sessions)
     publish_taoxi_datasets(*result)
@@ -742,7 +768,7 @@ def load_runtime_taoxi_quote() -> dict[str, object] | None:
 
 __all__ = [
     "INDEX_NAME", "INDEX_CODE", "VERSION", "TaoxiDataError", "classify_snapshot_halt_status",
-    "select_snapshot_constituents", "validate_v3_directory", "build_taoxi_series",
+    "select_snapshot_constituents", "validate_v3_directory", "extend_sessions", "build_taoxi_series",
     "publish_taoxi_datasets", "rebuild_taoxi_index", "load_taoxi_history",
     "load_taoxi_constituents", "load_taoxi_quality", "fetch_taoxi_intraday_quote", "load_runtime_taoxi_quote",
 ]

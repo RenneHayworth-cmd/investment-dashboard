@@ -156,6 +156,11 @@ class FuturesLiveFacadeContractTests(unittest.TestCase):
             ),
             patch.object(
                 futures_live_settlements,
+                "_statement_covered_closed_options",
+                return_value=set(),
+            ),
+            patch.object(
+                futures_live_settlements,
                 "_fetch_dce_option_settlements_for_date",
                 return_value=(official, "大商所测试"),
             ) as fetch,
@@ -170,6 +175,42 @@ class FuturesLiveFacadeContractTests(unittest.TestCase):
         fetch.assert_called_once_with("2026-08-17", {"I2609P730"})
         save.assert_called_once()
         self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["errors"], [])
+
+    def test_settlement_backfill_skips_closed_options_covered_by_statement(self) -> None:
+        requirements = pd.DataFrame(
+            [
+                {"asset_type": "期权", "contract": "I2609P730", "first_date": "2026-06-17", "target_date": "2026-08-18"},
+                {"asset_type": "期权", "contract": "I2701P700", "first_date": "2026-09-10", "target_date": "2026-09-30"},
+                {"asset_type": "期权", "contract": "I2705P680", "first_date": "2026-10-09", "target_date": "2026-10-09"},
+            ]
+        )
+        positions = pd.DataFrame(
+            [{"asset_type": "期权", "contract": "I2701P700", "estimated_quantity": -2}]
+        )
+        with (
+            patch.object(futures_live_settlements, "latest_monthly_account", return_value={"statement_end_date": "2026-09-30"}),
+            patch.object(futures_live_settlements, "build_estimated_positions", return_value=positions),
+        ):
+            covered = futures_live_settlements._statement_covered_closed_options(requirements)
+
+        # Closed and inside the statement: skip. Still held, or traded after the statement: keep.
+        self.assertEqual(covered, {"I2609P730"})
+
+        with (
+            patch.object(futures_live_settlements, "_historical_contract_requirements", return_value=requirements.iloc[:1]),
+            patch.object(
+                futures_live_settlements,
+                "load_daily_closes",
+                return_value=pd.DataFrame(columns=["asset_type", "contract", "trade_date", "settlement_price"]),
+            ),
+            patch.object(futures_live_settlements, "_statement_covered_closed_options", return_value={"I2609P730"}),
+            patch.object(futures_live_settlements, "_fetch_dce_option_settlements_for_date") as fetch,
+        ):
+            result = futures_live_settlements.update_traded_contract_daily_settlements(force=True)
+
+        fetch.assert_not_called()
+        self.assertEqual(result["skipped"], 1)
         self.assertEqual(result["errors"], [])
 
     def test_close_backfill_fetches_iron_ore_option_history(self) -> None:

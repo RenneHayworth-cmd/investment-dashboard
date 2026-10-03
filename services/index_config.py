@@ -24,6 +24,13 @@ INDEX_CONFIG = {
         "market_group": "A股",
         "tickflow_symbol": "399006.SZ",
     },
+    "创成长": {
+        "source": "akshare_cn",
+        "code": "399296",
+        "market": "sz",
+        "market_group": "A股",
+        "tickflow_symbol": "399296.SZ",
+    },
     "沪深300": {
         "source": "akshare_cn",
         "code": "000300",
@@ -78,6 +85,13 @@ INDEX_CONFIG = {
         "market": "sh",
         "market_group": "A股",
         "tickflow_symbol": "000688.SH",
+    },
+    "中韩半导体": {
+        "source": "akshare_cn",
+        "code": "931790",
+        "market": "sh",
+        "market_group": "A股",
+        "eastmoney_quote_secid": "2.931790",
     },
     "中证红利低波": {
         "source": "akshare_csindex",
@@ -210,11 +224,13 @@ INDEX_CONFIG = {
 INDEX_WIND_CODES = {
     "上证指数": "000001.SH",
     "创业板指": "399006.SZ",
+    "创成长": "399296.SZ",
     "沪深300": "000300.SH",
     "中证500": "000905.SH",
     "中证1000": "000852.SH",
     "中证2000": "932000.CSI",
     "科创50": "000688.SH",
+    "中韩半导体": "931790.CSI",
     "中证红利低波": "H30269.CSI",
     "国证自由现金流": "980092.CNI",
     "恒生科技": "HSTECH.HI",

@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 import json
 from io import StringIO
 from pathlib import Path
@@ -17,6 +17,7 @@ from services.taoxi_microcap_index import (
     TaoxiDataError,
     build_taoxi_series,
     classify_snapshot_halt_status,
+    extend_sessions,
     fetch_taoxi_intraday_quote,
     publish_taoxi_datasets,
     refresh_incremental_formal_bars,
@@ -148,6 +149,40 @@ class TaoxiMicrocapTests(unittest.TestCase):
         group = pd.DataFrame({"快照日期": ["2026-09-24"], "快照时间": ["2026-09-26 19:56:00"]})
         self.assertTrue(_snapshot_is_close_confirmed(group, list(pd.to_datetime(["2026-09-24"]))))
         self.assertFalse(_snapshot_is_close_confirmed(group, list(pd.to_datetime(["2026-09-24", "2026-09-25"]))))
+
+    def test_sessions_extend_past_frozen_v3_calendar(self):
+        v3_sessions = list(pd.to_datetime(["2026-09-30", "2026-10-08", "2026-10-09", "2026-10-12", "2026-10-13"]))
+        self.assertEqual(extend_sessions(v3_sessions, date(2026, 10, 1)), v3_sessions)
+        extended = extend_sessions(v3_sessions, date(2026, 10, 16))
+        self.assertEqual(extended[5:], list(pd.to_datetime(["2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19"])))
+        # National Day closures come from the maintained holiday table.
+        bridged = extend_sessions(list(pd.to_datetime(["2026-09-30"])), date(2026, 9, 30))
+        self.assertEqual(bridged[-1], pd.Timestamp("2026-10-08"))
+
+    def test_sessions_refuse_uncovered_holiday_year(self):
+        with patch("services.taoxi_microcap_index.uncovered_calendar_years", return_value=[2027]):
+            with self.assertRaisesRegex(TaoxiDataError, "未覆盖2027年"):
+                extend_sessions(list(pd.to_datetime(["2026-12-31"])), date(2026, 12, 31))
+
+    @patch("services.taoxi_microcap_index.BASE_DATE", pd.Timestamp("2026-06-19"))
+    def test_snapshot_after_v3_calendar_end_takes_effect_next_session(self):
+        first = [f"600{i:03d}" for i in range(20)]
+        codes = [f"601{i:03d}" for i in range(400)]
+        estimates = pd.DataFrame([
+            {"date": "2026-06-19", "代码": code, "strategy_rank": rank} for rank, code in enumerate(first, 1)
+        ])
+        snapshot = pd.DataFrame({"快照日期": "2026-06-22", "快照时间": "2026-06-22 15:05:00", "代码": codes,
+            "名称": codes, "总市值(亿元)": range(1, 401), "成交量": 1, "成交额": 1, "是否停牌": False})
+        bars = pd.DataFrame(make_bars("2026-06-22", first, 1.10) + make_bars("2026-06-23", codes[:20], 1.20))
+        frozen = list(pd.to_datetime(["2026-06-19", "2026-06-22"]))
+        history, _, _, _ = build_taoxi_series(estimates, snapshot, bars, frozen)
+        self.assertEqual(history["trade_date"].max(), pd.Timestamp("2026-06-22"))
+        history, members, _, _ = build_taoxi_series(
+            estimates, snapshot, bars, extend_sessions(frozen, date(2026, 6, 22))
+        )
+        self.assertEqual(history["trade_date"].max(), pd.Timestamp("2026-06-23"))
+        self.assertAlmostEqual(history.iloc[-1]["close"], 1320)
+        self.assertEqual(set(members[members["effective_date"].eq(pd.Timestamp("2026-06-23"))]["代码"]), set(codes[:20]))
 
     @patch("services.taoxi_microcap_index.save_dataset")
     @patch("services.taoxi_microcap_index.load_dataset")

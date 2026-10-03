@@ -162,6 +162,8 @@ def repair_latest_missing_prices(store,provider):
     if not missing and not events_changed:
         return None
     provider.required=set(missing)
+    # Retain original session metadata while fetching historical replacement prices.
+    provider.original_quotes=batch.get("quotes",{})
     provider.refresh(day,missing)
     fresh=provider.batch(day)
     updated=deepcopy(batch)
@@ -174,8 +176,6 @@ def repair_latest_missing_prices(store,provider):
             continue
         if q.get("formal") is not True or q.get("date")!=day or q.get("adjustment")!="none":
             continue
-        if any(type(q.get(k)) is not bool for k in ("halted", "limit_up", "limit_down", "eligible")):
-            continue
         q=deepcopy(q)
         original=batch["quotes"].get(code,{})
         if not q.get("metadata") and original.get("metadata"):
@@ -187,6 +187,14 @@ def repair_latest_missing_prices(store,provider):
             for field,comparison in (("limit_up",lambda a,b:a>=b-1e-8),("limit_down",lambda a,b:a<=b+1e-8)):
                 if ext.get(field):
                     q[field]=comparison(float(q["close"]),float(ext[field]))
+        # A confirmed close can repair valuation even when execution evidence is
+        # still incomplete. execute() retains the explicit provisional warnings.
+        fields=("halted","limit_up","limit_down","eligible")
+        if (original.get("formal") is True and original.get("close") is not None
+                and float(original["close"])==float(q["close"])
+                and sum(type(q.get(k)) is bool for k in fields)
+                    <= sum(type(original.get(k)) is bool for k in fields)):
+            continue
         updated["quotes"][code]=q
         improved.append(code)
     if not improved and not events_changed:
@@ -248,6 +256,14 @@ def update_simulation(target=None,db_path=None,provider=None,preflight=False,ref
                 result["status"]="已补价重算"
                 detail=(f"补齐{len(repaired['codes'])}只行情/资格字段" if repaired["codes"] else "按当前模拟口径重算权益事件字段")
                 result["message"]=f"{repaired['date']}{detail}，原日结已归档；"+result["message"]
+            latest={row["strategy"]:row for row in store.days()}
+            pending=list(dict.fromkeys(w for row in latest.values() if row.get("provisional")
+                                       for w in row.get("warnings",[])))
+            if pending:
+                result["gaps"].append(dict(date=max(row["date"] for row in latest.values()),
+                                          reason="；".join(pending)))
+                result["status"]="待补数据"
+                result["message"]+="；仍有行情/资格缺项，等待后续更新补齐重算"
             if job is not None:
                 from core.db import finish_job
                 finish_job(job,"failed" if result["gaps"] else "success",result["message"])

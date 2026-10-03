@@ -128,6 +128,8 @@ class IndexRealtimeTests(unittest.TestCase):
         self.assertEqual(names[0], "上证指数")
         self.assertEqual(names[names.index("微盘股") + 1], "桃囍微盘")
         self.assertEqual(names[names.index("桃囍微盘") + 1], "科创50")
+        self.assertEqual(names[names.index("科创50") + 1], "中韩半导体")
+        self.assertEqual(names[names.index("创业板指") + 1], "创成长")
         self.assertEqual(
             names[names.index("铁矿石主连") - 2 : names.index("铁矿石主连")],
             ["中证500期货主连", "中证1000期货主连"],

@@ -45,11 +45,32 @@ before a larger handoff or commit.
 
 ## UI Notes
 
-- Keep `app.py` lightweight. It should act as a status and navigation overview:
-  cache count, latest cache update time, latest trade date, today-focus notes,
-  and common page entry text. Avoid rebuilding it as a heavy card dashboard.
-- The `指数监控` page should show cached data first and must not use a periodic
-  network refresh timer for its summary cards or formal summary update. A
+- `app.py` is the live-account overview (user decision 2026-10-02) and shows only:
+  combined total assets, daily P&L, total P&L since account opening (with the
+  since-ETF-opening amount beside it) and cumulative return; one card each for
+  ETF实盘, 微盘实盘 and 期货实盘 (broker customer equity: 盯市 minus 申报费 and other
+  account fees, never deducting exercise fees twice); the combined NAV/daily-P&L
+  chart; and the combined return calendar. Keep it thin: `services/home_overview.py`
+  reads the three ledgers with formal closes/settlements only (no network, no
+  intraday quotes) and `components/home/` renders, caching results for five minutes.
+  Combine by summing each day's P&L amounts and return denominators, stop at the
+  earliest latest valuation, and start at the ETF实盘 opening close (before it
+  only futures was recorded; 微盘实盘 capital comes out of ETF实盘). The opening
+  day is a baseline with zero combined P&L. Account cards keep their own start.
+  Pre-ledger stock P&L (opening to the ETF实盘 opening close = assets minus net
+  bank transfers) lives in the `live_pre_ledger_pnl` table, never in source; it
+  adds to the ETF card's since-opening P&L only. User decision 2026-10-02: the
+  9/3 LOF custody transfer-in counts as income, not new capital (as in Notion).
+- The `指数监控` page should show cached data first. User decision 2026-10-01:
+  while this page is open, automatically refresh only S&P 500, Nasdaq Composite,
+  and Nasdaq 100 card quotes every two minutes during US cash trading hours.
+  Use the market calendar for NY dates, DST, holidays and shortened sessions.
+  Share request reservations across browser sessions in the same process;
+  failed instruments retry no sooner than ten minutes, retaining the last valid
+  quote. Accept only positive prices with same-session source timestamps no
+  older than three minutes. Manual successful quotes satisfy the next automatic
+  slot. These quotes are transient and do not update formal summaries or history.
+  VIX and all other markets remain manual. A
   cache-only fragment may poll local dataset metadata every 30 seconds and
   rerender the page after the standalone scheduled updater changes the formal
   report cache. The `更新指数数据` button is the manual network trigger: fetch one read-only quote for
@@ -68,7 +89,8 @@ before a larger handoff or commit.
   using `index_final_history` (or the mapped futures contract's formal history),
   never treating an old raw intraday row as confirmation. Use local market dates,
   US daylight saving time, futures overnight trading dates, and holiday-eve night
-  suspensions. Reopening remains cache-only; the update button refreshes only
+  suspensions. Reopening reuses local data and the shared US quote cadence;
+  other markets remain cache-only. The update button refreshes only
   instruments currently trading or still missing their lunch/formal data.
   The split-column report has no user-selectable display window: retain the
   latest 120 calendar days. For every displayed trading day, show that day's
@@ -164,7 +186,8 @@ before a larger handoff or commit.
   old and new contract prices. Keep detail views on the unadjusted
   main-continuous long history.
 - The monitored set includes the Shanghai Composite, mainland China indices,
-  EastMoney micro-cap board index, STAR 50, CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
+  EastMoney micro-cap board index, STAR 50, CSI KRX China-Korea Semiconductor
+  (`931790`), ChiNext Growth (`399296`), CSI 2000, US indices, VIX, Hang Seng Tech, Hang Seng SCHK High
   Dividend Low Volatility, Nikkei 225, Korea KOSPI, and iron ore/gold/crude
   oil/silver and CSI 500/CSI 1000 main-continuous futures. Main-continuous futures should try to
   supplement same-day spot prices so they do not remain stale during the
@@ -187,9 +210,17 @@ before a larger handoff or commit.
   environment proxies. Require all 20 unique members and same-day timestamps for
   trading stocks; a partial or stale batch must fall back, never reduce the divisor.
   Surface quote/calculation failures while retaining valid caches.
+  The v3 `calendar.csv` ends 14 days after its export; formal rebuilds extend
+  sessions from `services/market_calendar.py` and fail loudly when the A-share
+  holiday table does not cover the needed year.
 - `国证自由现金流` (`980092`) uses AkShare's official CNI history
   endpoint (`index_hist_cni`) so its back-calculated series reaches the
   2012-12-31 base date; generic A-share and TickFlow history are shorter.
+- `中韩半导体` (`931790`, after `科创50`) and `创成长` (`399296`, after `创业板指`)
+  use the same unified A-share chain as the other mainland indices
+  (`akshare_cn`, TickFlow first where supported; TickFlow lacks 931790). 931790
+  also publishes on Korean-only sessions; those rows are dropped like other
+  non-A-share dates.
 - Keep `A股分析` and `美股分析` aligned where the workflows overlap: sidebar
   settings, top summary metrics, chart tab order, and drawdown metric/chart
   style should stay consistent so users do not have to relearn the page.
@@ -204,8 +235,9 @@ before a larger handoff or commit.
   per request: the fixed 15-ETF list requires three requests per refresh.
   Each batch updates all ETF cards and the transient timing-table preview.
   Retry failed ETF batches no more often than every ten minutes.
-  Public-source index quotas are unconfirmed, so keep the index monitoring
-  page manual and retain the existing auxiliary quote cadence: every ten minutes
+  Apart from the three verified US indices above, public-source index quotas
+  remain unconfirmed and index monitoring remains manual. Retain the existing
+  holdings auxiliary quote cadence: every ten minutes
   09:30-10:00, every thirty minutes 10:00-11:30 and 13:00-14:50, once at lunch,
   and every two minutes 14:50-15:00. Apply that separate cadence to the holdings
   index reference, the `I2701` futures card and the two futures-spread cards, retaining
@@ -343,7 +375,16 @@ before a larger handoff or commit.
   cumulative buy cost; do not sum share quantities across different ETFs. Keep
   the total row's trade-date and valuation-date cells blank, center the table,
   and style the total row like the current-position total row.
-- The `期货实盘` page is separate from ETF `实盘记录`. Read broker monthly
+- The `期货实盘` page is separate from ETF `实盘记录`.
+  Strategy analysis (user decision 2026-10-02) shows a P&L table and selectable
+  cumulative monetary P&L curves for 铁矿石滚贴水, 铁矿石跨期, IM跨期 and
+  中证1000卖Put. Iron-ore short puts, assignment and subsequent directional
+  rolls belong to 铁矿石滚贴水 throughout. Split shared contracts by execution
+  quantity, never by whole-contract labels. Corn is excluded from strategy
+  displays but remains in the account reconciliation bridge. Reuse the selected
+  close/settlement basis, preserve missing-price gaps, and show unallocated
+  account fees/manual adjustments separately. Do not invent strategy capital
+  or returns. Read broker monthly
   statements from `FUTURES_STATEMENT_DIR` or the default local OneDrive
   directory without modifying them. Match only broker statement filenames and
   support both `.xls` and `.xlsx`; derived statistics workbooks are not input.
@@ -401,7 +442,10 @@ before a larger handoff or commit.
   `采用手工` or `采用正式` choice, and unresolved differences pause formal
   cumulative confirmation. Manual daily-P&L records remain deletable.
   Backfill formal daily prices for every historically traded contract, including
-  closed or expired contracts, using append-only date inserts. Iron-ore option
+  closed or expired contracts, using append-only date inserts. Exception (user
+  decision 2026-10-01): an option no longer held whose whole holding period is
+  covered by the latest monthly statement uses the statement as authoritative;
+  do not backfill or warn about its missing exchange settlements. Iron-ore option
   expiry requires the underlying contract's official expiry-day settlement.
   Keep each strike independent; confirmed short-put assignment removes the
   option and creates the same quantity of long underlying futures at the strike.
@@ -414,7 +458,10 @@ before a larger handoff or commit.
 ## Structure
 
 - `app.py`: Streamlit home page.
-- `pages/`: Streamlit pages. Numeric prefixes control sidebar ordering.
+- `pages/`: Streamlit pages. Numeric prefixes control sidebar ordering. User
+  decision 2026-10-02: `指数监控`, `持仓分析`, `ETF实盘`, `微盘实盘`, `期货实盘`,
+  then the remaining pages in their previous order (`A股分析`, `策略回测`,
+  `相关性分析`, `期货期权`, `期货价差`, `美股分析`, `微盘股`, `任务与数据`).
 - `components/backtest/`: strategy-backtest mode components and annual ETF page workflow.
 - `components/live_record/`: ETF live-record valuation, tables, trade forms, and history views.
 - `components/futures_live/`: futures-live refresh, account, manual-entry, and history views.
@@ -716,6 +763,8 @@ Commit only relevant source changes. Do not revert unrelated user changes.
   is dry-run; activating Fangtang requires user confirmation that Windows Fangtang stopped.
 
 ## Microcap20 ABCD
+
+- Automatic simulation batches TickFlow close quotes in groups of at most five and stops new TickFlow requests after a rate-limit response in that run. Unadjusted daily fallback is EastMoney, Tencent, Sina, then optional Wind. Request the previous trading session alongside the target close for limit checks, and preserve original-session limit metadata during historical repairs. A formal close may repair valuation while unknown execution fields remain provisional. Remaining provisional warnings must return a data gap, not a successful complete update.
 
 - Exclude confirmed signal-day suspensions before taking the smallest 20. Freeze the entire candidate order with each rebalance plan. On execution-day suspension, substitute using that frozen order, never execution-day capitalization. Held suspended stocks still occupy the 20-position cap; limit-up cancellations do not get replacements.
 - Offline research replay lives in services/microcap_rotation_replay.py and must reconcile fills, inventories, cash, fees and all 72 display values before replacing the active research archive. User authorized replacing the old research display.

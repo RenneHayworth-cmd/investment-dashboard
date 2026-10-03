@@ -49,8 +49,8 @@ def render_account_trend(
     ].copy()
     period = st.segmented_control(
         "时间范围",
-        ["近1月", "近3月", "近1年", "全部"],
-        default="全部",
+        ["近1月", "近3月", "今年以来", "近1年", "全部"],
+        default="近1月",
         key="futures_live_period",
         label_visibility="collapsed",
     )

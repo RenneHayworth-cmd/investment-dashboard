@@ -454,6 +454,16 @@ def _calculate_daily_account_state(
                 {
                     "asset_type": contract_key[0],
                     "contract": contract_key[1],
+                    "long_quantity": (
+                        int(futures_states.get((contract_key[1], "多"), {}).get("quantity", 0))
+                        if contract_key[0] == "期货"
+                        else max(0, int(option_states.get(contract_key[1], {}).get("quantity", 0)))
+                    ),
+                    "short_quantity": (
+                        int(futures_states.get((contract_key[1], "空"), {}).get("quantity", 0))
+                        if contract_key[0] == "期货"
+                        else max(0, -int(option_states.get(contract_key[1], {}).get("quantity", 0)))
+                    ),
                     "realized_pnl": contract_realized_pnl,
                     "floating_pnl": (
                         None if contract_missing else contract_floating_pnl

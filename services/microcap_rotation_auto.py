@@ -1,9 +1,11 @@
 """Automatic TickFlow/AkShare inputs; missing optional evidence is disclosed."""
 import json
+import math
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import pandas as pd
 from services.microcap_rotation_data import CacheProvider,snapshot_records
 from services.microcap_rotation_policy import now,settled,ETF,DataGap
@@ -26,14 +28,23 @@ print(frame.to_json(orient='records',date_format='iso',force_ascii=False))
 def ak_raw_history(code, day):
     """Run the common registry with a process deadline for each interface."""
     from services.akshare_sources import raw_security_sources
-    from services.market_fallback import fetch_market_fallback, normalize_daily_prices
+    from services.market_fallback import MarketSource, fetch_market_fallback, normalize_daily_prices
+    from services.market_calendar import get_market_window, previous_trading_day
+    from datetime import date
+    from services.wind_source import wind_api_key, fetch_wind_daily_bars, wind_stock_code
+
+    start = previous_trading_day(get_market_window("A股"), date.fromisoformat(day)).isoformat()
 
     class BoundedAkShare:
         def __getattr__(self, name):
             return lambda **kwargs: pd.DataFrame(ak_call(name, kwargs))
 
+    sources = raw_security_sources(BoundedAkShare(), infer_tickflow_symbol(code), start, day, fund=code == ETF)
+    if wind_api_key():
+        sources.append(MarketSource("万得Wind", lambda: fetch_wind_daily_bars(
+            "stock_data", wind_stock_code(code), start, day, aftype="2"), "wind"))
     return fetch_market_fallback(
-        raw_security_sources(BoundedAkShare(), infer_tickflow_symbol(code), day, day, fund=code == ETF),
+        sources,
         normalize_daily_prices, date_column="date", price_column="close", target_date=day, allow_partial=False,
     )
 
@@ -84,6 +95,9 @@ class AutomaticProvider(CacheProvider):
         path=folder/(day+".json")
         saved=json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         quotes=dict(saved.get("quotes",{}))
+        for code, original in getattr(self,"original_quotes",{}).items():
+            if original.get("date")==day and original.get("metadata"):
+                quotes[code]=dict(quotes.get(code,original),metadata=original["metadata"])
         if not self.allow_fetch:
             result["quotes"]=quotes
             result["events"]=[]
@@ -102,17 +116,40 @@ class AutomaticProvider(CacheProvider):
         needed=sorted(selected)
         metadata={}
         snapshots={}
+        limited=Event()
+        def tickflow_call(call, *args, **kwargs):
+            if limited.is_set():
+                raise DataGap("TickFlow本轮已限流，使用备用源")
+            try:
+                return call(*args, **kwargs)
+            except Exception as exc:
+                if type(exc).__name__ == "RateLimitError":
+                    limited.set()
+                raise
         constituent_names={str(r.get("code")):str(r.get("name", "")) for r in result.get("constituents", [])}
         if needed and day==now().date().isoformat():
             try:
-                metadata={r["symbol"]:r for r in client.instruments.get([infer_tickflow_symbol(c) for c in needed])}
+                metadata={r["symbol"]:r for r in tickflow_call(client.instruments.get,[infer_tickflow_symbol(c) for c in needed])}
             except Exception:
                 result["warnings"].append("证券元数据未取得；有价格的成交标注为资格未完全核验")
         if needed and day==now().date().isoformat():
+            for offset in range(0,len(needed),5):
+                try:
+                    snapshots.update({r["symbol"]:r for r in tickflow_call(client.quotes.get,symbols=[infer_tickflow_symbol(c) for c in needed[offset:offset+5]])})
+                except Exception:
+                    if limited.is_set():
+                        break
+        def snapshot_values(symbol):
             try:
-                snapshots={r["symbol"]:r for r in client.quotes.get(symbols=[infer_tickflow_symbol(c) for c in needed])}
-            except Exception:
+                snapshot=snapshots[symbol]
+                stamp=pd.Timestamp(snapshot["timestamp"],unit="ms",tz="UTC").tz_convert("Asia/Shanghai")
+                price=float(snapshot["last_price"]); volume=float(snapshot["volume"])
+                if (stamp.strftime("%Y-%m-%d")==day and stamp.hour>=15
+                        and math.isfinite(price) and price>0 and math.isfinite(volume) and volume>=0):
+                    return price,volume
+            except (KeyError,TypeError,ValueError,OverflowError):
                 pass
+            return None,None
         def get_quote(code):
             symbol=infer_tickflow_symbol(code)
             old=quotes.get(code)
@@ -122,49 +159,55 @@ class AutomaticProvider(CacheProvider):
             close=volume=previous_close=None
             errors=[]
             source="TickFlow未复权日线"
+            if symbol in snapshots:
+                close,volume=snapshot_values(symbol)
+                if close is not None:
+                    source="TickFlow当日15点后收盘快照"
             try:
-                frame=client.klines.get(symbol,period="1d",count=8,adjust="none",as_dataframe=True)
-                dates=pd.to_datetime(frame.trade_date).dt.strftime("%Y-%m-%d")
-                day_frame=frame.loc[dates==day]
-                prior_frame=frame.loc[dates<day].sort_values("trade_date")
-                if len(prior_frame):
-                    previous_close=float(prior_frame.close.iloc[-1])
-                if len(day_frame)==1:
-                    close=float(day_frame.close.iloc[0])
-                    volume=float(day_frame.volume.iloc[0]) if "volume" in day_frame else None
+                if close is None:
+                    frame=tickflow_call(client.klines.get,symbol,period="1d",count=8,adjust="none",as_dataframe=True)
+                    dates=pd.to_datetime(frame.trade_date).dt.strftime("%Y-%m-%d")
+                    day_frame=frame.loc[dates==day]
+                    prior_frame=frame.loc[dates<day].sort_values("trade_date")
+                    if len(prior_frame):
+                        previous_close=float(prior_frame.close.iloc[-1])
+                    if len(day_frame)==1:
+                        close=float(day_frame.close.iloc[0])
+                        volume=float(day_frame.volume.iloc[0]) if "volume" in day_frame else None
             except Exception as exc:
                 errors.append("TickFlow日线："+type(exc).__name__)
             if close is None and symbol not in snapshots and day==now().date().isoformat():
                 try:
-                    single=client.quotes.get(symbols=[symbol])
+                    single=tickflow_call(client.quotes.get,symbols=[symbol])
                     for item in single:
                         if item.get("symbol")==symbol:
                             snapshots[symbol]=item
                 except Exception as exc:
                     errors.append("TickFlow收盘快照："+type(exc).__name__)
             if close is None and symbol in snapshots:
-                snapshot=snapshots[symbol]
-                stamp=pd.Timestamp(snapshot["timestamp"],unit="ms",tz="UTC").tz_convert("Asia/Shanghai")
-                if stamp.strftime("%Y-%m-%d")==day and stamp.hour>=15:
-                    close=float(snapshot["last_price"]); volume=float(snapshot["volume"])
+                close,volume=snapshot_values(symbol)
+                if close is not None:
                     source="TickFlow当日15点后收盘快照"
-            if close is None:
+            meta=metadata.get(symbol,{}) or (old.get("metadata",{}) if old and old.get("date")==day else {})
+            ext=meta.get("ext") or {}
+            if close is None or (not previous_close and not (ext.get("limit_up") and ext.get("limit_down"))):
                 try:
                     data=ak_raw_history(code,day)
+                    prior=data.loc[data["date"].dt.strftime("%Y-%m-%d").lt(day)].sort_values("date")
+                    if not prior.empty:
+                        previous_close=float(prior.iloc[-1]["close"])
                     matched=data.loc[data["date"].dt.strftime("%Y-%m-%d").eq(day)].to_dict("records")
-                    if len(matched)==1:
+                    if close is None and len(matched)==1:
                         close=float(matched[0]["close"])
                         volume=float(matched[0]["volume"]) if "volume" in matched[0] else None
                         source=data.attrs["market_data_source"]+"未复权日线"
                 except Exception as exc:
                     errors.append("AkShare日线："+type(exc).__name__)
-            import math
             if close is not None and (not math.isfinite(close) or close<=0):
                 close=None
             if volume is not None and not math.isfinite(volume):
                 volume=None
-            meta=metadata.get(symbol,{})
-            ext=meta.get("ext") or {}
+            # Original metadata is dated with the saved quote, never today's limits.
             up,down=ext.get("limit_up"),ext.get("limit_down")
             halted=None if volume is None else volume==0
             limit_source="TickFlow同日证券元数据" if up and down else ""

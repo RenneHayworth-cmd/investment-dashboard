@@ -189,8 +189,8 @@ def _render_performance_history(
         )
         period = st.segmented_control(
             "时间范围",
-            ["近1月", "近3月", "近1年", "全部"],
-            default="全部",
+            ["近1月", "近3月", "今年以来", "近1年", "全部"],
+            default="近1月",
             key=f"{key_prefix}_{scope}_period",
             label_visibility="collapsed",
         )
@@ -302,8 +302,8 @@ def _render_performance_history(
         daily["cumulative_return_pct"] = (daily["nav"] - 1.0) * 100.0
         period = st.segmented_control(
             "时间范围",
-            ["近1月", "近3月", "近1年", "全部"],
-            default="全部",
+            ["近1月", "近3月", "今年以来", "近1年", "全部"],
+            default="近1月",
             key=f"{key_prefix}_{scope}_period",
             label_visibility="collapsed",
         )

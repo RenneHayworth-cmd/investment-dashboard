@@ -23,3 +23,6 @@ cache.microcap_rotation.lock
 
 # Codex local working memory
 .workbuddy/memory/
+
+# Local SQLite backups contain personal ledgers
+cache.db.bak*

@@ -34,18 +34,20 @@ from services.index_sources_mx import fetch_mx_realtime_quote
 EASTMONEY_QUOTE_SECIDS = {
     "上证指数": "1.000001",
     "创业板指": "0.399006",
+    "创成长": "0.399296",
     "沪深300": "1.000300",
     "中证500": "1.000905",
     "中证1000": "1.000852",
     "中证2000": "2.932000",
     "微盘股": "90.BK1158",
     "科创50": "1.000688",
+    "中韩半导体": "2.931790",
     "中证红利低波": "2.H30269",
     "国证自由现金流": "0.980092",
     "恒生科技": "124.HSTECH",
     "恒生港股通高息低波": "124.HSHYLV",
     "标普500": "100.SPX",
-    "纳斯达克100": "100.NDX",
+    "纳斯达克100": "100.NDX100",
     "日经225": "100.N225",
     "韩国KOSPI": "100.KS11",
 }
@@ -862,6 +864,10 @@ def _fetch_eastmoney_quote(index_name: str, secid: str) -> dict[str, object] | N
                 response.raise_for_status()
                 quote = response.json().get("data") or {}
             except Exception:
+                continue
+            if market_name == "美股" and str(quote.get("f57") or "").strip().upper() != secid.partition(".")[2].upper():
+                # EastMoney NDX is the composite; its Nasdaq-100 is NDX100.
+                # Never display a successful response for a different instrument.
                 continue
             price = pd.to_numeric(quote.get("f43"), errors="coerce")
             if pd.isna(price):
