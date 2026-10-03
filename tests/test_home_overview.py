@@ -2,6 +2,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from services.home_overview import (
@@ -131,7 +133,11 @@ def test_inception_pnl_adds_the_stored_pre_ledger_result(tmp_path, monkeypatch):
     assert abs(account.inception_pnl - 900.00) < 1e-9
 
 
-def test_home_page_renders_overview_without_network():
+@pytest.mark.parametrize(
+    ("inception_pnl", "shows_since_start"),
+    [(10.0, False), (1_010.0, True)],
+)
+def test_home_page_renders_overview_without_network(inception_pnl, shows_since_start):
     etf = _account(
         "etf",
         [("2026-09-29", 0.0, 1000.0), ("2026-09-30", 10.0, 1000.0)],
@@ -143,16 +149,22 @@ def test_home_page_renders_overview_without_network():
         "accounts": [etf],
         "combined": combine_account_series([etf], start=pd.Timestamp("2026-09-29")),
         "start": pd.Timestamp("2026-09-29"),
-        "inception_pnl": 10.0,
+        "inception_pnl": inception_pnl,
         "errors": {"futures": "缺少月结单"},
     }
+    st.cache_data.clear()
     with patch("components.home.overview.load_account_overview", return_value=overview):
         app = AppTest.from_file(str(Path(__file__).parents[1] / "app.py"), default_timeout=30).run()
 
     assert list(app.exception) == []
     assert [item.value for item in app.subheader] == ["总净值与每日盈亏", "总收益日历"]
     assert any("期货实盘读取失败" in item.value for item in app.warning)
-    assert any("合计总资产" in item.value for item in app.markdown)
+    cards = next(item.value for item in app.markdown if "合计总资产" in item.value)
+    # 开户以来与起算以来金额相同时不重复显示。
+    assert ("总盈亏（开户以来）" in cards) is shows_since_start
+    assert ("09-29起 +1.00%" in cards) is shows_since_start
+    assert "+1.00%" in cards  # 累计收益率与总盈亏同卡显示
+    assert "累计收益率" not in cards
 
 
 def test_first_day_pnl_counts_for_an_account_starting_on_the_start_date():

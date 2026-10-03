@@ -71,9 +71,13 @@ def _account_return(account: AccountSeries) -> tuple[float | None, float | None]
     return float(((1.0 + rates).prod() - 1.0) * 100.0), float(rates.iloc[-1] * 100.0)
 
 
-def _metric(label: str, value: str, *, secondary: str = "", color: str | None = None) -> str:
+def _metric(
+    label: str, value: str, *, secondary: str = "", color: str | None = None, secondary_color: str | None = None
+) -> str:
     style = f' style="color:{color}"' if color else ""
-    extra = f'<span class="home-metric-secondary"{style}>{html.escape(secondary)}</span>' if secondary else ""
+    secondary_color = secondary_color or color
+    secondary_style = f' style="color:{secondary_color}"' if secondary_color else ""
+    extra = f'<span class="home-metric-secondary"{secondary_style}>{html.escape(secondary)}</span>' if secondary else ""
     return (
         '<div class="home-metric">'
         f'<div class="home-metric-label">{html.escape(label)}</div>'
@@ -85,7 +89,7 @@ def _metric(label: str, value: str, *, secondary: str = "", color: str | None = 
 _STYLE = """
 <style>
 .home-grid { display: grid; gap: 0.65rem; margin: 0.6rem 0 0.4rem; }
-.home-grid.total { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.home-grid.total { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .home-grid.accounts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .home-card, .home-metric {
     min-width: 0; padding: 0.72rem 0.8rem; border: 1px solid var(--ui-border);
@@ -98,10 +102,12 @@ _STYLE = """
 .home-card-title { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
 .home-card-name { font-weight: 650; font-size: 1rem; color: var(--ui-text); }
 .home-card-assets { font-size: 1.3rem; font-weight: 680; color: var(--ui-text); margin: 0.35rem 0 0.45rem; }
-.home-card-row { display: flex; justify-content: space-between; font-size: 0.9rem; line-height: 1.6; }
+.home-card-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.9rem; line-height: 1.75; }
+.home-card-amount { font-size: 1.08rem; font-weight: 680; }
+.home-card-rate { margin-left: 0.5rem; font-size: 0.84rem; font-weight: 560; }
 .home-card-row span:first-child { color: var(--ui-muted); }
 @media (max-width: 900px) {
-    .home-grid.total { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .home-grid.total { grid-template-columns: minmax(0, 1fr); }
     .home-grid.accounts { grid-template-columns: minmax(0, 1fr); }
     .home-metric-label { white-space: normal; }
 }
@@ -119,16 +125,30 @@ def _render_total_cards(
     cumulative = latest["cumulative_pnl"] if latest is not None else None
     cumulative_rate = latest["cumulative_return_pct"] if latest is not None else None
     since = _date(start)
+    # 合计曲线从开户起算时，“开户以来”与“起算以来”是同一口径，不再加括号说明；
+    # 只有某账本晚于开户建账（另有建账前盈亏）时才区分两者。
+    starts_after_opening = any(account.pre_ledger_pnl for account in accounts) or (
+        cumulative is not None and abs(float(cumulative) - inception_pnl) >= 0.005
+    )
     cards = [
         _metric("合计总资产", _money(total_assets)),
-        _metric("当日盈亏", _signed_money(daily_pnl), secondary=_signed_pct(daily_rate), color=_color(daily_pnl)),
         _metric(
-            "总盈亏（开户以来）",
-            _signed_money(inception_pnl),
-            secondary=f"{since[5:]}起 {_signed_money(cumulative)}" if cumulative is not None else "",
-            color=_color(inception_pnl),
+            "当日盈亏",
+            _signed_money(daily_pnl),
+            secondary=_signed_pct(daily_rate),
+            color=_color(daily_pnl),
+            secondary_color=_color(daily_rate),
         ),
-        _metric(f"累计收益率（{since}起）", _signed_pct(cumulative_rate) or "-", color=_color(cumulative_rate)),
+        _metric(
+            "总盈亏（开户以来）" if starts_after_opening else "总盈亏",
+            _signed_money(inception_pnl),
+            # 收益率按合计净值复合；起点晚于开户时注明起算日。
+            secondary=(
+                f"{since[5:]}起 {_signed_pct(cumulative_rate)}" if starts_after_opening else _signed_pct(cumulative_rate)
+            ),
+            color=_color(inception_pnl),
+            secondary_color=_color(cumulative_rate),
+        ),
     ]
     st.markdown(_STYLE + '<div class="home-grid total">' + "".join(cards) + "</div>", unsafe_allow_html=True)
 
@@ -140,21 +160,34 @@ def _render_account_cards(accounts: list[AccountSeries]) -> None:
         daily_pnl = account.daily["pnl_amount"].iloc[-1] if not account.daily.empty else None
         asset_label = "客户权益" if account.key == "futures" else "总资产"
         ledger_start = _date(account.daily["date"].min())
-        rows = [
-            ("当日盈亏", f"{_signed_money(daily_pnl)}  {_signed_pct(daily_rate)}", _color(daily_pnl)),
-            ("累计盈亏（开户以来）", _signed_money(account.inception_pnl), _color(account.inception_pnl)),
-        ]
-        if account.pre_ledger_pnl:
-            rows += [
-                (f"其中建账前（至{_date(account.pre_ledger_through)[5:]}）", _signed_money(account.pre_ledger_pnl),
-                 _color(account.pre_ledger_pnl)),
-                ("其中建账后", _signed_money(account.cumulative_pnl), _color(account.cumulative_pnl)),
+        def amount_and_rate(amount, rate):
+            # 金额与收益率各按自身正负着色（期货可能盈利为正而按日复合收益率为负）。
+            return [
+                (_signed_money(amount), _color(amount), "home-card-amount"),
+                (_signed_pct(rate), _color(rate), "home-card-rate"),
             ]
-        rows.append((f"收益率（{ledger_start[5:]}起）", _signed_pct(cumulative_rate) or "-", _color(cumulative_rate)))
+
+        rows = [("当日盈亏", amount_and_rate(daily_pnl, daily_rate))]
+        if account.pre_ledger_pnl:
+            # 晚于开户建账：开户以来金额拆为建账前和建账后，收益率只覆盖建账后。
+            rows += [
+                ("累计盈亏（开户以来）",
+                 [(_signed_money(account.inception_pnl), _color(account.inception_pnl), "home-card-amount")]),
+                (f"其中建账前（至{_date(account.pre_ledger_through)[5:]}）",
+                 [(_signed_money(account.pre_ledger_pnl), _color(account.pre_ledger_pnl), "home-card-amount")]),
+                ("其中建账后", amount_and_rate(account.cumulative_pnl, cumulative_rate)),
+            ]
+        else:
+            rows.append(("累计盈亏", amount_and_rate(account.inception_pnl, cumulative_rate)))
         row_html = "".join(
-            f'<div class="home-card-row"><span>{html.escape(label)}</span>'
-            f'<span style="color:{color}">{html.escape(value)}</span></div>'
-            for label, value, color in rows
+            f'<div class="home-card-row"><span>{html.escape(label)}</span><span>'
+            + "".join(
+                f'<span class="{css}" style="color:{color}">{html.escape(text)}</span>'
+                for text, color, css in parts
+                if text
+            )
+            + "</span></div>"
+            for label, parts in rows
         )
         cards.append(
             '<div class="home-card">'
