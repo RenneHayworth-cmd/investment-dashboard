@@ -24,7 +24,7 @@ from core.ui import (
     filter_by_time_range,
     render_metric_grid,
 )
-from services.fund_analysis import FUND_ADJUST_NONE
+from services.live_price_history import load_live_price_histories
 from services.live_trading import (
     build_live_account_snapshot,
     build_live_daily_returns,
@@ -36,7 +36,6 @@ from services.live_trading import (
 from services.position_analysis import (
     filter_current_etf_realtime_quotes,
     latest_final_etf_trade_date,
-    load_or_fetch_etf,
     load_runtime_etf_quotes,
     refresh_runtime_etf_quotes,
 )
@@ -122,32 +121,14 @@ def _load_live_formal_histories(
             last_refresh_scope=st.session_state.get(scope_key),
         )
     )
-    histories: dict[str, pd.DataFrame] = {}
-    failures: list[str] = []
-    warnings: list[str] = []
-    complete = True
-    for symbol in symbols:
-        item = load_or_fetch_etf(
-            symbol,
-            api_key=api_key,
-            count=5000,
-            adjust=FUND_ADJUST_NONE,
-            allow_fetch=refresh_due,
-            force_refresh=False,
-            save_to_cache=save_to_cache,
-            market_now=market_now,
-        )
-        if item.dataframe is not None and not item.dataframe.empty:
-            histories[symbol] = item.dataframe
-        item_date = pd.to_datetime(item.latest_date, errors="coerce")
-        if item.error:
-            detail = f"{symbol}：{item.error}"
-            (failures if refresh_due else warnings).append(detail)
-        if pd.isna(item_date) or item_date.date() < target_date:
-            complete = False
-            warnings.append(
-                f"{symbol}：正式收盘最新到{item.latest_date or '-'}，目标为{target_date}"
-            )
+    # 只取账本所需区间：已清仓标的覆盖到清仓日即可，可转债走新浪日线并按面值补齐上市前日期。
+    histories, failures, warnings, complete = load_live_price_histories(
+        trades,
+        market_now=market_now,
+        allow_fetch=refresh_due,
+        save_to_cache=save_to_cache,
+        api_key=api_key,
+    )
     if refresh_due:
         st.session_state[attempt_key] = market_now.replace(tzinfo=None).isoformat()
         st.session_state[target_key] = str(target_date)

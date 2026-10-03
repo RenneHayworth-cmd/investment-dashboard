@@ -22,10 +22,10 @@ from components.live_record import (
     render_live_trade_form as _render_live_trade_form,
     render_live_trade_summary as _render_live_trade_summary,
 )
+from components.live_record.statement_import import render_statement_import
 from core.db import init_db
 from core.return_calendar import render_return_calendar
 from core.ui import apply_global_style, render_page_header
-from services.fund_analysis import FUND_ADJUST_NONE
 from services.live_trading import (
     add_live_trade,
     append_live_symbol_pnl_total,
@@ -42,7 +42,6 @@ from services.live_trading import (
     summarize_live_position_performance,
     summarize_live_trades,
 )
-from services.position_analysis import latest_final_etf_trade_date, load_or_fetch_etf
 
 
 st.set_page_config(page_title="ETF实盘", layout="wide")
@@ -115,19 +114,17 @@ def render_live_symbol_pnl_history() -> None:
     """只读本地正式收盘缓存渲染逐标的历史盈亏。"""
     _render_live_symbol_pnl_history(
         list_trades=list_live_trades,
-        load_etf=load_or_fetch_etf,
         build_history=build_live_symbol_pnl_history,
         append_total=append_live_symbol_pnl_total,
         render_history_table=render_live_symbol_history_table,
         market_now_provider=lambda: datetime.now(ZoneInfo("Asia/Shanghai")),
         api_key_provider=lambda: os.getenv("TICKFLOW_API_KEY", ""),
-        adjustment=FUND_ADJUST_NONE,
     )
 
 render_daily_close_pnl()
 
 st.subheader("实盘数据维护")
-trade_tab, cash_tab = st.tabs(["新增成交", "账户资金"])
+trade_tab, cash_tab, import_tab = st.tabs(["新增成交", "账户资金", "交割单导入"])
 with trade_tab:
     trades = list_live_trades()
     _render_live_trade_summary(trades, summarize_trades=summarize_live_trades)
@@ -144,4 +141,6 @@ with cash_tab:
         cash_flows,
         delete_cash_flow=delete_live_cash_flow,
     )
+with import_tab:
+    render_statement_import()
 render_live_symbol_pnl_history()

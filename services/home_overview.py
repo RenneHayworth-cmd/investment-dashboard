@@ -178,7 +178,11 @@ def combine_account_series(accounts: list[AccountSeries], *, start: object = Non
     合计序列截止到所有已开户账户都完成估值的最后一天，避免某个账本缺正式数据时
     把其余账本的收益当作全部收益。某账户中间缺一天时，它的盈亏会体现在下一个估值日。
     """
-    frames = [account.daily for account in accounts if not account.daily.empty]
+    frames = [
+        account.daily.assign(_opened_before=account.daily["date"].min())
+        for account in accounts
+        if not account.daily.empty
+    ]
     if not frames:
         return pd.DataFrame(columns=COMBINED_COLUMNS)
     end = min(frame["date"].max() for frame in frames)
@@ -187,8 +191,10 @@ def combine_account_series(accounts: list[AccountSeries], *, start: object = Non
     if start is not None:
         start = pd.Timestamp(start).normalize()
         stacked = stacked[stacked["date"].ge(start)].copy()
-        # 起算日收盘是合计净值的基准，当天已发生的盈亏属于起算之前。
-        stacked.loc[stacked["date"].eq(start), "pnl_amount"] = 0.0
+        # 起算日收盘是合计净值的基准：起算前已开户的账户，当天盈亏属于起算之前；
+        # 当天才开始估值的账户，首日盈亏来自建账后的变动，照常计入。
+        before_start = stacked["date"].eq(start) & stacked["_opened_before"].lt(start)
+        stacked.loc[before_start, "pnl_amount"] = 0.0
     if stacked.empty:
         return pd.DataFrame(columns=COMBINED_COLUMNS)
     pending = stacked["confirmation_status"].where(stacked["confirmation_status"].ne("正式"))
@@ -261,16 +267,12 @@ def load_account_overview(*, market_now: datetime) -> dict[str, object]:
     errors: dict[str, str] = {}
 
     try:
-        from services.fund_analysis import FUND_ADJUST_NONE
+        from services.live_price_history import load_live_price_histories
         from services.live_trading import build_live_account_snapshot, list_live_cash_flows, list_live_trades
-        from services.position_analysis import latest_final_etf_trade_date, load_or_fetch_etf
+        from services.position_analysis import latest_final_etf_trade_date
 
         trades = list_live_trades()
-        histories = {}
-        for symbol in sorted(trades["symbol"].dropna().astype(str).unique()) if not trades.empty else []:
-            item = load_or_fetch_etf(symbol, adjust=FUND_ADJUST_NONE, allow_fetch=False, save_to_cache=False)
-            if item.dataframe is not None and not item.dataframe.empty:
-                histories[symbol] = item.dataframe
+        histories, _failures, _warnings, _complete = load_live_price_histories(trades, market_now=market_now)
         snapshot = build_live_account_snapshot(
             trades,
             list_live_cash_flows(),

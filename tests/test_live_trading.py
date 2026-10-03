@@ -1013,7 +1013,7 @@ class LiveTradingTests(unittest.TestCase):
 
         self.assertIn('st.subheader("每日正式收盘盈亏")', dashboard_source)
         self.assertIn('["账户口径", "持仓口径"]', dashboard_source)
-        self.assertIn("adjust=FUND_ADJUST_NONE", dashboard_source)
+        self.assertIn("load_live_price_histories(", dashboard_source)
         self.assertIn("build_live_account_snapshot(", dashboard_source)
         self.assertIn("refresh_runtime_etf_quotes(", dashboard_source)
         self.assertIn("load_runtime_etf_quotes()", dashboard_source)
@@ -1063,7 +1063,7 @@ class LiveTradingTests(unittest.TestCase):
 
         self.assertIn('st.subheader("历史盈亏")', history_source)
         self.assertIn("build_history(all_trades, price_histories)", history_source)
-        self.assertIn("append_total(build_history", history_source)
+        self.assertIn("append_total(symbol_history)", history_source)
         self.assertIn("render_history_table(history_display)", history_source)
         self.assertIn("包含当前持仓和已清仓标的", history_source)
 

@@ -131,23 +131,19 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
                 "services.position_analysis.load_or_fetch_etf",
                 return_value=cached_item,
             ) as fetch_mock,
-            patch(
-                "components.live_record.dashboard.load_or_fetch_etf",
-                return_value=cached_item,
-            ) as dashboard_fetch_mock,
         ):
             app = AppTest.from_file(str(page_path), default_timeout=20).run()
 
         self.assertEqual(list(app.exception), [])
-        self.assertEqual(fetch_mock.call_count, 1)
-        self.assertEqual(dashboard_fetch_mock.call_count, 1)
+        # 账户估值与历史盈亏各读一次本地缓存，都不联网、不写缓存。
+        self.assertEqual(fetch_mock.call_count, 2)
         self.assertEqual(
-            [call.kwargs["allow_fetch"] for call in dashboard_fetch_mock.call_args_list],
-            [False],
+            [call.kwargs["allow_fetch"] for call in fetch_mock.call_args_list],
+            [False, False],
         )
         self.assertEqual(
             [call.kwargs["save_to_cache"] for call in fetch_mock.call_args_list],
-            [False],
+            [False, False],
         )
         realtime_mock.assert_called_once()
         self.assertEqual(realtime_mock.call_args.args[0], ["159501"])
@@ -207,7 +203,6 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
             patch("components.live_record.dashboard.list_live_cash_flows", return_value=cash_flows),
             patch("components.live_record.dashboard.live_close_refresh_due", return_value=False),
             patch("components.live_record.dashboard.refresh_runtime_etf_quotes", return_value={}),
-            patch("components.live_record.dashboard.load_or_fetch_etf", return_value=cached_item),
             patch("services.position_analysis.load_or_fetch_etf", return_value=cached_item),
         ):
             app = AppTest.from_file(str(page_path), default_timeout=20).run()

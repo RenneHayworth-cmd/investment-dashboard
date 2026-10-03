@@ -54,13 +54,12 @@ before a larger handoff or commit.
   reads the three ledgers with formal closes/settlements only (no network, no
   intraday quotes) and `components/home/` renders, caching results for five minutes.
   Combine by summing each day's P&L amounts and return denominators, stop at the
-  earliest latest valuation, and start at the ETF实盘 opening close (before it
-  only futures was recorded; 微盘实盘 capital comes out of ETF实盘). The opening
-  day is a baseline with zero combined P&L. Account cards keep their own start.
-  Pre-ledger stock P&L (opening to the ETF实盘 opening close = assets minus net
-  bank transfers) lives in the `live_pre_ledger_pnl` table, never in source; it
-  adds to the ETF card's since-opening P&L only. User decision 2026-10-02: the
-  9/3 LOF custody transfer-in counts as income, not new capital (as in Notion).
+  earliest latest valuation, and start at the ETF实盘 first valuation date
+  (微盘实盘 capital comes out of ETF实盘). On that start day, zero only the P&L of
+  accounts already valued before it. Account cards keep their own start. A ledger
+  that starts after account opening may store its pre-ledger P&L in the
+  `live_pre_ledger_pnl` table (never in source); ETF实盘 now starts at opening, so
+  that table is empty for it.
 - The `指数监控` page should show cached data first. User decision 2026-10-01:
   while this page is open, automatically refresh only S&P 500, Nasdaq Composite,
   and Nasdaq 100 card quotes every two minutes during US cash trading hours.
@@ -329,6 +328,23 @@ before a larger handoff or commit.
   execution, and no network request or result cache. Keep the start-date account
   value at 500,000 and NAV at 1 with setup fees disclosed separately; include
   later fees in daily P&L. Stop before the first incomplete formal session.
+- ETF实盘 is rebuilt from broker statements since stock-account opening (user
+  decision 2026-10-03): 华宝交割单 + 华宝资金明细 and 银河交割单, imported on the
+  page's `交割单导入` tab with a preview and explicit confirmation
+  (`services/live_statement_import.py`). Statement rows use `stmt:<broker>:` record
+  keys; re-importing a broker replaces only its statement rows inside the new
+  file's date range. Manual records are kept; a manual record exactly matching a
+  statement row is taken over and its strategy/notes are carried over. A-share
+  stocks stay in 微盘实盘 and are skipped. Repo and 金自来 principal stays cash with
+  pair income on the return date; LOF 申购 rows are buys and SH-LOF 调帐转入 is not
+  counted again; 资金明细 申购预扣款 rows are allocated to the later 转托转入 shares
+  as buys; convertible bonds use 张, IPO payment buys the listed code at face value.
+  Inter-broker custody moves are not booked. Each broker's preview must reconcile
+  ledger cash to statement cash plus open repo principal minus stock cash.
+  `services/live_price_history.py` loads closes only for each symbol's held window,
+  uses Sina daily bars for convertible bonds (face value before listing), and
+  carries the previous close over suspended sessions inside the available history.
+  The history section adds a category summary (ETF / LOF套利 / 可转债 / 现金管理).
 - The `实盘记录` page stores actual executions separately from simulated
   backtests in the local `live_trades` SQLite table. Treat `fee_rate_pct` as a
   percentage value, calculate position cost with fees included, and use moving

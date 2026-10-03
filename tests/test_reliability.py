@@ -318,8 +318,8 @@ class PageReliabilityTests(unittest.TestCase):
             root / "components" / "position" / "coordinator.py"
         ).read_text(encoding="utf-8")
         self.assertIn("FUND_ADJUSTMENT_OPTIONS", position_source)
-        live_source = (root / "pages" / "3_ETF实盘.py").read_text(encoding="utf-8")
-        self.assertIn("adjustment=FUND_ADJUST_NONE", live_source)
+        live_source = (root / "services" / "live_price_history.py").read_text(encoding="utf-8")
+        self.assertIn("adjust=FUND_ADJUST_NONE", live_source)
     def test_position_page_imports_realtime_timing_end_constant(self):
         source = (
             Path(__file__).parents[1]

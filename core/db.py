@@ -105,6 +105,18 @@ def init_db() -> None:
             ON live_cash_flows(flow_date, flow_time, id)
             """
         )
+        live_flow_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(live_cash_flows)")
+        }
+        if "record_key" not in live_flow_columns:
+            # 交割单导入的流水以 stmt: 开头，手工流水为空。
+            conn.execute("ALTER TABLE live_cash_flows ADD COLUMN record_key TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_live_cash_flows_record_key
+            ON live_cash_flows(record_key) WHERE record_key IS NOT NULL
+            """
+        )
         # The microcap live ledger is intentionally isolated from the ETF
         # live_trades/live_cash_flows tables and from all simulated accounts.
         conn.execute(

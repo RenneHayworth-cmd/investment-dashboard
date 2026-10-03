@@ -153,3 +153,13 @@ def test_home_page_renders_overview_without_network():
     assert [item.value for item in app.subheader] == ["总净值与每日盈亏", "总收益日历"]
     assert any("期货实盘读取失败" in item.value for item in app.warning)
     assert any("合计总资产" in item.value for item in app.markdown)
+
+
+def test_first_day_pnl_counts_for_an_account_starting_on_the_start_date():
+    etf = _account("etf", [("2025-11-21", 30.0, 500_000.0), ("2025-11-24", 10.0, 500_030.0)])
+    futures = _account("futures", [("2025-12-24", -2.0, 500.0)])
+
+    combined = combine_account_series([etf, futures], start=combined_start_date([etf, futures]))
+
+    assert combined.iloc[0]["pnl_amount"] == 30.0
+    assert combined["cumulative_pnl"].iloc[-1] == 40.0  # 期货 12/24 晚于各账户共同估值截止日
