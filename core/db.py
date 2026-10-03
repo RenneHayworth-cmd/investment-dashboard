@@ -390,6 +390,17 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS live_pre_ledger_pnl (
+                account TEXT PRIMARY KEY,
+                through_date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                notes TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS futures_daily_pnl_overrides (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trade_date TEXT NOT NULL UNIQUE,
