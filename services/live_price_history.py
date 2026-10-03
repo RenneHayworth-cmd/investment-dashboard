@@ -65,20 +65,48 @@ def _a_share_sessions(start: date, end: date) -> list[date]:
     return days
 
 
-def _fetch_bond_daily(symbol: str) -> pd.DataFrame:
+def _fetch_bond_daily(symbol: str, *, target_date: date | None = None) -> pd.DataFrame:
+    """可转债不复权日线：新浪 → 腾讯 → Wind，缺最新完成交易日时继续尝试下一个来源。"""
     import akshare as ak
 
+    from services.market_fallback import MarketSource, fetch_market_fallback, normalize_daily_prices
+
     prefix = "sh" if symbol.startswith("11") else "sz"
-    raw = ak.bond_zh_hs_cov_daily(symbol=f"{prefix}{symbol}")
-    if raw is None or raw.empty or "close" not in raw.columns:
-        raise ValueError(f"新浪可转债日线未返回 {symbol} 的数据")
-    frame = pd.DataFrame(
-        {
-            "date": pd.to_datetime(raw["date"], errors="coerce").dt.strftime("%Y-%m-%d"),
-            "price": pd.to_numeric(raw["close"], errors="coerce"),
-        }
+    sources = [
+        MarketSource("新浪可转债日线", lambda: ak.bond_zh_hs_cov_daily(symbol=f"{prefix}{symbol}")),
+        MarketSource(
+            "腾讯日线",
+            lambda: ak.stock_zh_a_hist_tx(symbol=f"{prefix}{symbol}", start_date="20000101",
+                                          end_date=pd.Timestamp.today().strftime("%Y%m%d"), adjust=""),
+        ),
+    ]
+    from services.wind_source import fetch_wind_daily_bars, wind_api_key
+
+    if wind_api_key():
+        wind_code = f"{symbol}.{'SH' if prefix == 'sh' else 'SZ'}"
+        end = target_date or date.today()
+        sources.append(
+            MarketSource("万得Wind", lambda: fetch_wind_daily_bars("stock_data", wind_code, end - timedelta(days=800), end))
+        )
+
+    def normalize(frame: pd.DataFrame) -> pd.DataFrame:
+        data = normalize_daily_prices(frame)
+        result = pd.DataFrame(
+            {
+                "date": pd.to_datetime(data["date"], errors="coerce"),
+                "close": pd.to_numeric(data["close"], errors="coerce"),
+            }
+        ).dropna()
+        return result[result["close"] > 0].sort_values("date").drop_duplicates("date", keep="last")
+
+    fetched = fetch_market_fallback(
+        sources, normalize, date_column="date", price_column="close", target_date=target_date
     )
-    return frame.dropna().drop_duplicates("date", keep="last")
+    if fetched is None or fetched.empty:
+        raise ValueError(f"可转债日线来源均未返回 {symbol} 的数据")
+    return pd.DataFrame(
+        {"date": pd.to_datetime(fetched["date"]).dt.strftime("%Y-%m-%d"), "price": fetched["close"].astype(float)}
+    )
 
 
 def load_bond_history(
@@ -99,7 +127,7 @@ def load_bond_history(
     covered = not history.empty and str(history["date"].max()) >= end.isoformat()
     if allow_fetch and not covered:
         try:
-            fetched = _fetch_bond_daily(symbol)
+            fetched = _fetch_bond_daily(symbol, target_date=completed_date)
             fetched = fetched[fetched["date"] <= completed_date.isoformat()]
             new_rows = fetched[~fetched["date"].isin(set(history["date"].astype(str)))]
             if not new_rows.empty:
@@ -111,7 +139,7 @@ def load_bond_history(
                 if save_to_cache:
                     save_dataset(_bond_cache_key(symbol), symbol, BOND_SOURCE, BOND_DATA_TYPE, history)
         except Exception as exc:  # 数据源失败时保留已有缓存
-            error = f"新浪可转债日线：{exc}"
+            error = f"可转债日线：{exc}"
     history["date"] = history["date"].astype(str)
     listed = history["date"].min() if not history.empty else None
     # 上市首日之前（或尚未上市）按面值估值，只用于计算，不写入缓存。

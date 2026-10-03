@@ -102,18 +102,28 @@ def quote_refresh_due(
     return age >= QUOTE_INTERVAL_SECONDS
 
 
-def _fetch_futures_quote(contract: str) -> dict[str, object]:
-    from services.futures_spread import _fetch_futures_spot_from_sina_direct
+def _wind_quote(wind_code: str | None, label: str) -> dict[str, object]:
+    from services.wind_source import WIND_SOURCE_LABEL, fetch_wind_quotes, wind_api_key
 
-    try:
-        spot = _fetch_futures_spot_from_sina_direct(contract)
-        source = "新浪期货实时"
-    except Exception:
-        import akshare as ak
-        from services.futures_spread import _spot_market_for_contract
+    if not wind_code or not wind_api_key():
+        raise ValueError(f"{label}没有可用的万得Wind代码或未配置Key")
+    frame = fetch_wind_quotes("index_data", [wind_code])
+    if frame.empty:
+        raise ValueError(f"万得Wind未返回 {wind_code} 的实时行情")
+    row = frame.iloc[0]
+    price = pd.to_numeric(row.get("price"), errors="coerce")
+    if pd.isna(price) or float(price) <= 0:
+        raise ValueError(f"万得Wind {wind_code} 实时价无效")
+    stamp = pd.to_datetime(row.get("quote_time"), errors="coerce")
+    return {
+        "price": float(price),
+        "quote_date": pd.Timestamp(row.get("trade_date")) if pd.notna(row.get("trade_date")) else pd.NaT,
+        "quote_time": "" if pd.isna(stamp) else stamp.strftime("%H:%M:%S"),
+        "source": WIND_SOURCE_LABEL,
+    }
 
-        spot = ak.futures_zh_spot(symbol=contract, market=_spot_market_for_contract(contract), adjust="0")
-        source = "AkShare期货实时"
+
+def _spot_frame_quote(spot: pd.DataFrame, source: str) -> dict[str, object]:
     if spot is None or spot.empty:
         raise ValueError("实时接口未返回数据")
     row = spot.iloc[0]
@@ -129,18 +139,55 @@ def _fetch_futures_quote(contract: str) -> dict[str, object]:
     return {"price": float(price), "quote_date": quote_date, "quote_time": quote_time, "source": source}
 
 
-def _fetch_option_quote(contract: str, market_now: datetime) -> dict[str, object]:
-    from services.futures_options_analysis import append_option_spot_row
+def _fetch_futures_quote(contract: str) -> dict[str, object]:
+    """期货合约实时价：新浪直连 → AkShare → 万得Wind，依次尝试直到拿到有效价格。"""
+    from services.futures_spread import _fetch_futures_spot_from_sina_direct, _spot_market_for_contract
+    from services.wind_source import wind_futures_contract_code
 
-    yesterday = pd.Timestamp(market_now.date()) - pd.Timedelta(days=1)
-    seed = pd.DataFrame({"date": [yesterday], "close": [float("nan")]})
-    result = append_option_spot_row(seed, contract, replace_current_day=True, market_now=market_now)
-    today = result[pd.to_datetime(result["date"], errors="coerce").dt.normalize().eq(pd.Timestamp(market_now.date()))]
-    price = pd.to_numeric(today["close"], errors="coerce").dropna() if not today.empty else pd.Series(dtype=float)
-    if price.empty or float(price.iloc[-1]) <= 0:
-        raise ValueError("新浪期权链未返回当日价格")
-    return {"price": float(price.iloc[-1]), "quote_date": pd.Timestamp(market_now.date()), "quote_time": "",
-            "source": "新浪期权实时"}
+    def akshare_spot() -> pd.DataFrame:
+        import akshare as ak
+
+        return ak.futures_zh_spot(symbol=contract, market=_spot_market_for_contract(contract), adjust="0")
+
+    errors = []
+    for source, fetch in (("新浪期货实时", lambda: _fetch_futures_spot_from_sina_direct(contract)),
+                          ("AkShare期货实时", akshare_spot)):
+        try:
+            return _spot_frame_quote(fetch(), source)
+        except Exception as exc:
+            errors.append(f"{source}：{exc}")
+    try:
+        return _wind_quote(wind_futures_contract_code(contract), contract)
+    except Exception as exc:
+        errors.append(f"万得Wind：{exc}")
+    raise ValueError("；".join(errors))
+
+
+def _fetch_option_quote(contract: str, market_now: datetime) -> dict[str, object]:
+    """期权实时价：新浪期权链 → 万得Wind。"""
+    from services.futures_options_analysis import append_option_spot_row
+    from services.wind_source import wind_option_contract_code
+
+    errors = []
+    try:
+        yesterday = pd.Timestamp(market_now.date()) - pd.Timedelta(days=1)
+        seed = pd.DataFrame({"date": [yesterday], "close": [float("nan")]})
+        result = append_option_spot_row(seed, contract, replace_current_day=True, market_now=market_now)
+        today = result[
+            pd.to_datetime(result["date"], errors="coerce").dt.normalize().eq(pd.Timestamp(market_now.date()))
+        ]
+        price = pd.to_numeric(today["close"], errors="coerce").dropna() if not today.empty else pd.Series(dtype=float)
+        if price.empty or float(price.iloc[-1]) <= 0:
+            raise ValueError("新浪期权链未返回当日价格")
+        return {"price": float(price.iloc[-1]), "quote_date": pd.Timestamp(market_now.date()), "quote_time": "",
+                "source": "新浪期权实时"}
+    except Exception as exc:
+        errors.append(f"新浪期权链：{exc}")
+    try:
+        return _wind_quote(wind_option_contract_code(contract), contract)
+    except Exception as exc:
+        errors.append(f"万得Wind：{exc}")
+    raise ValueError("；".join(errors))
 
 
 def fetch_futures_live_quotes(

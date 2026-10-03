@@ -346,7 +346,8 @@ before a larger handoff or commit.
   Inter-broker custody moves are not booked. Each broker's preview must reconcile
   ledger cash to statement cash plus open repo principal minus stock cash.
   `services/live_price_history.py` loads closes only for each symbol's held window,
-  uses Sina daily bars for convertible bonds (face value before listing), and
+  uses Sina → Tencent → Wind daily bars for convertible bonds (face value before
+  listing), and
   carries the previous close over suspended sessions inside the available history.
   The history section adds a category summary (ETF / LOF套利 / 可转债 / 现金管理).
 - The `实盘记录` page stores actual executions separately from simulated
@@ -400,8 +401,10 @@ before a larger handoff or commit.
   fragment fetches live prices for held contracts only during their futures
   sessions (CFFEX 9:30-11:30/13:00-15:00; commodities 9:00-10:15/10:30-11:30/
   13:30-15:00 plus night sessions, which belong to the next trading day and
-  are suspended before holidays). Futures use Sina direct then AkShare spot;
-  options use the Sina option chain. Reject quotes from another trading day;
+  are suspended before holidays). Futures use Sina direct → AkShare spot →
+  Wind; options use the Sina option chain → Wind (`wind_option_contract_code`,
+  e.g. `I2701-P-700.DCE`, `MO2612-P-6000.CFE`). Formal option daily closes use
+  Sina, then Wind when Sina fails or lags the target session. Reject quotes from another trading day;
   when a whole round fails, retry no sooner than ten minutes. Estimate the day's
   mark-to-market P&L as (live − latest formal settlement) × quantity ×
   multiplier and add it to the latest settlement equity. Keep the last quote

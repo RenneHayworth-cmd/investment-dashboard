@@ -267,8 +267,30 @@ def wind_futures_contract_code(contract: str) -> str | None:
     return f"{prefix}{month}.{wind_exchange}"
 
 
+_CFFEX_OPTION_PREFIXES = {"MO", "IO", "HO"}
+
+
+def wind_option_contract_code(contract: str) -> str | None:
+    """期权合约转 Wind 代码：``I2701P700`` -> ``I2701-P-700.DCE``，``MO2612P6000`` -> ``MO2612-P-6000.CFE``。"""
+    text = re.sub(r"[-_\s]", "", str(contract).strip().split(".")[0]).upper()
+    matched = re.fullmatch(r"([A-Z]+)(\d{3,4})([CP])(\d+(?:\.\d+)?)", text)
+    if matched is None:
+        return None
+    prefix, month, option_type, strike = matched.groups()
+    if prefix in _CFFEX_OPTION_PREFIXES:
+        exchange = "CFE"
+    else:
+        underlying = wind_futures_contract_code(f"{prefix}{month}")
+        if underlying is None:
+            return None
+        exchange = underlying.rsplit(".", 1)[1]
+        if exchange == "CZC" and len(month) == 4:
+            month = month[1:]
+    return f"{prefix}{month}-{option_type}-{strike}.{exchange}"
+
+
 __all__ = [
     "WIND_API_KEY_ENV", "WIND_SOURCE_LABEL", "WindSourceError", "wind_api_key", "wind_available",
     "reset_wind_cooldown", "fetch_wind_quotes", "fetch_wind_daily_bars", "wind_stock_code",
-    "wind_futures_contract_code",
+    "wind_futures_contract_code", "wind_option_contract_code",
 ]

@@ -21,6 +21,42 @@ from services.futures_live_repository import list_futures_live_trades, load_dail
 from services.futures_live_settlements import _update_position_settlements
 from services.futures_live_statement_parser import _date_text, _number
 
+def _fetch_option_daily(contract: str, target_date: str, market_now: datetime | None) -> tuple[pd.DataFrame, str]:
+    """期权合约日线：新浪 → 万得Wind；新浪失败或未覆盖目标交易日时改用 Wind。"""
+    errors: list[str] = []
+    sina_data: pd.DataFrame | None = None
+    try:
+        data, source, is_chain = fetch_option_from_akshare(
+            normalize_option_symbol(contract),
+            "1d",
+            5000,
+            prefer_realtime_snapshot=False,
+            market_now=market_now,
+        )
+        if is_chain:
+            raise RuntimeError("期权行情返回了期权链而不是合约日线。")
+        sina_data = data
+        latest = _date_text(pd.to_datetime(data["date"], errors="coerce").max()) if not data.empty else ""
+        if latest and latest >= target_date:
+            return data, source
+        errors.append(f"新浪期权日线最新到{latest or '-'}")
+    except Exception as exc:
+        errors.append(f"新浪期权日线：{exc}")
+    from services.wind_source import fetch_wind_daily_bars, wind_api_key, wind_option_contract_code
+
+    wind_code = wind_option_contract_code(contract)
+    if wind_code and wind_api_key():
+        try:
+            end = pd.Timestamp(target_date)
+            bars = fetch_wind_daily_bars("index_data", wind_code, end - pd.Timedelta(days=800), end)
+            return bars[["date", "close"]], "万得Wind期权日线"
+        except Exception as exc:
+            errors.append(f"万得Wind：{exc}")
+    if sina_data is not None and not sina_data.empty:
+        return sina_data, "AkShare/新浪期权日线（未覆盖目标日）"
+    raise RuntimeError("；".join(errors))
+
+
 def _save_daily_close_frame(
     asset_type: str,
     contract: str,
@@ -85,16 +121,7 @@ def update_position_daily_closes(
             continue
         try:
             if asset_type == "期权":
-                option_symbol = normalize_option_symbol(contract)
-                data, source, is_chain = fetch_option_from_akshare(
-                    option_symbol,
-                    "1d",
-                    5000,
-                    prefer_realtime_snapshot=False,
-                    market_now=market_now,
-                )
-                if is_chain:
-                    raise RuntimeError("期权行情返回了期权链而不是合约日线。")
+                data, source = _fetch_option_daily(contract, target, market_now)
             else:
                 data = fetch_futures_daily(
                     contract,
@@ -216,15 +243,7 @@ def update_traded_contract_daily_closes(
             continue
         try:
             if asset_type == "期权":
-                data, source, is_chain = fetch_option_from_akshare(
-                    normalize_option_symbol(contract),
-                    "1d",
-                    5000,
-                    prefer_realtime_snapshot=False,
-                    market_now=market_now,
-                )
-                if is_chain:
-                    raise RuntimeError("期权行情返回了期权链而不是合约日线。")
+                data, source = _fetch_option_daily(contract, str(requirement["target_date"]), market_now)
             else:
                 data = fetch_futures_daily(
                     contract,
