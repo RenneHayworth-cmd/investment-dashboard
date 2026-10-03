@@ -10,7 +10,7 @@ from streamlit.testing.v1 import AppTest
 from services.position_analysis import PositionItem, PositionTimingPerformanceResult
 
 
-PAGE = Path(__file__).parents[1] / "pages" / "5_持仓分析.py"
+PAGE = Path(__file__).parents[1] / "pages" / "2_持仓分析.py"
 
 
 def _item(

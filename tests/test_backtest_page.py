@@ -9,7 +9,7 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 
-PAGE = Path(__file__).parents[1] / "pages" / "3_策略回测.py"
+PAGE = Path(__file__).parents[1] / "pages" / "7_策略回测.py"
 NETWORK_CALLS = (
     "components.backtest.ma_timing.fetch_backtest_fund_close",
     "components.backtest.portfolio_timing.fetch_backtest_fund_close",

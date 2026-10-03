@@ -386,7 +386,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
     def test_position_page_uses_one_week_operation_guidance(self):
         root = Path(__file__).parents[1]
-        page_source = (root / "pages" / "5_持仓分析.py").read_text(
+        page_source = (root / "pages" / "2_持仓分析.py").read_text(
             encoding="utf-8"
         )
         realtime_source = (root / "components" / "position" / "realtime.py").read_text(
@@ -551,7 +551,7 @@ class PositionAnalysisTests(unittest.TestCase):
 
     def test_position_page_stays_clear_while_data_is_loading(self):
         root = Path(__file__).parents[1]
-        page_source = (root / "pages" / "5_持仓分析.py").read_text(
+        page_source = (root / "pages" / "2_持仓分析.py").read_text(
             encoding="utf-8"
         )
         cards_source = (

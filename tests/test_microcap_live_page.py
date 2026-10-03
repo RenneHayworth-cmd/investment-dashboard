@@ -15,7 +15,7 @@ class MicrocapLivePageTests(unittest.TestCase):
     def test_empty_page_loads_without_market_network_or_etf_ledger_access(self):
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         with (
             patch("core.db.DB_PATH", database_path),
             patch("core.db.ensure_dirs"),
@@ -45,7 +45,7 @@ class MicrocapLivePageTests(unittest.TestCase):
 
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         with (
             patch("core.db.DB_PATH", database_path),
@@ -78,7 +78,7 @@ class MicrocapLivePageTests(unittest.TestCase):
 
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         with (
             patch("core.db.DB_PATH", database_path),
             patch("core.db.ensure_dirs"),
@@ -135,7 +135,7 @@ class MicrocapLivePageTests(unittest.TestCase):
     def test_rotation_tab_lists_out_and_new_names_without_network(self):
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         with (
             patch("core.db.DB_PATH", database_path),
             patch("core.db.ensure_dirs"),
@@ -164,7 +164,7 @@ class MicrocapLivePageTests(unittest.TestCase):
     def test_rotation_realtime_button_ranks_without_saving_snapshot(self):
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         live = self._rotation_snapshots(today).rename(columns={"快照日期": "日期", "快照时间": "更新时间"})
         with (
@@ -194,7 +194,7 @@ class MicrocapLivePageTests(unittest.TestCase):
     def test_rotation_realtime_flags_delayed_quotes(self):
         temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         live = self._rotation_snapshots(today).rename(columns={"快照日期": "日期", "快照时间": "更新时间"})
         live.attrs.update(source_hosts=["push2delay.eastmoney.com"], delayed=True, quote_time=f"{today} 14:41:00")
@@ -241,7 +241,7 @@ class MicrocapLiveLunchValuationTests(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         database_path = Path(temp_dir.name) / "cache.db"
-        page_path = Path(__file__).parents[1] / "pages" / "11_微盘实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "4_微盘实盘.py"
         quotes = {"600000": {"price": quote_price, "quote_time": now.replace(hour=11, minute=30), "source": "测试报价", "status": "实时"}}
         with patch("core.db.DB_PATH", database_path), patch("core.db.ensure_dirs"):
             init_db()

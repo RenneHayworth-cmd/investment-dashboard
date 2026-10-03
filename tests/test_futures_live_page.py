@@ -8,7 +8,7 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 
-PAGE = Path(__file__).parents[1] / "pages" / "12_期货实盘.py"
+PAGE = Path(__file__).parents[1] / "pages" / "5_期货实盘.py"
 TARGET_DATE = "2026-08-21"
 ACCOUNT = pd.Series(
     {
@@ -147,6 +147,7 @@ class FuturesLivePageSmokeTests(unittest.TestCase):
                 "数据更新",
                 "当前持仓盈亏",
                 "账户盈亏趋势",
+                "策略收益分析",
                 "历史盈亏",
                 "资金流水明细",
                 "成交明细",

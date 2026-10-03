@@ -36,6 +36,11 @@ from services.index_realtime import (
     save_futures_main_contract_names,
 )
 from services.market_calendar import MARKET_WINDOWS, is_market_trading_day, latest_completed_trade_date
+from services.index_us_refresh import (
+    US_QUOTE_REFRESH_SECONDS,
+    refresh_us_index_quotes,
+    remember_us_manual_refresh,
+)
 from services.taoxi_microcap_index import load_taoxi_constituents, load_taoxi_history, load_taoxi_quality
 from services.update_tasks import (
     enrich_index_report_indicators,
@@ -724,8 +729,22 @@ def build_manual_realtime_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
     return apply_realtime_quotes_to_summary(summary_df, display_quotes)
 
 
+@st.fragment(run_every=f"{US_QUOTE_REFRESH_SECONDS}s")
 def render_manual_index_cards(summary_df: pd.DataFrame) -> None:
-    render_index_cards(build_manual_realtime_summary(summary_df))
+    cards = st.empty()
+    with cards.container():
+        render_index_cards(build_manual_realtime_summary(summary_df))
+    result = refresh_us_index_quotes(now=datetime.now(ZoneInfo("Asia/Shanghai")))
+    if result.quotes:
+        st.session_state.index_realtime_quote_cache = load_runtime_realtime_quotes(
+            st.session_state.get("index_realtime_quote_cache", {})
+        )
+        with cards.container():
+            render_index_cards(build_manual_realtime_summary(summary_df))
+    if result.errors:
+        st.warning("美股自动报价暂不可用，保留上次有效数据，失败品种十分钟后重试：" + " | ".join(
+            f"{name}：{message}" for name, message in sorted(result.errors.items())
+        ))
 
 
 def build_freshness_items(summary_df: pd.DataFrame) -> list[dict]:
@@ -864,7 +883,7 @@ with st.sidebar:
         placeholder="可选；留空使用免费历史数据或环境变量",
     )
     update_clicked = st.button("更新指数数据", type="primary")
-    st.caption("每天15:10、16:10自动补齐正式日线；本页只监听本地缓存并自动重绘。手动更新按各市场交易时段获取报价，午休成功后复用，收盘后仅补正式数据缺口。")
+    st.caption("标普500、纳斯达克综合、纳斯达克100在美股交易时段每两分钟刷新；VIX及其他市场保留手动更新。正式日线仍由15:10、16:10任务补齐。")
 
 notice = st.session_state.pop("index_update_notice", None)
 if notice:
@@ -891,6 +910,7 @@ if update_clicked:
         quote_errors.setdefault(name, "未取得当前市场交易日的有效报价，保留上次有效数据")
     if quotes:
         remember_runtime_realtime_quotes(quotes)
+        remember_us_manual_refresh(quotes, now=update_now)
         stored_quotes = dict(st.session_state.get("index_realtime_quote_cache", {}))
         stored_quotes.update(quotes)
         st.session_state.index_realtime_quote_cache = stored_quotes

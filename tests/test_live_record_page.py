@@ -8,10 +8,23 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
+from components.live_record.account import _sort_by_market_value
 from components.live_record.dashboard import _load_shared_position_quotes
 
 
 class LiveRecordPageSmokeTests(unittest.TestCase):
+    def test_positions_default_to_market_value_descending(self):
+        positions = pd.DataFrame(
+            {
+                "symbol": ["159501", "161125", "512890", "513880"],
+                "market_value": [500.0, None, 3000.0, 400.0],
+            }
+        )
+
+        ordered = _sort_by_market_value(positions)
+
+        self.assertEqual(ordered["symbol"].tolist(), ["512890", "159501", "513880", "161125"])
+
     def test_shared_holdings_quotes_merge_process_and_session_state(self):
         market_now = datetime(2026, 8, 31, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         process_quotes = {
@@ -44,7 +57,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertEqual(result["510500"]["price"], 6.1)
 
     def test_default_empty_render_is_cache_first_and_never_fetches(self):
-        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "3_ETF实盘.py"
         with (
             patch.dict("os.environ", {"TICKFLOW_API_KEY": "test_key"}),
             patch("core.db.init_db"),
@@ -78,7 +91,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertNotIn("实时行情", [item.label for item in app.expander])
 
     def test_cached_holding_render_keeps_both_price_reads_network_disabled(self):
-        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "3_ETF实盘.py"
         trades = pd.DataFrame(
             [
                 {
@@ -140,7 +153,7 @@ class LiveRecordPageSmokeTests(unittest.TestCase):
         self.assertEqual(realtime_mock.call_args.args[0], ["159501"])
 
     def test_initialized_account_renders_summary_chart_and_detail_tabs(self):
-        page_path = Path(__file__).parents[1] / "pages" / "10_ETF实盘.py"
+        page_path = Path(__file__).parents[1] / "pages" / "3_ETF实盘.py"
         trades = pd.DataFrame(
             [
                 {

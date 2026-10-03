@@ -28,6 +28,7 @@ from components.futures_live import (
     run_session_auto_refresh,
 )
 from core.db import init_db
+from components.futures_live.strategy import render_strategy_analysis
 from core.ui import apply_global_style, render_page_header
 from services import futures_live_trading as futures_live
 
@@ -83,6 +84,7 @@ render_refresh_status(close_daily_pnl, settlement_daily_pnl)
 render_option_expiry()
 render_current_positions()
 render_account_trend(close_daily_pnl, settlement_daily_pnl)
+render_strategy_analysis(close_daily_pnl, settlement_daily_pnl)
 render_daily_pnl_override_form()
 render_daily_pnl_reconciliation()
 render_contract_history()

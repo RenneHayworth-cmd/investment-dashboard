@@ -307,10 +307,10 @@ class PageReliabilityTests(unittest.TestCase):
     def test_analysis_pages_use_explicit_adjustment_labels_and_live_none(self):
         root = Path(__file__).parents[1]
         for page_name in (
-            "2_A股分析.py",
-            "3_策略回测.py",
-            "4_相关性分析.py",
-            "8_美股分析.py",
+            "6_A股分析.py",
+            "7_策略回测.py",
+            "8_相关性分析.py",
+            "11_美股分析.py",
         ):
             source = (root / "pages" / page_name).read_text(encoding="utf-8")
             self.assertIn("FUND_ADJUSTMENT_OPTIONS", source)
@@ -318,7 +318,7 @@ class PageReliabilityTests(unittest.TestCase):
             root / "components" / "position" / "coordinator.py"
         ).read_text(encoding="utf-8")
         self.assertIn("FUND_ADJUSTMENT_OPTIONS", position_source)
-        live_source = (root / "pages" / "10_ETF实盘.py").read_text(encoding="utf-8")
+        live_source = (root / "pages" / "3_ETF实盘.py").read_text(encoding="utf-8")
         self.assertIn("adjustment=FUND_ADJUST_NONE", live_source)
     def test_position_page_imports_realtime_timing_end_constant(self):
         source = (
@@ -335,8 +335,8 @@ class PageReliabilityTests(unittest.TestCase):
 
     def test_analysis_pages_keep_last_source_in_session_state(self):
         root = Path(__file__).parents[1]
-        a_share = (root / "pages" / "2_A股分析.py").read_text(encoding="utf-8")
-        us_stock = (root / "pages" / "8_美股分析.py").read_text(encoding="utf-8")
+        a_share = (root / "pages" / "6_A股分析.py").read_text(encoding="utf-8")
+        us_stock = (root / "pages" / "11_美股分析.py").read_text(encoding="utf-8")
 
         self.assertIn('analysis_state_key = "a_share_analysis_source"', a_share)
         self.assertIn('analysis_state_key = "us_stock_analysis_source"', us_stock)
@@ -344,7 +344,7 @@ class PageReliabilityTests(unittest.TestCase):
         self.assertIn("if save_to_cache and fresh_analysis", us_stock)
 
     def test_a_share_analysis_exports_every_chart_and_table(self):
-        source = (Path(__file__).parents[1] / "pages" / "2_A股分析.py").read_text(encoding="utf-8")
+        source = (Path(__file__).parents[1] / "pages" / "6_A股分析.py").read_text(encoding="utf-8")
 
         self.assertIn('"toImageButtonOptions"', source)
         self.assertIn('f"{download_name}_走势分析"', source)

@@ -1,6 +1,6 @@
 # 持仓分析 Web
 
-只增加 `pages/5_持仓分析.py` 对应的观察池与模拟策略 Web 入口。Streamlit
+只增加 `pages/2_持仓分析.py` 对应的观察池与模拟策略 Web 入口。Streamlit
 页面保留；没有迁移 ETF/期货真实账户记录。后端导入原仓库 services，
 不包含第二份 MA、仓位、512890 或收益算法。
 

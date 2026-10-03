@@ -18,6 +18,13 @@ def _value(value: object, *, suffix: str = "", digits: int = 2) -> str:
     return f"{float(value):,.{digits}f}{suffix}"
 
 
+def _sort_by_market_value(positions: pd.DataFrame) -> pd.DataFrame:
+    """持仓表默认按市值从大到小排列；缺市值的行排在最后。"""
+    if "market_value" not in positions.columns:
+        return positions
+    order = pd.to_numeric(positions["market_value"], errors="coerce")
+    return positions.loc[order.sort_values(ascending=False, na_position="last", kind="stable").index]
+
 def _pnl_color(value: object) -> str:
     return pnl_color(value, up=UP_TEXT_COLOR, down=DOWN_TEXT_COLOR, flat=NEUTRAL_TEXT_COLOR)
 
@@ -218,10 +225,11 @@ def render_live_account_section(
         else:
             summary = dict(snapshot.get("summary") or {})
             total_assets = summary.get("total_assets")
+            ordered = _sort_by_market_value(positions)
             try:
-                render_positions(positions, total_assets=total_assets)
+                render_positions(ordered, total_assets=total_assets)
             except TypeError:
-                render_positions(positions)
+                render_positions(ordered)
             st.caption(
                 "盘中使用“持仓分析”同一套共享行情刷新器；未覆盖标的回退最近正式收盘，"
                 "并在行情状态中标注。实时行情仅用于当前估值，不写入正式历史，也不影响"

@@ -983,7 +983,7 @@ class LiveTradingTests(unittest.TestCase):
 
     def test_live_page_renders_close_based_pnl_curve(self):
         root = Path(__file__).parents[1]
-        page_source = (root / "pages" / "10_ETF实盘.py").read_text(encoding="utf-8")
+        page_source = (root / "pages" / "3_ETF实盘.py").read_text(encoding="utf-8")
         dashboard_source = (root / "components" / "live_record" / "dashboard.py").read_text(
             encoding="utf-8"
         )
