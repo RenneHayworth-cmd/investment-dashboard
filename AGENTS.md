@@ -288,6 +288,10 @@ before a larger handoff or commit.
   at or after the market close. Apply the same incremental cache rules;
   intraday card quotes remain in the TickFlow batch when available. If TickFlow
   omits 161128, use its same-day Sina snapshot as an intraday-only fallback.
+  ETF/LOF intraday quotes (user decision 2026-10-03) fall back in order
+  TickFlow → Tencent batch (`qt.gtimg.cn`, same-day rows with volume) → Sina
+  batch → Wind, each step only for codes still missing; without a TickFlow key
+  the chain starts at Tencent. All sources accept same-day quotes only.
   Spread and option updates
   reuse current formal caches on initial automatic loads and explicit load-button
   refreshes; force realtime previews only during A-share quote hours. Its bottom summary table contains ETFs/LOFs only and follows the index
@@ -392,6 +396,18 @@ before a larger handoff or commit.
   the total row's trade-date and valuation-date cells blank, center the table,
   and style the total row like the current-position total row.
 - The `期货实盘` page is separate from ETF `实盘记录`.
+  Intraday preview (user decision 2026-10-03): while the page is open, a 120s
+  fragment fetches live prices for held contracts only during their futures
+  sessions (CFFEX 9:30-11:30/13:00-15:00; commodities 9:00-10:15/10:30-11:30/
+  13:30-15:00 plus night sessions, which belong to the next trading day and
+  are suspended before holidays). Futures use Sina direct then AkShare spot;
+  options use the Sina option chain. Reject quotes from another trading day;
+  when a whole round fails, retry no sooner than ten minutes. Estimate the day's
+  mark-to-market P&L as (live − latest formal settlement) × quantity ×
+  multiplier and add it to the latest settlement equity. Keep the last quote
+  after the close until that trading date's settlement is saved. Quotes stay in
+  session state only and never feed caches, curves, calendars or strategy views
+  (`services/futures_live_realtime.py`, `components/futures_live/realtime.py`).
   Strategy analysis (user decision 2026-10-02) shows a P&L table and selectable
   cumulative monetary P&L curves for 铁矿石滚贴水, 铁矿石跨期, IM跨期 and
   中证1000卖Put. Iron-ore short puts, assignment and subsequent directional

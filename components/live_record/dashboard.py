@@ -71,7 +71,8 @@ def _refresh_shared_position_quotes(
     market_now: datetime,
 ) -> str:
     """Refresh open ETFs through the holdings-page scheduler and shared cache."""
-    if not str(api_key or "").strip() or trades is None or trades.empty:
+    # 没有 TickFlow Key 时由腾讯、新浪、Wind 备用源提供报价。
+    if trades is None or trades.empty:
         return ""
     positions = build_live_positions(trades)
     if positions.empty:

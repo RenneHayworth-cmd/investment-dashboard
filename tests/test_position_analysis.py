@@ -873,12 +873,14 @@ class PositionAnalysisTests(unittest.TestCase):
         self.assertEqual(state["last_success_band"], "午间")
         self.assertEqual(state["last_success_trade_date"], "2026-07-15")
 
-    @patch("services.position_analysis._fetch_sina_exchange_fund_quote")
+    @patch("services.position_runtime._fetch_tencent_fund_quotes", return_value=({}, "腾讯实时行情：无报价"))
+    @patch("services.position_runtime.fetch_sina_exchange_fund_quotes")
     @patch("tickflow.TickFlow")
     def test_fetch_tickflow_etf_quotes_uses_sina_when_lof_is_missing(
         self,
         tickflow_mock,
-        sina_quote_mock,
+        sina_quotes_mock,
+        tencent_mock,
     ):
         market_now = datetime(
             2026, 8, 4, 10, 30, tzinfo=ZoneInfo("Asia/Shanghai")
@@ -894,13 +896,18 @@ class PositionAnalysisTests(unittest.TestCase):
                 }
             ]
         )
-        sina_quote_mock.return_value = {
-            "symbol": "161128.SZ",
-            "price": 6.815,
-            "previous_close": 6.770,
-            "change_pct": 0.6647,
-            "quote_time": market_now,
-        }
+        sina_quotes_mock.return_value = (
+            {
+                "161128": {
+                    "symbol": "161128.SZ",
+                    "price": 6.815,
+                    "previous_close": 6.770,
+                    "change_pct": 0.6647,
+                    "quote_time": market_now,
+                }
+            },
+            "",
+        )
 
         quotes = fetch_tickflow_etf_quotes(
             ["512890", "161128"],
@@ -909,10 +916,8 @@ class PositionAnalysisTests(unittest.TestCase):
         )
 
         self.assertEqual(set(quotes), {"512890", "161128"})
-        sina_quote_mock.assert_called_once_with(
-            symbol="161128.SZ",
-            market_now=market_now,
-        )
+        tencent_mock.assert_called_once_with(["161128.SZ"], market_now=market_now)
+        sina_quotes_mock.assert_called_once_with(["161128.SZ"], market_now=market_now)
 
     def test_apply_etf_realtime_quote_updates_card_only(self):
         cached_data = pd.DataFrame({"date": pd.to_datetime(["2026-07-14"]), "price": [1.1]})

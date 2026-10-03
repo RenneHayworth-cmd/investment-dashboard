@@ -183,6 +183,8 @@ def test_etf_quotes_fall_back_to_wind_when_tickflow_raises(wind_key):
     frame = pd.DataFrame([{"wind_code": "510500.SH", "trade_date": date(2026, 9, 30),
                            "quote_time": pd.Timestamp("2026-09-30T10:00:00+08:00"), "price": 7.472, "previous_close": 7.476}])
     with patch.object(runtime, "_tickflow_quote_client", return_value=client), \
+         patch.object(runtime, "_fetch_tencent_fund_quotes", return_value=({}, "腾讯实时行情：无报价")), \
+         patch.object(runtime, "fetch_sina_exchange_fund_quotes", return_value=({}, "新浪财经：无报价")), \
          patch("services.wind_source.fetch_wind_quotes", return_value=frame) as fetch:
         quotes = runtime.fetch_tickflow_etf_quotes(["510500"], api_key="key", market_now=datetime(2026, 9, 30, 10, 1, tzinfo=TZ))
     fetch.assert_called_once_with("fund_data", ["510500.SH"])
@@ -196,8 +198,10 @@ def test_etf_quote_error_names_every_failed_source(wind_key):
     client = Mock()
     client.quotes.get.side_effect = RuntimeError("tickflow down")
     with patch.object(runtime, "_tickflow_quote_client", return_value=client), \
+         patch.object(runtime, "_fetch_tencent_fund_quotes", return_value=({}, "腾讯实时行情：无报价")), \
+         patch.object(runtime, "fetch_sina_exchange_fund_quotes", return_value=({}, "新浪财经：无报价")), \
          patch("services.wind_source.fetch_wind_quotes", side_effect=wind.WindSourceError("万得Wind请求失败")):
-        with pytest.raises(ValueError, match="TickFlow：tickflow down；万得Wind"):
+        with pytest.raises(ValueError, match="TickFlow：tickflow down；腾讯实时行情：无报价；新浪财经：无报价；万得Wind"):
             runtime.fetch_tickflow_etf_quotes(["510500"], api_key="key", market_now=datetime(2026, 9, 30, 10, 1, tzinfo=TZ))
 
 

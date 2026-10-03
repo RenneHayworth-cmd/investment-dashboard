@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 from services.fund_analysis import _tickflow_client_from_env, infer_tickflow_symbol
 from services.market_calendar import get_market_window, is_market_trading_day
-from services.position_market import _fetch_sina_exchange_fund_quote
+from services.position_market import fetch_sina_exchange_fund_quotes
 from services.position_models import (
     ETF_AFTERNOON_TIMING_START_TIME,
     ETF_FINAL_CLOSE_READY_TIME,
@@ -22,7 +24,6 @@ from services.position_models import (
     ETF_REALTIME_TIMING_END_TIME,
     ETF_REALTIME_TIMING_REFRESH_SECONDS,
     ETF_REALTIME_TIMING_START_TIME,
-    ETF_SINA_REALTIME_FALLBACK_CODES,
     ETF_TIMING_STRATEGIES,
     PositionItem,
     _round_metric,
@@ -226,29 +227,94 @@ def _tickflow_quote_datetime(row: pd.Series) -> datetime | None:
     return parsed.tz_localize("Asia/Shanghai").to_pydatetime()
 
 
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+
+
+def _tencent_fund_symbol(symbol: str) -> str:
+    code, _, exchange = str(symbol).strip().upper().partition(".")
+    return ("sh" if exchange == "SH" else "sz") + code
+
+
+def _fetch_tencent_fund_quotes(
+    symbols: list[str],
+    *,
+    market_now: datetime,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """腾讯批量快照（不依赖东方财富）；只接受当天且已有成交的报价，先直连再走系统代理。"""
+    if not symbols:
+        return {}, ""
+    wanted = {_tencent_fund_symbol(symbol): symbol for symbol in symbols}
+    url = TENCENT_QUOTE_URL + ",".join(wanted)
+    headers = {"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"}
+    last_error = ""
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        try:
+            response = session.get(url, headers=headers, timeout=8)
+            response.raise_for_status()
+            content = response.content.decode("gbk", errors="replace")
+        except Exception as exc:
+            last_error = f"腾讯实时行情：{exc}"
+            continue
+        finally:
+            session.close()
+        quotes: dict[str, dict[str, object]] = {}
+        for tencent_symbol, payload in re.findall(r'v_((?:sh|sz)\d{6})="([^"]*)"', content):
+            symbol = wanted.get(tencent_symbol)
+            fields = payload.split("~")
+            if symbol is None or len(fields) < 38 or fields[2] != tencent_symbol[2:]:
+                continue
+            price, previous_close, volume = (pd.to_numeric(fields[index], errors="coerce") for index in (3, 4, 6))
+            try:
+                quote_time = datetime.strptime(fields[30], "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            except ValueError:
+                continue
+            if (pd.isna(price) or float(price) <= 0 or pd.isna(volume) or float(volume) <= 0
+                    or quote_time.date() != market_now.date()):
+                continue
+            has_previous = pd.notna(previous_close) and float(previous_close) > 0
+            quotes[normalize_etf_base_code(symbol)] = {
+                "symbol": symbol.upper(),
+                "price": float(price),
+                "previous_close": float(previous_close) if has_previous else None,
+                "change_pct": (float(price) / float(previous_close) - 1) * 100 if has_previous else None,
+                "quote_time": quote_time,
+                "source": "腾讯实时行情",
+            }
+        if quotes:
+            return quotes, ""
+        last_error = "腾讯实时行情：未返回当天有成交的报价"
+    return {}, last_error
+
+
 def fetch_tickflow_etf_quotes(
     codes: list[str],
     *,
     api_key: str,
     market_now: datetime | None = None,
 ) -> dict[str, dict[str, object]]:
-    if not api_key.strip():
-        raise ValueError("TickFlow实时行情需要填写API Key。")
+    """ETF/LOF 盘中报价：TickFlow → 腾讯 → 新浪 → Wind，后一级只补前面缺失的代码。
 
+    各来源都只接受当天报价；没有 TickFlow Key 时从腾讯开始。
+    """
     market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     symbols = [infer_tickflow_symbol(code) for code in codes]
-    client = _tickflow_quote_client(api_key)
     quote_frames = []
     tickflow_error: Exception | None = None
-    try:
-        for start in range(0, len(symbols), 5):
-            batch = symbols[start:start + 5]
-            batch_df = client.quotes.get(symbols=batch, as_dataframe=True)
-            if batch_df is not None and not batch_df.empty:
-                quote_frames.append(batch_df)
-    except Exception as exc:
-        # Keep batches already returned; Sina/Wind below cover the rest.
-        tickflow_error = exc
+    if api_key.strip():
+        client = _tickflow_quote_client(api_key)
+        try:
+            for start in range(0, len(symbols), 5):
+                batch = symbols[start:start + 5]
+                batch_df = client.quotes.get(symbols=batch, as_dataframe=True)
+                if batch_df is not None and not batch_df.empty:
+                    quote_frames.append(batch_df)
+        except Exception as exc:
+            # 保留已返回的批次，其余由备用源补齐。
+            tickflow_error = exc
+    else:
+        tickflow_error = ValueError("未配置API Key")
     if quote_frames:
         quote_df = pd.concat(quote_frames, ignore_index=True)
         if "symbol" not in quote_df.columns:
@@ -276,31 +342,30 @@ def fetch_tickflow_etf_quotes(
             "previous_close": None if pd.isna(previous_close) else float(previous_close),
             "change_pct": None if pd.isna(change_pct) else float(change_pct),
             "quote_time": quote_time,
+            "source": "TickFlow",
         }
 
-    for symbol in symbols:
-        base_code = normalize_etf_base_code(symbol)
-        if base_code not in ETF_SINA_REALTIME_FALLBACK_CODES or base_code in quotes:
-            continue
-        try:
-            quotes[base_code] = _fetch_sina_exchange_fund_quote(
-                symbol=symbol,
-                market_now=market_now,
-            )
-        except Exception as exc:
-            logger.warning("%s TickFlow实时行情缺失，新浪备用源也失败：%s", symbol, exc)
+    def missing() -> list[str]:
+        return [symbol for symbol in symbols if normalize_etf_base_code(symbol) not in quotes]
 
+    errors = [f"TickFlow：{tickflow_error}" if tickflow_error is not None else ""]
+    for fetch in (_fetch_tencent_fund_quotes, fetch_sina_exchange_fund_quotes):
+        if not missing():
+            break
+        fallback_quotes, error = fetch(missing(), market_now=market_now)
+        quotes.update(fallback_quotes)
+        errors.append(error)
     wind_error = ""
-    missing = [symbol for symbol in symbols if normalize_etf_base_code(symbol) not in quotes]
-    if missing:
-        wind_quotes, wind_error = _fetch_wind_etf_quotes(missing, market_now=market_now)
+    if missing():
+        wind_quotes, wind_error = _fetch_wind_etf_quotes(missing(), market_now=market_now)
         quotes.update(wind_quotes)
+    if missing():
+        logger.warning("ETF实时行情仍缺失：%s", "、".join(missing()))
 
     if not quotes:
-        details = [
-            f"TickFlow：{tickflow_error}" if tickflow_error is not None else "TickFlow未返回当天ETF实时行情",
-            wind_error,
-        ]
+        details = [*errors, wind_error]
+        if tickflow_error is None:
+            details[0] = "TickFlow未返回当天ETF实时行情"
         raise ValueError("；".join(part for part in details if part) + "。")
     return quotes
 

@@ -398,22 +398,13 @@ def _request_sina_realtime_snapshot(sina_symbol: str):
             return session.get(url, **request_kwargs)
 
 
-def _fetch_sina_exchange_fund_quote(
+def _parse_sina_fund_fields(
+    fields: list[str],
     *,
     symbol: str,
-    market_now: datetime | None = None,
+    market_now: datetime,
 ) -> dict[str, object]:
-    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
     base_code = normalize_etf_base_code(symbol)
-    sina_symbol = _sina_exchange_symbol(symbol)
-    response = _request_sina_realtime_snapshot(sina_symbol)
-    response.raise_for_status()
-    payload = response.content.decode("gb18030", errors="replace")
-    match = re.search(
-        rf'var\s+hq_str_{re.escape(sina_symbol)}="([^"]*)"',
-        payload,
-    )
-    fields = match.group(1).split(",") if match else []
     if len(fields) < 32:
         raise ValueError(f"新浪财经未返回 {base_code} 的可识别实时快照。")
 
@@ -447,7 +438,56 @@ def _fetch_sina_exchange_fund_quote(
         ),
         "change_pct": change_pct,
         "quote_time": quote_time,
+        "source": "新浪财经实时",
     }
+
+
+def _fetch_sina_exchange_fund_quote(
+    *,
+    symbol: str,
+    market_now: datetime | None = None,
+) -> dict[str, object]:
+    market_now = market_now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    sina_symbol = _sina_exchange_symbol(symbol)
+    response = _request_sina_realtime_snapshot(sina_symbol)
+    response.raise_for_status()
+    payload = response.content.decode("gb18030", errors="replace")
+    match = re.search(
+        rf'var\s+hq_str_{re.escape(sina_symbol)}="([^"]*)"',
+        payload,
+    )
+    fields = match.group(1).split(",") if match else []
+    return _parse_sina_fund_fields(fields, symbol=symbol, market_now=market_now)
+
+
+def fetch_sina_exchange_fund_quotes(
+    symbols: list[str],
+    *,
+    market_now: datetime,
+) -> tuple[dict[str, dict[str, object]], str]:
+    """一次请求批量取场内基金新浪快照；只返回当天有效报价，并汇总失败原因。"""
+    if not symbols:
+        return {}, ""
+    sina_symbols = {_sina_exchange_symbol(symbol): symbol for symbol in symbols}
+    try:
+        response = _request_sina_realtime_snapshot(",".join(sina_symbols))
+        response.raise_for_status()
+    except Exception as exc:
+        return {}, f"新浪财经：{exc}"
+    payload = response.content.decode("gb18030", errors="replace")
+    quotes: dict[str, dict[str, object]] = {}
+    errors: list[str] = []
+    for sina_symbol, symbol in sina_symbols.items():
+        match = re.search(rf'var\s+hq_str_{re.escape(sina_symbol)}="([^"]*)"', payload)
+        try:
+            quote = _parse_sina_fund_fields(
+                match.group(1).split(",") if match else [], symbol=symbol, market_now=market_now
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        quotes[normalize_etf_base_code(symbol)] = quote
+    return quotes, ("新浪财经：" + "；".join(errors[:3])) if errors and not quotes else ""
 
 
 def _ensure_sina_adjustment_is_identity(sina_symbol: str, adjust: str | None) -> None:
